@@ -1,0 +1,10 @@
+.ctags.d/
+.idea
+.cache
+*.a
+*.o
+*.d
+*.s
+*.so
+*.ld
+*-test
