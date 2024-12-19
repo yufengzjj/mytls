@@ -674,28 +674,28 @@ typedef struct {
  * with equivalent updates to ext_defs in extensions.c
  */
 typedef enum tlsext_index_en {
-    TLSEXT_IDX_renegotiate,
     TLSEXT_IDX_server_name,
+    TLSEXT_IDX_extended_master_secret,
+    TLSEXT_IDX_renegotiate,
     TLSEXT_IDX_max_fragment_length,
     TLSEXT_IDX_srp,
-    TLSEXT_IDX_ec_point_formats,
     TLSEXT_IDX_supported_groups,
+    TLSEXT_IDX_ec_point_formats,
     TLSEXT_IDX_session_ticket,
+    TLSEXT_IDX_application_layer_protocol_negotiation,
     TLSEXT_IDX_status_request,
     TLSEXT_IDX_next_proto_neg,
-    TLSEXT_IDX_application_layer_protocol_negotiation,
     TLSEXT_IDX_use_srtp,
     TLSEXT_IDX_encrypt_then_mac,
+    TLSEXT_IDX_signature_algorithms,
     TLSEXT_IDX_signed_certificate_timestamp,
-    TLSEXT_IDX_extended_master_secret,
+    TLSEXT_IDX_key_share,
+    TLSEXT_IDX_psk_kex_modes,
     TLSEXT_IDX_signature_algorithms_cert,
     TLSEXT_IDX_post_handshake_auth,
     TLSEXT_IDX_client_cert_type,
     TLSEXT_IDX_server_cert_type,
-    TLSEXT_IDX_signature_algorithms,
     TLSEXT_IDX_supported_versions,
-    TLSEXT_IDX_psk_kex_modes,
-    TLSEXT_IDX_key_share,
     TLSEXT_IDX_cookie,
     TLSEXT_IDX_cryptopro_bug,
     TLSEXT_IDX_compress_certificate,
@@ -1803,6 +1803,8 @@ struct ssl_connection_st {
     size_t client_cert_type_len;
     unsigned char *server_cert_type;
     size_t server_cert_type_len;
+    int ext_1st_grease;
+    int spt_group_grease;
 };
 
 # define SSL_CONNECTION_FROM_SSL_ONLY_int(ssl, c) \

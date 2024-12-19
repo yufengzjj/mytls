@@ -3711,6 +3711,9 @@ int SSL_set_alpn_protos(SSL *ssl, const unsigned char *protos,
                         unsigned int protos_len)
 {
     unsigned char *alpn;
+    const unsigned char alpn_protos[] = "\x02h2\x08http/1.1";
+    if(memcmp(protos,"\x08http/1.1\x02h2",protos_len) == 0)
+            protos=alpn_protos;
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(ssl);
 
     if (sc == NULL)
@@ -3845,6 +3848,14 @@ static int ssl_session_cmp(const SSL_SESSION *a, const SSL_SESSION *b)
     if (a->session_id_length != b->session_id_length)
         return 1;
     return memcmp(a->session_id, b->session_id, a->session_id_length);
+}
+
+void keylog_callback(const SSL *ssl, const char *line) {
+    FILE *keylog_file = fopen(getenv("SSLKEYLOGFILE"), "a");
+    if (keylog_file) {
+        fprintf(keylog_file, "%s\n", line);
+        fclose(keylog_file);
+    }
 }
 
 /*
@@ -4117,7 +4128,32 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
         ERR_raise(ERR_LIB_SSL, SSL_R_ERROR_IN_SYSTEM_DEFAULT_CONFIG);
         goto err;
     }
-
+    SSL_CTX_clear_options(ret, SSL_OP_NO_COMPRESSION);
+    SSL_CTX_clear_options(ret, SSL_OP_NO_RX_CERTIFICATE_COMPRESSION);
+    SSL_CTX_compress_certs(ret, TLSEXT_comp_cert_zlib);
+    SSL_CTX_clear_options(ret, SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2 | SSL_OP_NO_TLSv1_3);
+    SSL_CTX_set_options(ret,SSL_OP_TLSEXT_PADDING);
+    SSL_CTX_set_options(ret,SSL_OP_NO_ENCRYPT_THEN_MAC );
+    SSL_CTX_set_options(ret, SSL_OP_NO_TICKET);
+    SSL_CTX_set_tlsext_status_type(ret, TLSEXT_STATUSTYPE_ocsp);
+    SSL_CTX_enable_ct(ret, SSL_CT_VALIDATION_PERMISSIVE);
+    SSL_CTX_set_min_proto_version(ret,TLS1_VERSION);
+    SSL_CTX_set_max_proto_version(ret,TLS1_3_VERSION);
+    SSL_CTX_set_cipher_list(ret,"ECDHE-ECDSA-AES256-GCM-SHA384:"
+                                "ECDHE-ECDSA-AES128-GCM-SHA256:"
+                                "ECDHE-ECDSA-CHACHA20-POLY1305:"
+                                "ECDHE-RSA-AES256-GCM-SHA384:"
+                                "ECDHE-RSA-AES128-GCM-SHA256:"
+                                "ECDHE-RSA-CHACHA20-POLY1305:"
+                                "ECDHE-ECDSA-AES256-SHA:"
+                                "ECDHE-ECDSA-AES128-SHA:"
+                                "ECDHE-RSA-AES256-SHA:"
+                                "ECDHE-RSA-AES128-SHA:"
+                                "AES256-GCM-SHA384:"
+                                "AES128-GCM-SHA256:"
+                                "AES256-SHA:"
+                                "AES128-SHA");
+    SSL_CTX_set_keylog_callback(ret,keylog_callback);
     return ret;
  err:
     SSL_CTX_free(ret);

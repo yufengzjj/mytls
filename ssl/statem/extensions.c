@@ -139,6 +139,22 @@ typedef struct extensions_definition_st {
  */
 #define INVALID_EXTENSION { TLSEXT_TYPE_invalid, 0, NULL, NULL, NULL, NULL, NULL, NULL }
 static const EXTENSION_DEFINITION ext_defs[] = {
+        {
+                TLSEXT_TYPE_server_name,
+                SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
+                | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS,
+                init_server_name,
+                tls_parse_ctos_server_name, tls_parse_stoc_server_name,
+                tls_construct_stoc_server_name, tls_construct_ctos_server_name,
+                final_server_name
+        },
+        {
+                TLSEXT_TYPE_extended_master_secret,
+                SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
+                | SSL_EXT_TLS1_2_AND_BELOW_ONLY,
+                init_ems, tls_parse_ctos_ems, tls_parse_stoc_ems,
+                tls_construct_stoc_ems, tls_construct_ctos_ems, final_ems
+        },
     {
         TLSEXT_TYPE_renegotiate,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
@@ -146,15 +162,6 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         NULL, tls_parse_ctos_renegotiate, tls_parse_stoc_renegotiate,
         tls_construct_stoc_renegotiate, tls_construct_ctos_renegotiate,
         final_renegotiate
-    },
-    {
-        TLSEXT_TYPE_server_name,
-        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
-        | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS,
-        init_server_name,
-        tls_parse_ctos_server_name, tls_parse_stoc_server_name,
-        tls_construct_stoc_server_name, tls_construct_ctos_server_name,
-        final_server_name
     },
     {
         TLSEXT_TYPE_max_fragment_length,
@@ -174,6 +181,39 @@ static const EXTENSION_DEFINITION ext_defs[] = {
     INVALID_EXTENSION,
 #endif
     {
+            /*
+             * "supported_groups" is spread across several specifications.
+             * It was originally specified as "elliptic_curves" in RFC 4492,
+             * and broadened to include named FFDH groups by RFC 7919.
+             * Both RFCs 4492 and 7919 do not include a provision for the server
+             * to indicate to the client the complete list of groups supported
+             * by the server, with the server instead just indicating the
+             * selected group for this connection in the ServerKeyExchange
+             * message.  TLS 1.3 adds a scheme for the server to indicate
+             * to the client its list of supported groups in the
+             * EncryptedExtensions message, but none of the relevant
+             * specifications permit sending supported_groups in the ServerHello.
+             * Nonetheless (possibly due to the close proximity to the
+             * "ec_point_formats" extension, which is allowed in the ServerHello),
+             * there are several servers that send this extension in the
+             * ServerHello anyway.  Up to and including the 1.1.0 release,
+             * we did not check for the presence of nonpermitted extensions,
+             * so to avoid a regression, we must permit this extension in the
+             * TLS 1.2 ServerHello as well.
+             *
+             * Note that there is no tls_parse_stoc_supported_groups function,
+             * so we do not perform any additional parsing, validation, or
+             * processing on the server's group list -- this is just a minimal
+             * change to preserve compatibility with these misbehaving servers.
+             */
+            TLSEXT_TYPE_supported_groups,
+            SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS
+            | SSL_EXT_TLS1_2_SERVER_HELLO,
+            NULL, tls_parse_ctos_supported_groups, NULL,
+            tls_construct_stoc_supported_groups,
+            tls_construct_ctos_supported_groups, NULL
+        },
+    {
         TLSEXT_TYPE_ec_point_formats,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
         | SSL_EXT_TLS1_2_AND_BELOW_ONLY,
@@ -182,45 +222,23 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         final_ec_pt_formats
     },
     {
-        /*
-         * "supported_groups" is spread across several specifications.
-         * It was originally specified as "elliptic_curves" in RFC 4492,
-         * and broadened to include named FFDH groups by RFC 7919.
-         * Both RFCs 4492 and 7919 do not include a provision for the server
-         * to indicate to the client the complete list of groups supported
-         * by the server, with the server instead just indicating the
-         * selected group for this connection in the ServerKeyExchange
-         * message.  TLS 1.3 adds a scheme for the server to indicate
-         * to the client its list of supported groups in the
-         * EncryptedExtensions message, but none of the relevant
-         * specifications permit sending supported_groups in the ServerHello.
-         * Nonetheless (possibly due to the close proximity to the
-         * "ec_point_formats" extension, which is allowed in the ServerHello),
-         * there are several servers that send this extension in the
-         * ServerHello anyway.  Up to and including the 1.1.0 release,
-         * we did not check for the presence of nonpermitted extensions,
-         * so to avoid a regression, we must permit this extension in the
-         * TLS 1.2 ServerHello as well.
-         *
-         * Note that there is no tls_parse_stoc_supported_groups function,
-         * so we do not perform any additional parsing, validation, or
-         * processing on the server's group list -- this is just a minimal
-         * change to preserve compatibility with these misbehaving servers.
-         */
-        TLSEXT_TYPE_supported_groups,
-        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS
-        | SSL_EXT_TLS1_2_SERVER_HELLO,
-        NULL, tls_parse_ctos_supported_groups, NULL,
-        tls_construct_stoc_supported_groups,
-        tls_construct_ctos_supported_groups, NULL
-    },
-    {
         TLSEXT_TYPE_session_ticket,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
         | SSL_EXT_TLS1_2_AND_BELOW_ONLY,
         init_session_ticket, tls_parse_ctos_session_ticket,
         tls_parse_stoc_session_ticket, tls_construct_stoc_session_ticket,
         tls_construct_ctos_session_ticket, NULL
+    },
+    {
+            /*
+             * Must appear in this list after server_name so that finalisation
+             * happens after server_name callbacks
+             */
+            TLSEXT_TYPE_application_layer_protocol_negotiation,
+            SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
+            | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS,
+            init_alpn, tls_parse_ctos_alpn, tls_parse_stoc_alpn,
+            tls_construct_stoc_alpn, tls_construct_ctos_alpn, final_alpn
     },
 #ifndef OPENSSL_NO_OCSP
     {
@@ -245,17 +263,6 @@ static const EXTENSION_DEFINITION ext_defs[] = {
 #else
     INVALID_EXTENSION,
 #endif
-    {
-        /*
-         * Must appear in this list after server_name so that finalisation
-         * happens after server_name callbacks
-         */
-        TLSEXT_TYPE_application_layer_protocol_negotiation,
-        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
-        | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS,
-        init_alpn, tls_parse_ctos_alpn, tls_parse_stoc_alpn,
-        tls_construct_stoc_alpn, tls_construct_ctos_alpn, final_alpn
-    },
 #ifndef OPENSSL_NO_SRTP
     {
         TLSEXT_TYPE_use_srtp,
@@ -274,6 +281,13 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         init_etm, tls_parse_ctos_etm, tls_parse_stoc_etm,
         tls_construct_stoc_etm, tls_construct_ctos_etm, NULL
     },
+    {
+            TLSEXT_TYPE_signature_algorithms,
+            SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST,
+            init_sig_algs, tls_parse_ctos_sig_algs,
+            tls_parse_ctos_sig_algs, tls_construct_ctos_sig_algs,
+            tls_construct_ctos_sig_algs, final_sig_algs
+    },
 #ifndef OPENSSL_NO_CT
     {
         TLSEXT_TYPE_signed_certificate_timestamp,
@@ -291,12 +305,25 @@ static const EXTENSION_DEFINITION ext_defs[] = {
     INVALID_EXTENSION,
 #endif
     {
-        TLSEXT_TYPE_extended_master_secret,
-        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_2_SERVER_HELLO
-        | SSL_EXT_TLS1_2_AND_BELOW_ONLY,
-        init_ems, tls_parse_ctos_ems, tls_parse_stoc_ems,
-        tls_construct_stoc_ems, tls_construct_ctos_ems, final_ems
-    },
+            /*
+             * Must be in this list after supported_groups. We need that to have
+             * been parsed before we do this one.
+             */
+            TLSEXT_TYPE_key_share,
+            SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_SERVER_HELLO
+            | SSL_EXT_TLS1_3_HELLO_RETRY_REQUEST | SSL_EXT_TLS_IMPLEMENTATION_ONLY
+            | SSL_EXT_TLS1_3_ONLY,
+            NULL, tls_parse_ctos_key_share, tls_parse_stoc_key_share,
+            tls_construct_stoc_key_share, tls_construct_ctos_key_share,
+            final_key_share
+        },
+        {
+            TLSEXT_TYPE_psk_kex_modes,
+            SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS_IMPLEMENTATION_ONLY
+            | SSL_EXT_TLS1_3_ONLY,
+            init_psk_kex_modes, tls_parse_ctos_psk_kex_modes, NULL, NULL,
+            tls_construct_ctos_psk_kex_modes, NULL
+        },
     {
         TLSEXT_TYPE_signature_algorithms_cert,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST,
@@ -332,13 +359,6 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         NULL
     },
     {
-        TLSEXT_TYPE_signature_algorithms,
-        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST,
-        init_sig_algs, tls_parse_ctos_sig_algs,
-        tls_parse_ctos_sig_algs, tls_construct_ctos_sig_algs,
-        tls_construct_ctos_sig_algs, final_sig_algs
-    },
-    {
         TLSEXT_TYPE_supported_versions,
         SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_SERVER_HELLO
         | SSL_EXT_TLS1_3_HELLO_RETRY_REQUEST | SSL_EXT_TLS_IMPLEMENTATION_ONLY,
@@ -347,26 +367,6 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         NULL, tls_parse_stoc_supported_versions,
         tls_construct_stoc_supported_versions,
         tls_construct_ctos_supported_versions, final_supported_versions
-    },
-    {
-        TLSEXT_TYPE_psk_kex_modes,
-        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS_IMPLEMENTATION_ONLY
-        | SSL_EXT_TLS1_3_ONLY,
-        init_psk_kex_modes, tls_parse_ctos_psk_kex_modes, NULL, NULL,
-        tls_construct_ctos_psk_kex_modes, NULL
-    },
-    {
-        /*
-         * Must be in this list after supported_groups. We need that to have
-         * been parsed before we do this one.
-         */
-        TLSEXT_TYPE_key_share,
-        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_SERVER_HELLO
-        | SSL_EXT_TLS1_3_HELLO_RETRY_REQUEST | SSL_EXT_TLS_IMPLEMENTATION_ONLY
-        | SSL_EXT_TLS1_3_ONLY,
-        NULL, tls_parse_ctos_key_share, tls_parse_stoc_key_share,
-        tls_construct_stoc_key_share, tls_construct_ctos_key_share,
-        final_key_share
     },
     {
         /* Must be after key_share */
@@ -838,7 +838,7 @@ int should_add_extension(SSL_CONNECTION *s, unsigned int extctx,
 
     return 1;
 }
-
+extern int gen_random_grease();
 /*
  * Construct all the extensions relevant to the current |context| and write
  * them to |pkt|. If this is an extension for a Certificate in a Certificate
@@ -889,7 +889,12 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
         /* SSLfatal() already called */
         return 0;
     }
-
+    s->ext_1st_grease = gen_random_grease();
+    if (!WPACKET_put_bytes_u16(pkt, s->ext_1st_grease)
+        || !WPACKET_sub_memcpy_u16(pkt, 0, 0)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
     for (i = 0, thisexd = ext_defs; i < OSSL_NELEM(ext_defs); i++, thisexd++) {
         EXT_RETURN (*construct)(SSL_CONNECTION *s, WPACKET *pkt,
                                 unsigned int context,
@@ -1810,7 +1815,6 @@ static EXT_RETURN tls_construct_compress_certificate(SSL_CONNECTION *sc, WPACKET
 {
 #ifndef OPENSSL_NO_COMP_ALG
     int i;
-
     if (!ossl_comp_has_alg(0))
         return EXT_RETURN_NOT_SENT;
 

@@ -184,6 +184,9 @@ EXT_RETURN tls_construct_ctos_ec_pt_formats(SSL_CONNECTION *s, WPACKET *pkt,
                                             unsigned int context, X509 *x,
                                             size_t chainidx)
 {
+    int last_min_version = SSL_CTX_get_min_proto_version(s->session_ctx);
+    if(last_min_version==TLS1_3_VERSION)
+        return EXT_RETURN_NOT_SENT;
     const unsigned char *pformats;
     size_t num_formats;
     int reason, min_version, max_version;
@@ -210,7 +213,7 @@ EXT_RETURN tls_construct_ctos_ec_pt_formats(SSL_CONNECTION *s, WPACKET *pkt,
 
     return EXT_RETURN_SENT;
 }
-
+extern int gen_random_grease();
 EXT_RETURN tls_construct_ctos_supported_groups(SSL_CONNECTION *s, WPACKET *pkt,
                                                unsigned int context, X509 *x,
                                                size_t chainidx)
@@ -243,6 +246,11 @@ EXT_RETURN tls_construct_ctos_supported_groups(SSL_CONNECTION *s, WPACKET *pkt,
             || !WPACKET_start_sub_packet_u16(pkt)
             || !WPACKET_start_sub_packet_u16(pkt)
             || !WPACKET_set_flags(pkt, WPACKET_FLAGS_NON_ZERO_LENGTH)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+    s->spt_group_grease = gen_random_grease();
+    if (!WPACKET_put_bytes_u16(pkt, s->spt_group_grease)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
@@ -544,6 +552,9 @@ EXT_RETURN tls_construct_ctos_ems(SSL_CONNECTION *s, WPACKET *pkt,
                                   unsigned int context,
                                   X509 *x, size_t chainidx)
 {
+    int min_version = SSL_CTX_get_min_proto_version(s->session_ctx);
+    if(min_version==TLS1_3_VERSION)
+        return EXT_RETURN_NOT_SENT;
     if (s->options & SSL_OP_NO_EXTENDED_MASTER_SECRET)
         return EXT_RETURN_NOT_SENT;
 
@@ -567,7 +578,7 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, reason);
         return EXT_RETURN_FAIL;
     }
-
+    min_version = SSL_CTX_get_min_proto_version(s->session_ctx);
     /*
      * Don't include this if we can't negotiate TLSv1.3. We can do a straight
      * comparison here because we will never be called in DTLS.
@@ -581,7 +592,10 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
-
+    if (!WPACKET_put_bytes_u16(pkt, gen_random_grease())) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
     for (currv = max_version; currv >= min_version; currv--) {
         if (!WPACKET_put_bytes_u16(pkt, currv)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
@@ -658,6 +672,12 @@ static int add_key_share(SSL_CONNECTION *s, WPACKET *pkt, unsigned int curve_id)
     }
 
     /* Create KeyShareEntry */
+    unsigned char dummy_point[]={0x00};
+    if (!WPACKET_put_bytes_u16(pkt, s->spt_group_grease)
+        || !WPACKET_sub_memcpy_u16(pkt, dummy_point, 1)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        goto err;
+    }
     if (!WPACKET_put_bytes_u16(pkt, curve_id)
             || !WPACKET_sub_memcpy_u16(pkt, encoded_point, encodedlen)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
@@ -942,11 +962,24 @@ EXT_RETURN tls_construct_ctos_early_data(SSL_CONNECTION *s, WPACKET *pkt,
  * subsequent binder bytes
  */
 #define PSK_PRE_BINDER_OVERHEAD (2 + 2 + 2 + 2 + 4 + 2 + 1)
-
+int force_add_grease_end_ext(SSL_CONNECTION *s,WPACKET *pkt){
+    char ext_info[]={0x00};
+    int ext_lst_grease = gen_random_grease();
+    while (ext_lst_grease==s->ext_1st_grease) { ext_lst_grease = gen_random_grease(); }
+    if (!WPACKET_put_bytes_u16(pkt, ext_lst_grease)
+        || !WPACKET_sub_memcpy_u16(pkt, ext_info, 1)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+    return EXT_RETURN_SENT;
+}
 EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
                                       unsigned int context, X509 *x,
                                       size_t chainidx)
 {
+    if (force_add_grease_end_ext(s,pkt) == EXT_RETURN_FAIL) {
+        return EXT_RETURN_FAIL;
+    }
     unsigned char *padbytes;
     size_t hlen;
 
@@ -1663,7 +1696,7 @@ int tls_parse_stoc_alpn(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
             break;
         }
     }
-
+    valid = 1;
     if (!valid) {
         /* The protocol sent from the server does not match one we advertised */
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_BAD_EXTENSION);

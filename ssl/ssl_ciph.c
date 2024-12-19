@@ -2235,7 +2235,7 @@ int ssl_cert_is_disabled(SSL_CTX *ctx, size_t idx)
  */
 const char *OSSL_default_cipher_list(void)
 {
-    return "ALL:!COMPLEMENTOFDEFAULT:!eNULL";
+    return "";
 }
 
 /*
@@ -2245,7 +2245,24 @@ const char *OSSL_default_cipher_list(void)
  */
 const char *OSSL_default_ciphersuites(void)
 {
-    return "TLS_AES_256_GCM_SHA384:"
-           "TLS_CHACHA20_POLY1305_SHA256:"
-           "TLS_AES_128_GCM_SHA256";
+    return "TLS_AES_128_GCM_SHA256:"
+           "TLS_AES_256_GCM_SHA384:"
+           "TLS_CHACHA20_POLY1305_SHA256";
+}
+
+const unsigned short GREASE_VALUES[] = {
+        0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A,
+        0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
+        0xCACA, 0xDADA, 0xEAEA, 0xFAFA
+};
+const size_t GREASE_VALUES_COUNT = sizeof(GREASE_VALUES) / sizeof(GREASE_VALUES[0]);
+int gen_random_grease(){
+    unsigned char random_byte[4];
+    int random_number;
+    RAND_bytes(random_byte, sizeof(random_byte));
+    random_number = ((random_byte[0] << 24) |
+                     (random_byte[1] << 16) |
+                     (random_byte[2] << 8) |
+                     random_byte[3]);
+    return GREASE_VALUES[abs(random_number) % GREASE_VALUES_COUNT];
 }

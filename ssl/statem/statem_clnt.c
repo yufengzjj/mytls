@@ -4058,7 +4058,13 @@ int ssl_do_client_cert_cb(SSL_CONNECTION *s, X509 **px509, EVP_PKEY **ppkey)
         i = sctx->client_cert_cb(SSL_CONNECTION_GET_SSL(s), px509, ppkey);
     return i;
 }
-
+extern int gen_random_grease();
+int force_put_cipher_by_char(int cid, WPACKET *pkt, size_t *len){
+    if (!WPACKET_put_bytes_u16(pkt, cid & 0xffff))
+        return 0;
+    *len = 2;
+    return 1;
+}
 int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
                              WPACKET *pkt)
 {
@@ -4101,7 +4107,11 @@ int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
         maxlen -= 2;
     if (s->mode & SSL_MODE_SEND_FALLBACK_SCSV)
         maxlen -= 2;
-
+    if (!force_put_cipher_by_char(gen_random_grease(), pkt, &len)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return 0;
+    }
+    totlen += len;
     for (i = 0; i < sk_SSL_CIPHER_num(sk) && totlen < maxlen; i++) {
         const SSL_CIPHER *c;
 
@@ -4127,7 +4137,17 @@ int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
 
         totlen += len;
     }
-
+    int min_version = SSL_CTX_get_min_proto_version(s->session_ctx);
+    if(min_version==TLS1_VERSION){
+        int forced_ciphers[] ={0xc008,0xc012,0x000a};
+        for (   i= 0; i < (sizeof(forced_ciphers) / sizeof(forced_ciphers[0])) && totlen < maxlen; ++i) {
+            if (!force_put_cipher_by_char(forced_ciphers[i], pkt, &len)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+            totlen += len;
+        }
+    }
     if (totlen == 0 || !maxverok) {
         const char *maxvertext =
             !maxverok
