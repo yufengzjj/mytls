@@ -579,6 +579,8 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
         return EXT_RETURN_FAIL;
     }
     min_version = SSL_CTX_get_min_proto_version(s->session_ctx);
+    if (min_version < TLS1_3_VERSION)
+        min_version = TLS1_VERSION;
     /*
      * Don't include this if we can't negotiate TLSv1.3. We can do a straight
      * comparison here because we will never be called in DTLS.

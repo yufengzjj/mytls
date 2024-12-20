@@ -3680,6 +3680,9 @@ static int alpn_value_ok(const unsigned char *protos, unsigned int protos_len)
 int SSL_CTX_set_alpn_protos(SSL_CTX *ctx, const unsigned char *protos,
                             unsigned int protos_len)
 {
+    const unsigned char alpn_protos[] = "\x02h2\x08http/1.1";
+    if (protos_len == sizeof(alpn_protos) - 1 && memcmp(protos, "\x08http/1.1\x02h2", protos_len) == 0)
+        protos = alpn_protos;
     unsigned char *alpn;
 
     if (protos_len == 0 || protos == NULL) {
@@ -3712,8 +3715,8 @@ int SSL_set_alpn_protos(SSL *ssl, const unsigned char *protos,
 {
     unsigned char *alpn;
     const unsigned char alpn_protos[] = "\x02h2\x08http/1.1";
-    if(memcmp(protos,"\x08http/1.1\x02h2",protos_len) == 0)
-            protos=alpn_protos;
+    if (protos_len == sizeof(alpn_protos) - 1 && memcmp(protos, "\x08http/1.1\x02h2", protos_len) == 0)
+        protos = alpn_protos;
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(ssl);
 
     if (sc == NULL)
