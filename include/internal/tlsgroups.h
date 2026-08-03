@@ -57,4 +57,7 @@
 # define OSSL_TLS_GROUP_ID_ffdhe6144        0x0103
 # define OSSL_TLS_GROUP_ID_ffdhe8192        0x0104
 
+/* draft-kwiatkowski-tls-ecdhe-mlkem hybrid groups */
+# define OSSL_TLS_GROUP_ID_X25519MLKEM768         0x11EC
+
 #endif

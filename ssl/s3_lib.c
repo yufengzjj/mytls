@@ -3399,6 +3399,25 @@ int ssl3_new(SSL *s)
     return 1;
 }
 
+/*
+ * Release every client key_share private key. |tmp.pkey| aliases one of the
+ * |ks_pkey| entries once a share has been added, so it must not be freed
+ * separately.
+ */
+static void ssl3_free_key_shares(SSL_CONNECTION *sc)
+{
+    size_t i;
+
+    for (i = 0; i < sc->s3.tmp.num_ks_pkey; i++) {
+        EVP_PKEY_free(sc->s3.tmp.ks_pkey[i]);
+        sc->s3.tmp.ks_pkey[i] = NULL;
+    }
+    if (sc->s3.tmp.num_ks_pkey == 0)
+        EVP_PKEY_free(sc->s3.tmp.pkey);
+    sc->s3.tmp.num_ks_pkey = 0;
+    sc->s3.tmp.pkey = NULL;
+}
+
 void ssl3_free(SSL *s)
 {
     SSL_CONNECTION *sc = SSL_CONNECTION_FROM_SSL(s);
@@ -3410,8 +3429,7 @@ void ssl3_free(SSL *s)
 
     EVP_PKEY_free(sc->s3.peer_tmp);
     sc->s3.peer_tmp = NULL;
-    EVP_PKEY_free(sc->s3.tmp.pkey);
-    sc->s3.tmp.pkey = NULL;
+    ssl3_free_key_shares(sc);
 
     ssl_evp_cipher_free(sc->s3.tmp.new_sym_enc);
     ssl_evp_md_free(sc->s3.tmp.new_hash);
@@ -3454,7 +3472,7 @@ int ssl3_clear(SSL *s)
     OPENSSL_free(sc->s3.tmp.peer_cert_sigalgs);
     OPENSSL_free(sc->s3.tmp.valid_flags);
 
-    EVP_PKEY_free(sc->s3.tmp.pkey);
+    ssl3_free_key_shares(sc);
     EVP_PKEY_free(sc->s3.peer_tmp);
 
     ssl3_free_digest_list(sc);

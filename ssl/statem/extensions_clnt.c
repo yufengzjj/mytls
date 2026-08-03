@@ -8,9 +8,28 @@
  */
 
 #include <openssl/ocsp.h>
+#include <openssl/rand.h>
 #include "../ssl_local.h"
 #include "internal/cryptlib.h"
 #include "statem_local.h"
+
+/*
+ * signature_algorithms exactly as Chrome advertises it. Order is significant:
+ * unlike the cipher and extension lists, JA4 hashes these in wire order.
+ * 0x0904..0x0906 are ML-DSA-44/65/87 (draft-ietf-tls-mldsa), which we cannot
+ * verify - see tls_construct_ctos_sig_algs().
+ */
+static const uint16_t chrome_sigalgs[] = {
+    0x0904, 0x0905, 0x0906,
+    TLSEXT_SIGALG_ecdsa_secp256r1_sha256,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha256,
+    TLSEXT_SIGALG_rsa_pkcs1_sha256,
+    TLSEXT_SIGALG_ecdsa_secp384r1_sha384,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha384,
+    TLSEXT_SIGALG_rsa_pkcs1_sha384,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha512,
+    TLSEXT_SIGALG_rsa_pkcs1_sha512
+};
 
 EXT_RETURN tls_construct_ctos_renegotiate(SSL_CONNECTION *s, WPACKET *pkt,
                                           unsigned int context, X509 *x,
@@ -213,7 +232,6 @@ EXT_RETURN tls_construct_ctos_ec_pt_formats(SSL_CONNECTION *s, WPACKET *pkt,
 
     return EXT_RETURN_SENT;
 }
-extern int gen_random_grease();
 EXT_RETURN tls_construct_ctos_supported_groups(SSL_CONNECTION *s, WPACKET *pkt,
                                                unsigned int context, X509 *x,
                                                size_t chainidx)
@@ -249,8 +267,8 @@ EXT_RETURN tls_construct_ctos_supported_groups(SSL_CONNECTION *s, WPACKET *pkt,
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
-    s->spt_group_grease = gen_random_grease();
-    if (!WPACKET_put_bytes_u16(pkt, s->spt_group_grease)) {
+    if (!WPACKET_put_bytes_u16(pkt,
+                               ossl_ssl_grease_value(s, SSL_GREASE_GROUP))) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
@@ -333,21 +351,50 @@ EXT_RETURN tls_construct_ctos_sig_algs(SSL_CONNECTION *s, WPACKET *pkt,
                                        unsigned int context, X509 *x,
                                        size_t chainidx)
 {
-    size_t salglen;
+    size_t salglen, i;
     const uint16_t *salg;
 
     if (!SSL_CLIENT_USE_SIGALGS(s))
         return EXT_RETURN_NOT_SENT;
 
-    salglen = tls12_get_psigalgs(s, 1, &salg);
     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_signature_algorithms)
                /* Sub-packet for sig-algs extension */
             || !WPACKET_start_sub_packet_u16(pkt)
                /* Sub-packet for the actual list */
-            || !WPACKET_start_sub_packet_u16(pkt)
-            || !tls12_copy_sigalgs(s, pkt, salg, salglen)
-            || !WPACKET_close(pkt)
-            || !WPACKET_close(pkt)) {
+            || !WPACKET_start_sub_packet_u16(pkt)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+
+    /*
+     * This constructor is shared with the server's CertificateRequest, which
+     * must advertise what we can really verify.
+     */
+    if ((context & SSL_EXT_CLIENT_HELLO) == 0) {
+        salglen = tls12_get_psigalgs(s, 1, &salg);
+        if (!tls12_copy_sigalgs(s, pkt, salg, salglen)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+            return EXT_RETURN_FAIL;
+        }
+    } else {
+        /*
+         * The advertised list is written verbatim rather than being derived
+         * from the locally available algorithms, because it is part of the
+         * fingerprint: both the exact membership and the order are hashed into
+         * JA4. It includes codepoints we cannot actually verify (ML-DSA), just
+         * as the browser we are imitating does; that is harmless because no
+         * deployed server signs the handshake with them, and if one ever did,
+         * tls12_check_peer_sigalg() would reject the unknown algorithm.
+         */
+        for (i = 0; i < OSSL_NELEM(chrome_sigalgs); i++) {
+            if (!WPACKET_put_bytes_u16(pkt, chrome_sigalgs[i])) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                return EXT_RETURN_FAIL;
+            }
+        }
+    }
+
+    if (!WPACKET_close(pkt) || !WPACKET_close(pkt)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
@@ -578,9 +625,6 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, reason);
         return EXT_RETURN_FAIL;
     }
-    min_version = SSL_CTX_get_min_proto_version(s->session_ctx);
-    if (min_version < TLS1_3_VERSION)
-        min_version = TLS1_VERSION;
     /*
      * Don't include this if we can't negotiate TLSv1.3. We can do a straight
      * comparison here because we will never be called in DTLS.
@@ -594,7 +638,8 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
-    if (!WPACKET_put_bytes_u16(pkt, gen_random_grease())) {
+    if (!WPACKET_put_bytes_u16(pkt,
+                               ossl_ssl_grease_value(s, SSL_GREASE_VERSION))) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
@@ -642,21 +687,26 @@ EXT_RETURN tls_construct_ctos_psk_kex_modes(SSL_CONNECTION *s, WPACKET *pkt,
 }
 
 #ifndef OPENSSL_NO_TLS1_3
-static int add_key_share(SSL_CONNECTION *s, WPACKET *pkt, unsigned int curve_id)
+/* Number of real key shares Chrome puts in a ClientHello */
+# define CHROME_KEY_SHARES 2
+
+static int add_key_share(SSL_CONNECTION *s, WPACKET *pkt, unsigned int curve_id,
+                         size_t idx)
 {
     unsigned char *encoded_point = NULL;
     EVP_PKEY *key_share_key = NULL;
     size_t encodedlen;
 
-    if (s->s3.tmp.pkey != NULL) {
-        if (!ossl_assert(s->hello_retry_request == SSL_HRR_PENDING)) {
+    if (idx < s->s3.tmp.num_ks_pkey) {
+        if (!ossl_assert(s->hello_retry_request == SSL_HRR_PENDING)
+                || !ossl_assert(s->s3.tmp.ks_pkey[idx] != NULL)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
             return 0;
         }
         /*
          * Could happen if we got an HRR that wasn't requesting a new key_share
          */
-        key_share_key = s->s3.tmp.pkey;
+        key_share_key = s->s3.tmp.ks_pkey[idx];
     } else {
         key_share_key = ssl_generate_pkey_group(s, curve_id);
         if (key_share_key == NULL) {
@@ -673,13 +723,25 @@ static int add_key_share(SSL_CONNECTION *s, WPACKET *pkt, unsigned int curve_id)
         goto err;
     }
 
-    /* Create KeyShareEntry */
-    unsigned char dummy_point[]={0x00};
-    if (!WPACKET_put_bytes_u16(pkt, s->spt_group_grease)
-        || !WPACKET_sub_memcpy_u16(pkt, dummy_point, 1)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-        goto err;
+    /*
+     * A GREASE KeyShareEntry with a one-byte key leads the list. It is omitted
+     * from the second ClientHello: RFC 8446 section 4.1.2 requires the
+     * key_share after a HelloRetryRequest to contain exactly one entry, for
+     * the group the server asked for, and servers do enforce that.
+     */
+    if (idx == 0 && s->hello_retry_request == SSL_HRR_NONE) {
+        static const unsigned char dummy_point[] = { 0x00 };
+
+        if (!WPACKET_put_bytes_u16(pkt,
+                                   ossl_ssl_grease_value(s, SSL_GREASE_GROUP))
+                || !WPACKET_sub_memcpy_u16(pkt, dummy_point,
+                                           sizeof(dummy_point))) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+            goto err;
+        }
     }
+
+    /* Create KeyShareEntry */
     if (!WPACKET_put_bytes_u16(pkt, curve_id)
             || !WPACKET_sub_memcpy_u16(pkt, encoded_point, encodedlen)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
@@ -687,17 +749,24 @@ static int add_key_share(SSL_CONNECTION *s, WPACKET *pkt, unsigned int curve_id)
     }
 
     /*
-     * When changing to send more than one key_share we're
-     * going to need to be able to save more than one EVP_PKEY. For now
-     * we reuse the existing tmp.pkey
+     * The first share is also the "current" one for all the code that only
+     * deals with a single key exchange key; tls_parse_stoc_key_share() repoints
+     * these at whichever share the server actually selected.
      */
-    s->s3.tmp.pkey = key_share_key;
-    s->s3.group_id = curve_id;
+    if (idx == 0) {
+        s->s3.tmp.pkey = key_share_key;
+        s->s3.group_id = curve_id;
+    }
+    s->s3.tmp.ks_pkey[idx] = key_share_key;
+    s->s3.tmp.ks_group_id[idx] = curve_id;
+    if (idx >= s->s3.tmp.num_ks_pkey)
+        s->s3.tmp.num_ks_pkey = idx + 1;
+
     OPENSSL_free(encoded_point);
 
     return 1;
  err:
-    if (s->s3.tmp.pkey == NULL)
+    if (key_share_key != s->s3.tmp.ks_pkey[idx])
         EVP_PKEY_free(key_share_key);
     OPENSSL_free(encoded_point);
     return 0;
@@ -709,7 +778,7 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
                                         size_t chainidx)
 {
 #ifndef OPENSSL_NO_TLS1_3
-    size_t i, num_groups = 0;
+    size_t i, num_groups = 0, sent = 0;
     const uint16_t *pgroups = NULL;
     uint16_t curve_id = 0;
 
@@ -725,14 +794,26 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
 
     tls1_get_supported_groups(s, &pgroups, &num_groups);
 
-    /*
-     * Make the number of key_shares sent configurable. For
-     * now, we just send one
-     */
-    if (s->s3.group_id != 0) {
-        curve_id = s->s3.group_id;
+    if (s->hello_retry_request == SSL_HRR_PENDING && s->s3.group_id != 0) {
+        /*
+         * The server told us which group it wants; RFC 8446 section 4.1.2
+         * allows exactly that one share in the second ClientHello.
+         */
+        s->s3.tmp.num_ks_pkey = 0;
+        if (!add_key_share(s, pkt, s->s3.group_id, 0)) {
+            /* SSLfatal() already called */
+            return EXT_RETURN_FAIL;
+        }
+        sent = 1;
     } else {
-        for (i = 0; i < num_groups; i++) {
+        /*
+         * Chrome offers a share for its two preferred groups - the hybrid
+         * X25519MLKEM768 and plain X25519 - so that a server supporting either
+         * can answer without a HelloRetryRequest. Matching that is part of the
+         * fingerprint, so we send shares for the first CHROME_KEY_SHARES
+         * usable groups rather than just the first one.
+         */
+        for (i = 0; i < num_groups && sent < CHROME_KEY_SHARES; i++) {
             if (!tls_group_allowed(s, pgroups[i], SSL_SECOP_CURVE_SUPPORTED))
                 continue;
 
@@ -741,17 +822,16 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
                 continue;
 
             curve_id = pgroups[i];
-            break;
+            if (!add_key_share(s, pkt, curve_id, sent)) {
+                /* SSLfatal() already called */
+                return EXT_RETURN_FAIL;
+            }
+            sent++;
         }
     }
 
-    if (curve_id == 0) {
+    if (sent == 0) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, SSL_R_NO_SUITABLE_KEY_SHARE);
-        return EXT_RETURN_FAIL;
-    }
-
-    if (!add_key_share(s, pkt, curve_id)) {
-        /* SSLfatal() already called */
         return EXT_RETURN_FAIL;
     }
 
@@ -964,24 +1044,10 @@ EXT_RETURN tls_construct_ctos_early_data(SSL_CONNECTION *s, WPACKET *pkt,
  * subsequent binder bytes
  */
 #define PSK_PRE_BINDER_OVERHEAD (2 + 2 + 2 + 2 + 4 + 2 + 1)
-int force_add_grease_end_ext(SSL_CONNECTION *s,WPACKET *pkt){
-    char ext_info[]={0x00};
-    int ext_lst_grease = gen_random_grease();
-    while (ext_lst_grease==s->ext_1st_grease) { ext_lst_grease = gen_random_grease(); }
-    if (!WPACKET_put_bytes_u16(pkt, ext_lst_grease)
-        || !WPACKET_sub_memcpy_u16(pkt, ext_info, 1)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-        return EXT_RETURN_FAIL;
-    }
-    return EXT_RETURN_SENT;
-}
 EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
                                       unsigned int context, X509 *x,
                                       size_t chainidx)
 {
-    if (force_add_grease_end_ext(s,pkt) == EXT_RETURN_FAIL) {
-        return EXT_RETURN_FAIL;
-    }
     unsigned char *padbytes;
     size_t hlen;
 
@@ -1047,6 +1113,182 @@ EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
     }
 
     return EXT_RETURN_SENT;
+}
+
+/*
+ * Application-Layer Protocol Settings (draft-vvv-tls-alps).
+ *
+ * Chrome offers ALPS for every ALPN protocol it can carry settings for, which
+ * in practice means h2 and only h2 - so the extension body is an ALPN-shaped
+ * protocol list holding just "h2". It is offered only when h2 itself is
+ * offered, which is why an http/1.1-only ClientHello from Chrome carries no
+ * ALPS and has one extension fewer.
+ *
+ * We have no settings of our own to send or to act on; the point is purely
+ * that the extension is present, and that a server which answers with its own
+ * settings in EncryptedExtensions does not trip the unsolicited-extension
+ * check.
+ */
+static const unsigned char alps_h2[] = { 0x02, 'h', '2' };
+
+EXT_RETURN tls_construct_ctos_alps(SSL_CONNECTION *s, WPACKET *pkt,
+                                   unsigned int context, X509 *x,
+                                   size_t chainidx)
+{
+    size_t i;
+    int offers_h2 = 0;
+
+    if (s->ext.alpn == NULL || !SSL_IS_FIRST_HANDSHAKE(s))
+        return EXT_RETURN_NOT_SENT;
+
+    /* Walk the wire-format ALPN list looking for "h2". */
+    for (i = 0; i + 1 <= s->ext.alpn_len;) {
+        size_t protolen = s->ext.alpn[i];
+
+        if (protolen == 0 || i + 1 + protolen > s->ext.alpn_len)
+            break;
+        if (protolen == sizeof(alps_h2) - 1
+                && memcmp(s->ext.alpn + i + 1, alps_h2 + 1,
+                          sizeof(alps_h2) - 1) == 0) {
+            offers_h2 = 1;
+            break;
+        }
+        i += 1 + protolen;
+    }
+
+    if (!offers_h2)
+        return EXT_RETURN_NOT_SENT;
+
+    if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_application_settings)
+            || !WPACKET_start_sub_packet_u16(pkt)
+            || !WPACKET_sub_memcpy_u16(pkt, alps_h2, sizeof(alps_h2))
+            || !WPACKET_close(pkt)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+
+    return EXT_RETURN_SENT;
+}
+
+int tls_parse_stoc_alps(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
+                        X509 *x, size_t chainidx)
+{
+    /* The server's application settings, which we have no use for. */
+    if (!PACKET_forward(pkt, PACKET_remaining(pkt))) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_BAD_EXTENSION);
+        return 0;
+    }
+
+    return 1;
+}
+
+/*
+ * GREASE Encrypted ClientHello (draft-ietf-tls-esni).
+ *
+ * We hold no ECHConfig, so there is nothing real to encrypt. Like the browser
+ * we imitate, we still send a syntactically valid "outer" ECHClientHello built
+ * from random bytes, so that the extension is present in every ClientHello and
+ * carrying real ECH does not stand out. A server that does not recognise the
+ * config_id ignores it and proceeds with the outer ClientHello; a server that
+ * does have ECH configured replies with retry_configs, which we discard in
+ * tls_parse_stoc_ech().
+ */
+
+/* HPKE codepoints: HKDF-SHA256 / AES-128-GCM, as sent by Chrome. */
+#define ECH_GREASE_KDF_ID       0x0001
+#define ECH_GREASE_AEAD_ID      0x0001
+/* An X25519 public key, the only KEM used for ECH in practice. */
+#define ECH_GREASE_ENC_LEN      32
+#define ECH_GREASE_AEAD_TAG_LEN 16
+/*
+ * Size of an inner ClientHello excluding the server_name and its padding. The
+ * inner ClientHello reuses most of the outer one through ech_outer_extensions,
+ * so what is left is small and nearly constant.
+ *
+ * 64 is what makes the total come out at Chrome's 250 bytes; verified against
+ * live Chrome 150 captures with two different SNI lengths.
+ */
+#define ECH_GREASE_INNER_LEN    64
+/* draft-ietf-tls-esni pads the inner server_name out to this length. */
+#define ECH_GREASE_NAME_PADDED  128
+
+EXT_RETURN tls_construct_ctos_ech(SSL_CONNECTION *s, WPACKET *pkt,
+                                  unsigned int context, X509 *x,
+                                  size_t chainidx)
+{
+    unsigned char *encp, *payloadp;
+    unsigned char cfgid;
+    size_t namelen, payloadlen;
+    OSSL_LIB_CTX *libctx = SSL_CONNECTION_GET_CTX(s)->libctx;
+
+    if (SSL_CONNECTION_IS_DTLS(s))
+        return EXT_RETURN_NOT_SENT;
+
+    /*
+     * Reproduce the padding rule of the ECH draft so that the length we
+     * advertise is the length a real ECH would have had: the inner server_name
+     * is padded out to 128 bytes, the whole inner ClientHello is then padded to
+     * a multiple of 32, and the AEAD tag is appended.
+     *
+     * The name *and its padding* together occupy 128 bytes, so for any name
+     * shorter than that the total is constant - which is the entire point of
+     * the padding, and matches Chrome sending 250 bytes for SNIs of both 9 and
+     * 16 characters.
+     */
+    namelen = s->ext.hostname != NULL ? strlen(s->ext.hostname) : 0;
+    if (namelen < ECH_GREASE_NAME_PADDED)
+        namelen = ECH_GREASE_NAME_PADDED;
+    payloadlen = ECH_GREASE_INNER_LEN + namelen;
+    payloadlen = (payloadlen + 31) & ~(size_t)31;
+    payloadlen += ECH_GREASE_AEAD_TAG_LEN;
+
+    if (RAND_bytes_ex(libctx, &cfgid, sizeof(cfgid), 0) <= 0) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+
+    if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_encrypted_client_hello)
+            || !WPACKET_start_sub_packet_u16(pkt)
+               /* ECHClientHelloType: outer */
+            || !WPACKET_put_bytes_u8(pkt, 0)
+            || !WPACKET_put_bytes_u16(pkt, ECH_GREASE_KDF_ID)
+            || !WPACKET_put_bytes_u16(pkt, ECH_GREASE_AEAD_ID)
+            || !WPACKET_put_bytes_u8(pkt, cfgid)
+            || !WPACKET_sub_allocate_bytes_u16(pkt, ECH_GREASE_ENC_LEN, &encp)
+            || !WPACKET_sub_allocate_bytes_u16(pkt, payloadlen, &payloadp)
+            || !WPACKET_close(pkt)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+
+    /*
+     * Both fields are indistinguishable from the real thing to anyone without
+     * the ECH private key: an X25519 public key and an AEAD ciphertext are
+     * uniform random strings.
+     */
+    if (RAND_bytes_ex(libctx, encp, ECH_GREASE_ENC_LEN, 0) <= 0
+            || RAND_bytes_ex(libctx, payloadp, payloadlen, 0) <= 0) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+
+    return EXT_RETURN_SENT;
+}
+
+int tls_parse_stoc_ech(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
+                       X509 *x, size_t chainidx)
+{
+    /*
+     * The only thing a server can send us here is retry_configs, in response
+     * to the GREASE ECH above. We have no ECH to retry, so accept and ignore
+     * it rather than failing the handshake on an unsolicited extension.
+     */
+    if (!PACKET_forward(pkt, PACKET_remaining(pkt))) {
+        SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_BAD_EXTENSION);
+        return 0;
+    }
+
+    return 1;
 }
 
 /*
@@ -1260,29 +1502,20 @@ EXT_RETURN tls_construct_ctos_psk(SSL_CONNECTION *s, WPACKET *pkt,
 #endif
 }
 
-EXT_RETURN tls_construct_ctos_post_handshake_auth(SSL_CONNECTION *s, WPACKET *pkt,
+EXT_RETURN tls_construct_ctos_post_handshake_auth(ossl_unused SSL_CONNECTION *s,
+                                                  ossl_unused WPACKET *pkt,
                                                   ossl_unused unsigned int context,
                                                   ossl_unused X509 *x,
                                                   ossl_unused size_t chainidx)
 {
-#ifndef OPENSSL_NO_TLS1_3
-    if (!s->pha_enabled)
-        return EXT_RETURN_NOT_SENT;
-
-    /* construct extension - 0 length, no contents */
-    if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_post_handshake_auth)
-            || !WPACKET_start_sub_packet_u16(pkt)
-            || !WPACKET_close(pkt)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-        return EXT_RETURN_FAIL;
-    }
-
-    s->post_handshake_auth = SSL_PHA_EXT_SENT;
-
-    return EXT_RETURN_SENT;
-#else
+    /*
+     * Never offered. Chrome does not support post-handshake authentication, so
+     * sending the extension would add a codepoint to the ClientHello that no
+     * browser sends. Applications turn it on without meaning to - httpx calls
+     * SSL_CTX_set_post_handshake_auth() on every context it builds, which is
+     * enough on its own to change the JA4 extension count.
+     */
     return EXT_RETURN_NOT_SENT;
-#endif
 }
 
 
@@ -1867,6 +2100,7 @@ int tls_parse_stoc_key_share(SSL_CONNECTION *s, PACKET *pkt,
 {
 #ifndef OPENSSL_NO_TLS1_3
     unsigned int group_id;
+    size_t i, j;
     PACKET encoded_pt;
     EVP_PKEY *ckey = s->s3.tmp.pkey, *skey = NULL;
     const TLS_GROUP_INFO *ginf = NULL;
@@ -1915,19 +2149,41 @@ int tls_parse_stoc_key_share(SSL_CONNECTION *s, PACKET *pkt,
         }
 
         s->s3.group_id = group_id;
-        EVP_PKEY_free(s->s3.tmp.pkey);
+        for (i = 0; i < s->s3.tmp.num_ks_pkey; i++) {
+            EVP_PKEY_free(s->s3.tmp.ks_pkey[i]);
+            s->s3.tmp.ks_pkey[i] = NULL;
+        }
+        s->s3.tmp.num_ks_pkey = 0;
         s->s3.tmp.pkey = NULL;
         return 1;
     }
 
-    if (group_id != s->s3.group_id) {
+    /*
+     * The server must have picked one of the groups we sent a share for. Make
+     * its key the current one and drop the others.
+     */
+    for (i = 0; i < s->s3.tmp.num_ks_pkey; i++) {
+        if (s->s3.tmp.ks_group_id[i] == group_id)
+            break;
+    }
+    if (i >= s->s3.tmp.num_ks_pkey) {
         /*
-         * This isn't for the group that we sent in the original
-         * key_share!
+         * This isn't for a group that we sent in the original key_share!
          */
         SSLfatal(s, SSL_AD_ILLEGAL_PARAMETER, SSL_R_BAD_KEY_SHARE);
         return 0;
     }
+    ckey = s->s3.tmp.ks_pkey[i];
+    s->s3.tmp.pkey = ckey;
+    s->s3.group_id = group_id;
+    for (j = 0; j < s->s3.tmp.num_ks_pkey; j++) {
+        if (j != i)
+            EVP_PKEY_free(s->s3.tmp.ks_pkey[j]);
+        s->s3.tmp.ks_pkey[j] = NULL;
+    }
+    s->s3.tmp.ks_pkey[0] = ckey;
+    s->s3.tmp.ks_group_id[0] = group_id;
+    s->s3.tmp.num_ks_pkey = 1;
     /* Retain this group in the SSL_SESSION */
     if (!s->hit) {
         s->session->kex_group = group_id;

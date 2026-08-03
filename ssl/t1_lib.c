@@ -197,13 +197,17 @@ static const unsigned char ecformats_default[] = {
 //    TLSEXT_ECPOINTFORMAT_ansiX962_compressed_char2
 };
 
-/* The default curves */
+/*
+ * The default curves: Chrome's list, in Chrome's order, because the
+ * supported_groups extension is part of the fingerprint we are matching.
+ */
 static const uint16_t supported_groups_default[] = {
+    OSSL_TLS_GROUP_ID_X25519MLKEM768, /* X25519MLKEM768 (0x11ec) */
     OSSL_TLS_GROUP_ID_x25519,        /* X25519 (29) */
     OSSL_TLS_GROUP_ID_secp256r1,     /* secp256r1 (23) */
 //    OSSL_TLS_GROUP_ID_x448,          /* X448 (30) */
     OSSL_TLS_GROUP_ID_secp384r1,     /* secp384r1 (24) */
-    OSSL_TLS_GROUP_ID_secp521r1,     /* secp521r1 (25) */
+//    OSSL_TLS_GROUP_ID_secp521r1,     /* secp521r1 (25) */
 //    OSSL_TLS_GROUP_ID_gc256A,        /* GC256A (34) */
 //    OSSL_TLS_GROUP_ID_gc256B,        /* GC256B (35) */
 //    OSSL_TLS_GROUP_ID_gc256C,        /* GC256C (36) */

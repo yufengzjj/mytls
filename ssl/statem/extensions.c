@@ -414,6 +414,32 @@ static const EXTENSION_DEFINITION ext_defs[] = {
         tls_construct_certificate_authorities, NULL,
     },
     {
+        /*
+         * Application-Layer Protocol Settings. Chrome offers it whenever it
+         * offers h2, and a server that supports it answers inside
+         * EncryptedExtensions - which we accept and ignore, since we have no
+         * settings to exchange.
+         */
+        TLSEXT_TYPE_application_settings,
+        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS
+        | SSL_EXT_TLS1_3_ONLY,
+        NULL, NULL, tls_parse_stoc_alps, NULL,
+        tls_construct_ctos_alps, NULL
+    },
+    {
+        /*
+         * We only ever send a GREASE encrypted_client_hello (we have no
+         * ECHConfig), but a server that does have ECH configured will answer
+         * with retry_configs in EncryptedExtensions, so we must be prepared to
+         * accept - and ignore - the response.
+         */
+        TLSEXT_TYPE_encrypted_client_hello,
+        SSL_EXT_CLIENT_HELLO | SSL_EXT_TLS1_3_ENCRYPTED_EXTENSIONS
+        | SSL_EXT_TLS1_3_ONLY,
+        NULL, NULL, tls_parse_stoc_ech, NULL,
+        tls_construct_ctos_ech, NULL
+    },
+    {
         /* Must be immediately before pre_shared_key */
         TLSEXT_TYPE_padding,
         SSL_EXT_CLIENT_HELLO,
@@ -838,7 +864,6 @@ int should_add_extension(SSL_CONNECTION *s, unsigned int extctx,
 
     return 1;
 }
-extern int gen_random_grease();
 /*
  * Construct all the extensions relevant to the current |context| and write
  * them to |pkt|. If this is an extension for a Certificate in a Certificate
@@ -855,6 +880,7 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
     int min_version, max_version = 0, reason;
     const EXTENSION_DEFINITION *thisexd;
     int for_comp = (context & SSL_EXT_TLS1_3_CERTIFICATE_COMPRESSION) != 0;
+    int grease = 0, shuffled = 0;
 
     if (!WPACKET_start_sub_packet_u16(pkt)
                /*
@@ -889,17 +915,59 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
         /* SSLfatal() already called */
         return 0;
     }
-    s->ext_1st_grease = gen_random_grease();
-    if (!WPACKET_put_bytes_u16(pkt, s->ext_1st_grease)
-        || !WPACKET_sub_memcpy_u16(pkt, 0, 0)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-        return EXT_RETURN_FAIL;
+    /*
+     * GREASE (RFC 8701) and extension-order randomisation only apply to a
+     * ClientHello we generate ourselves. Every other message keeps the plain
+     * table order.
+     */
+    grease = (context & SSL_EXT_CLIENT_HELLO) != 0 && !s->server;
+
+    if (grease) {
+        /* The first GREASE extension is empty and always comes first. */
+        if (!WPACKET_put_bytes_u16(pkt,
+                                   ossl_ssl_grease_value(s,
+                                                         SSL_GREASE_EXTENSION1))
+                || !WPACKET_sub_memcpy_u16(pkt, NULL, 0)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+            return 0;
+        }
+        /*
+         * padding and pre_shared_key are excluded from the shuffle: the
+         * padding length is computed from everything written before it, and
+         * TLSv1.3 requires pre_shared_key to be the very last extension.
+         */
+        shuffled = ossl_ssl_ext_permutation(s, TLSEXT_IDX_padding);
     }
-    for (i = 0, thisexd = ext_defs; i < OSSL_NELEM(ext_defs); i++, thisexd++) {
+
+    for (i = 0; i < OSSL_NELEM(ext_defs); i++) {
         EXT_RETURN (*construct)(SSL_CONNECTION *s, WPACKET *pkt,
                                 unsigned int context,
                                 X509 *x, size_t chainidx);
         EXT_RETURN ret;
+        size_t idx = i;
+
+        if (shuffled && i < TLSEXT_IDX_padding)
+            idx = s->ext_permutation[i];
+
+        if (grease && i == TLSEXT_IDX_padding) {
+            /*
+             * All the real extensions have been written. The second GREASE
+             * extension carries a single zero byte and goes here, i.e. after
+             * everything real but before padding/pre_shared_key.
+             */
+            static const unsigned char grease_body[] = { 0x00 };
+
+            if (!WPACKET_put_bytes_u16(pkt,
+                                       ossl_ssl_grease_value(s,
+                                                       SSL_GREASE_EXTENSION2))
+                    || !WPACKET_sub_memcpy_u16(pkt, grease_body,
+                                               sizeof(grease_body))) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                return 0;
+            }
+        }
+
+        thisexd = ext_defs + idx;
 
         /* Skip if not relevant for our context */
         if (!should_add_extension(s, thisexd->context, context, max_version))
@@ -920,7 +988,7 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
                 && (context & (SSL_EXT_CLIENT_HELLO
                                | SSL_EXT_TLS1_3_CERTIFICATE_REQUEST
                                | SSL_EXT_TLS1_3_NEW_SESSION_TICKET)) != 0)
-            s->ext.extflags[i] |= SSL_EXT_FLAG_SENT;
+            s->ext.extflags[idx] |= SSL_EXT_FLAG_SENT;
     }
 
     if (!WPACKET_close(pkt)) {
@@ -1813,8 +1881,48 @@ static EXT_RETURN tls_construct_compress_certificate(SSL_CONNECTION *sc, WPACKET
                                                      unsigned int context,
                                                      X509 *x, size_t chainidx)
 {
-#ifndef OPENSSL_NO_COMP_ALG
     int i;
+
+    /*
+     * The client always advertises exactly what Chrome advertises, whatever
+     * this build can actually decompress, because the extension is part of the
+     * fingerprint. A build that cannot decompress brotli will fail the
+     * handshake against a server that compresses its certificate chain, so
+     * configure with "enable-brotli".
+     */
+    if (!sc->server && (context & SSL_EXT_CLIENT_HELLO) != 0) {
+        static const uint16_t chrome_cert_comp_algs[] = {
+            TLSEXT_comp_cert_brotli
+        };
+
+        if ((sc->options & SSL_OP_NO_RX_CERTIFICATE_COMPRESSION) != 0
+                || sc->ext.client_cert_type_ctos)
+            return EXT_RETURN_NOT_SENT;
+
+        if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_compress_certificate)
+                || !WPACKET_start_sub_packet_u16(pkt)
+                || !WPACKET_start_sub_packet_u8(pkt)) {
+            SSLfatal(sc, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+            return EXT_RETURN_FAIL;
+        }
+
+        for (i = 0; i < (int)OSSL_NELEM(chrome_cert_comp_algs); i++) {
+            if (!WPACKET_put_bytes_u16(pkt, chrome_cert_comp_algs[i])) {
+                SSLfatal(sc, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                return EXT_RETURN_FAIL;
+            }
+        }
+
+        if (!WPACKET_close(pkt) || !WPACKET_close(pkt)) {
+            SSLfatal(sc, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+            return EXT_RETURN_FAIL;
+        }
+
+        sc->ext.compress_certificate_sent = 1;
+        return EXT_RETURN_SENT;
+    }
+
+#ifndef OPENSSL_NO_COMP_ALG
     if (!ossl_comp_has_alg(0))
         return EXT_RETURN_NOT_SENT;
 

@@ -701,11 +701,29 @@ typedef enum tlsext_index_en {
     TLSEXT_IDX_compress_certificate,
     TLSEXT_IDX_early_data,
     TLSEXT_IDX_certificate_authorities,
+    TLSEXT_IDX_application_settings,
+    TLSEXT_IDX_encrypted_client_hello,
     TLSEXT_IDX_padding,
     TLSEXT_IDX_psk,
     /* Dummy index - must always be the last entry */
     TLSEXT_IDX_num_builtins
 } TLSEXT_INDEX;
+
+/*
+ * GREASE slots (RFC 8701). Each slot gets its own byte of the per-connection
+ * GREASE seed, so the values are independent of one another but reproducible
+ * within a connection.
+ */
+typedef enum ssl_grease_index_en {
+    SSL_GREASE_CIPHER,
+    SSL_GREASE_GROUP,
+    SSL_GREASE_EXTENSION1,
+    SSL_GREASE_EXTENSION2,
+    SSL_GREASE_VERSION,
+    SSL_GREASE_TICKET_EXT,
+    /* Dummy index - must always be the last entry */
+    SSL_GREASE_LAST
+} SSL_GREASE_INDEX;
 
 DEFINE_LHASH_OF_EX(SSL_SESSION);
 /* Needed in ssl_cert.c */
@@ -749,6 +767,10 @@ int ssl_get_EC_curve_nid(const EVP_PKEY *pkey);
 __owur int tls13_set_encoded_pub_key(EVP_PKEY *pkey,
                                      const unsigned char *enckey,
                                      size_t enckeylen);
+
+#ifndef OPENSSL_CLIENT_MAX_KEY_SHARES
+# define OPENSSL_CLIENT_MAX_KEY_SHARES 4
+#endif
 
 typedef struct tls_group_info_st {
     char *tlsname;           /* Curve Name as in TLS specs */
@@ -807,6 +829,12 @@ struct ssl_ctx_st {
     STACK_OF(SSL_CIPHER) *cipher_list_by_id;
     /* TLSv1.3 specific ciphersuites */
     STACK_OF(SSL_CIPHER) *tls13_ciphersuites;
+    /*
+     * Set once SSL_CTX_new_ex() has installed the cipher lists that make up
+     * the fingerprint. While set, the public cipher setters are no-ops - see
+     * ossl_ssl_ciphers_pinned().
+     */
+    int ciphers_pinned;
     struct x509_store_st /* X509_STORE */ *cert_store;
     LHASH_OF(SSL_SESSION) *sessions;
     /*
@@ -1312,6 +1340,17 @@ struct ssl_connection_st {
             /* used to hold the new cipher we are going to use */
             const SSL_CIPHER *new_cipher;
             EVP_PKEY *pkey;         /* holds short lived key exchange key */
+            /*
+             * Client key_share state. Chrome sends a share for both
+             * X25519MLKEM768 and X25519, so we have to keep more than one
+             * private key alive until the server picks a group. |pkey|
+             * above aliases entry 0 and keeps the rest of the code that
+             * only knows about a single key working; once the server has
+             * chosen, it is repointed at the matching entry.
+             */
+            EVP_PKEY *ks_pkey[OPENSSL_CLIENT_MAX_KEY_SHARES];
+            uint16_t ks_group_id[OPENSSL_CLIENT_MAX_KEY_SHARES];
+            size_t num_ks_pkey;
             /* used for certificate requests */
             int cert_req;
             /* Certificate types in certificate request message. */
@@ -1803,8 +1842,24 @@ struct ssl_connection_st {
     size_t client_cert_type_len;
     unsigned char *server_cert_type;
     size_t server_cert_type_len;
-    int ext_1st_grease;
-    int spt_group_grease;
+
+    /*
+     * Client fingerprint mimicry state (see ssl/ssl_grease.c).
+     *
+     * |grease_seed| holds one random byte per GREASE slot. It is drawn once
+     * per connection so that every GREASE value stays stable for the lifetime
+     * of the connection: the second ClientHello after a HelloRetryRequest has
+     * to repeat the values from the first, and the key_share GREASE entry has
+     * to agree with the supported_groups one even though the two extensions
+     * are emitted in a randomised order.
+     *
+     * |ext_permutation| is the randomised ClientHello extension order, also
+     * drawn once per connection, for the same reason.
+     */
+    unsigned char grease_seed[SSL_GREASE_LAST];
+    int grease_seeded;
+    unsigned char ext_permutation[TLSEXT_IDX_num_builtins];
+    size_t ext_permutation_len;
 };
 
 # define SSL_CONNECTION_FROM_SSL_ONLY_int(ssl, c) \
@@ -2494,6 +2549,12 @@ __owur SSL *ossl_ssl_connection_new_int(SSL_CTX *ctx, const SSL_METHOD *method);
 __owur SSL *ossl_ssl_connection_new(SSL_CTX *ctx);
 void ossl_ssl_connection_free(SSL *ssl);
 __owur int ossl_ssl_connection_reset(SSL *ssl);
+
+__owur int ossl_ssl_ciphers_pinned(const SSL_CTX *ctx);
+
+/* ssl_grease.c */
+__owur uint16_t ossl_ssl_grease_value(SSL_CONNECTION *s, int idx);
+__owur int ossl_ssl_ext_permutation(SSL_CONNECTION *s, size_t num);
 
 __owur int ssl_read_internal(SSL *s, void *buf, size_t num, size_t *readbytes);
 __owur int ssl_write_internal(SSL *s, const void *buf, size_t num,

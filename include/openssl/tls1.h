@@ -160,6 +160,12 @@ extern "C" {
 # define TLSEXT_TYPE_key_share                   51
 # define TLSEXT_TYPE_quic_transport_parameters   57
 
+/* draft-vvv-tls-alps: Application-Layer Protocol Settings */
+# define TLSEXT_TYPE_application_settings        0x44cd
+
+/* draft-ietf-tls-esni: Encrypted ClientHello */
+# define TLSEXT_TYPE_encrypted_client_hello      0xfe0d
+
 /* Temporary extension type */
 # define TLSEXT_TYPE_renegotiate                 0xff01
 

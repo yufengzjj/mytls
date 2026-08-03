@@ -310,6 +310,7 @@ extern const OSSL_DISPATCH ossl_rsa_keymgmt_functions[];
 extern const OSSL_DISPATCH ossl_rsapss_keymgmt_functions[];
 #ifndef OPENSSL_NO_ECX
 extern const OSSL_DISPATCH ossl_x25519_keymgmt_functions[];
+extern const OSSL_DISPATCH ossl_mlx_x25519_kem_kmgmt_functions[];
 extern const OSSL_DISPATCH ossl_x448_keymgmt_functions[];
 extern const OSSL_DISPATCH ossl_ed25519_keymgmt_functions[];
 extern const OSSL_DISPATCH ossl_ed448_keymgmt_functions[];
@@ -393,6 +394,7 @@ extern const OSSL_DISPATCH ossl_sm2_asym_cipher_functions[];
 /* Asym Key encapsulation  */
 extern const OSSL_DISPATCH ossl_rsa_asym_kem_functions[];
 extern const OSSL_DISPATCH ossl_ecx_asym_kem_functions[];
+extern const OSSL_DISPATCH ossl_mlx_kem_asym_kem_functions[];
 extern const OSSL_DISPATCH ossl_ec_asym_kem_functions[];
 
 /* Encoders */

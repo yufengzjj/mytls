@@ -25,6 +25,7 @@
 #include "internal/cryptlib.h"
 #include "internal/nelem.h"
 #include "internal/refcount.h"
+#include "internal/thread_once.h"
 #include "internal/ktls.h"
 #include "internal/to_hex.h"
 #include "quic/quic_local.h"
@@ -592,6 +593,15 @@ int ossl_ssl_connection_reset(SSL *s)
     sc->hello_retry_request = SSL_HRR_NONE;
     sc->sent_tickets = 0;
 
+    /*
+     * Draw fresh GREASE values and a fresh extension order for the next
+     * connection - reusing them would make every ClientHello from this SSL
+     * object identical, which is exactly what the randomisation is there to
+     * avoid.
+     */
+    sc->grease_seeded = 0;
+    sc->ext_permutation_len = 0;
+
     sc->error = 0;
     sc->hit = 0;
     sc->shutdown = 0;
@@ -666,6 +676,15 @@ int SSL_CTX_set_ssl_version(SSL_CTX *ctx, const SSL_METHOD *meth)
     }
 
     ctx->method = meth;
+
+    /*
+     * Changing the method normally resets both cipher lists to the library
+     * defaults. That would defeat the pinning, and this function reaches
+     * ssl_create_cipher_list() directly rather than through the setters, so it
+     * has to be handled here.
+     */
+    if (ossl_ssl_ciphers_pinned(ctx))
+        return 1;
 
     if (!SSL_CTX_set_ciphersuites(ctx, OSSL_default_ciphersuites())) {
         ERR_raise(ERR_LIB_SSL, SSL_R_SSL_LIBRARY_HAS_NO_CIPHERS);
@@ -3325,10 +3344,51 @@ static int cipher_list_tls12_num(STACK_OF(SSL_CIPHER) *sk)
     return num;
 }
 
+/*
+ * Cipher pinning.
+ *
+ * The offered cipher suites are part of the fingerprint this library exists to
+ * reproduce, so SSL_CTX_new_ex() installs Chrome's lists and then pins them.
+ * While pinned, the four public setters below accept a new list and quietly
+ * keep the pinned one.
+ *
+ * This exists because applications routinely overwrite the cipher list without
+ * meaning to: CPython's _ssl.c, for instance, applies its own cipher string to
+ * every SSLContext it creates, which is enough to change the JA4 cipher hash.
+ * Reporting failure instead would just turn that into an exception the
+ * application cannot do anything about.
+ *
+ * Set MYTLS_ALLOW_CIPHER_OVERRIDE=1 in the environment to get the stock
+ * behaviour back - needed if you want "openssl ciphers <string>" to evaluate
+ * the string you passed rather than print the pinned list.
+ */
+static int cipher_override_allowed = 0;
+static CRYPTO_ONCE cipher_override_once = CRYPTO_ONCE_STATIC_INIT;
+
+DEFINE_RUN_ONCE_STATIC(ssl_init_cipher_override)
+{
+    const char *e = ossl_safe_getenv("MYTLS_ALLOW_CIPHER_OVERRIDE");
+
+    cipher_override_allowed = e != NULL && *e != '\0' && *e != '0';
+    return 1;
+}
+
+int ossl_ssl_ciphers_pinned(const SSL_CTX *ctx)
+{
+    if (ctx == NULL || !ctx->ciphers_pinned)
+        return 0;
+    if (!RUN_ONCE(&cipher_override_once, ssl_init_cipher_override))
+        return 1;
+    return !cipher_override_allowed;
+}
+
 /** specify the ciphers to be used by default by the SSL_CTX */
 int SSL_CTX_set_cipher_list(SSL_CTX *ctx, const char *str)
 {
     STACK_OF(SSL_CIPHER) *sk;
+
+    if (ossl_ssl_ciphers_pinned(ctx))
+        return 1;
 
     sk = ssl_create_cipher_list(ctx, ctx->tls13_ciphersuites,
                                 &ctx->cipher_list, &ctx->cipher_list_by_id, str,
@@ -3357,6 +3417,9 @@ int SSL_set_cipher_list(SSL *s, const char *str)
 
     if (sc == NULL)
         return 0;
+
+    if (ossl_ssl_ciphers_pinned(s->ctx))
+        return 1;
 
     sk = ssl_create_cipher_list(s->ctx, sc->tls13_ciphersuites,
                                 &sc->cipher_list, &sc->cipher_list_by_id, str,
@@ -3854,8 +3917,14 @@ static int ssl_session_cmp(const SSL_SESSION *a, const SSL_SESSION *b)
 }
 
 void keylog_callback(const SSL *ssl, const char *line) {
-    FILE *keylog_file = fopen(getenv("SSLKEYLOGFILE"), "a");
-    if (keylog_file) {
+    const char *path = getenv("SSLKEYLOGFILE");
+    FILE *keylog_file;
+
+    if (path == NULL || *path == '\0')
+        return;
+
+    keylog_file = fopen(path, "a");
+    if (keylog_file != NULL) {
         fprintf(keylog_file, "%s\n", line);
         fclose(keylog_file);
     }
@@ -4131,32 +4200,51 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
         ERR_raise(ERR_LIB_SSL, SSL_R_ERROR_IN_SYSTEM_DEFAULT_CONFIG);
         goto err;
     }
+    /*
+     * Defaults chosen so that a ClientHello from this library is byte-for-byte
+     * what Chrome would send. Anything an application overrides afterwards
+     * (ALPN, SNI, ...) is its own business, but everything that feeds the
+     * fingerprint is pinned here.
+     */
     SSL_CTX_clear_options(ret, SSL_OP_NO_COMPRESSION);
     SSL_CTX_clear_options(ret, SSL_OP_NO_RX_CERTIFICATE_COMPRESSION);
-    SSL_CTX_compress_certs(ret, TLSEXT_comp_cert_zlib);
-    SSL_CTX_clear_options(ret, SSL_OP_NO_TLSv1 | SSL_OP_NO_TLSv1_1 | SSL_OP_NO_TLSv1_2 | SSL_OP_NO_TLSv1_3);
-    SSL_CTX_set_options(ret,SSL_OP_TLSEXT_PADDING);
-    SSL_CTX_set_options(ret,SSL_OP_NO_ENCRYPT_THEN_MAC );
-    SSL_CTX_set_options(ret, SSL_OP_NO_TICKET);
+    /* Chrome advertises brotli, and only brotli, for certificate compression */
+    SSL_CTX_clear_options(ret, SSL_OP_NO_TLSv1_2 | SSL_OP_NO_TLSv1_3);
+    SSL_CTX_set_options(ret, SSL_OP_TLSEXT_PADDING);
+    SSL_CTX_set_options(ret, SSL_OP_NO_ENCRYPT_THEN_MAC);
     SSL_CTX_set_tlsext_status_type(ret, TLSEXT_STATUSTYPE_ocsp);
     SSL_CTX_enable_ct(ret, SSL_CT_VALIDATION_PERMISSIVE);
-    SSL_CTX_set_min_proto_version(ret,TLS1_VERSION);
-    SSL_CTX_set_max_proto_version(ret,TLS1_3_VERSION);
-    SSL_CTX_set_cipher_list(ret,"ECDHE-ECDSA-AES256-GCM-SHA384:"
-                                "ECDHE-ECDSA-AES128-GCM-SHA256:"
-                                "ECDHE-ECDSA-CHACHA20-POLY1305:"
-                                "ECDHE-RSA-AES256-GCM-SHA384:"
-                                "ECDHE-RSA-AES128-GCM-SHA256:"
-                                "ECDHE-RSA-CHACHA20-POLY1305:"
-                                "ECDHE-ECDSA-AES256-SHA:"
-                                "ECDHE-ECDSA-AES128-SHA:"
-                                "ECDHE-RSA-AES256-SHA:"
-                                "ECDHE-RSA-AES128-SHA:"
-                                "AES256-GCM-SHA384:"
-                                "AES128-GCM-SHA256:"
-                                "AES256-SHA:"
-                                "AES128-SHA");
-    SSL_CTX_set_keylog_callback(ret,keylog_callback);
+    /*
+     * TLSv1.2 is the floor: supported_versions must offer exactly {1.3, 1.2},
+     * and the empty renegotiation_info extension takes the place of the
+     * TLS_EMPTY_RENEGOTIATION_INFO_SCSV cipher only when TLSv1.0 is off.
+     */
+    SSL_CTX_set_min_proto_version(ret, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ret, TLS1_3_VERSION);
+    /* TLSv1.3 suites, in Chrome's order */
+    SSL_CTX_set_ciphersuites(ret, "TLS_AES_128_GCM_SHA256:"
+                                  "TLS_AES_256_GCM_SHA384:"
+                                  "TLS_CHACHA20_POLY1305_SHA256");
+    /* TLSv1.2 and below, in Chrome's order */
+    SSL_CTX_set_cipher_list(ret, "ECDHE-ECDSA-AES128-GCM-SHA256:"
+                                 "ECDHE-RSA-AES128-GCM-SHA256:"
+                                 "ECDHE-ECDSA-AES256-GCM-SHA384:"
+                                 "ECDHE-RSA-AES256-GCM-SHA384:"
+                                 "ECDHE-ECDSA-CHACHA20-POLY1305:"
+                                 "ECDHE-RSA-CHACHA20-POLY1305:"
+                                 "ECDHE-RSA-AES128-SHA:"
+                                 "ECDHE-RSA-AES256-SHA:"
+                                 "AES128-GCM-SHA256:"
+                                 "AES256-GCM-SHA384:"
+                                 "AES128-SHA:"
+                                 "AES256-SHA");
+    /*
+     * From here on the cipher lists are part of the fingerprint and the public
+     * setters will leave them alone. See ossl_ssl_ciphers_pinned().
+     */
+    ret->ciphers_pinned = 1;
+    if (getenv("SSLKEYLOGFILE") != NULL)
+        SSL_CTX_set_keylog_callback(ret, keylog_callback);
     return ret;
  err:
     SSL_CTX_free(ret);

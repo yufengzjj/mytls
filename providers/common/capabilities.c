@@ -16,6 +16,7 @@
 #include <openssl/params.h>
 #include "internal/nelem.h"
 #include "internal/tlsgroups.h"
+#include "crypto/ml_kem.h"
 #include "prov/providercommon.h"
 #include "internal/e_os.h"
 
@@ -28,6 +29,7 @@ typedef struct tls_group_constants_st {
     int maxtls;              /* Maximum TLS version (or 0 for undefined) */
     int mindtls;             /* Minimum DTLS version, -1 unsupported */
     int maxdtls;             /* Maximum DTLS version (or 0 for undefined) */
+    int is_kem;              /* Indicates utility as KEM */
 } TLS_GROUP_CONSTANTS;
 
 static const TLS_GROUP_CONSTANTS group_list[] = {
@@ -95,6 +97,9 @@ static const TLS_GROUP_CONSTANTS group_list[] = {
     { OSSL_TLS_GROUP_ID_ffdhe4096, 128, TLS1_3_VERSION, 0, -1, -1 },
     { OSSL_TLS_GROUP_ID_ffdhe6144, 128, TLS1_3_VERSION, 0, -1, -1 },
     { OSSL_TLS_GROUP_ID_ffdhe8192, 192, TLS1_3_VERSION, 0, -1, -1 },
+    /* Hybrid ML-KEM group; TLSv1.3 only, and used as a KEM not a KEX */
+    { OSSL_TLS_GROUP_ID_X25519MLKEM768, ML_KEM_768_SECBITS,
+      TLS1_3_VERSION, 0, -1, -1, 1 },
 };
 
 #define TLS_GROUP_ENTRY(tlsname, realname, algorithm, idx) \
@@ -120,10 +125,12 @@ static const TLS_GROUP_CONSTANTS group_list[] = {
                         (unsigned int *)&group_list[idx].mindtls), \
         OSSL_PARAM_int(OSSL_CAPABILITY_TLS_GROUP_MAX_DTLS, \
                         (unsigned int *)&group_list[idx].maxdtls), \
+        OSSL_PARAM_int(OSSL_CAPABILITY_TLS_GROUP_IS_KEM, \
+                        (unsigned int *)&group_list[idx].is_kem), \
         OSSL_PARAM_END \
     }
 
-static const OSSL_PARAM param_group_list[][10] = {
+static const OSSL_PARAM param_group_list[][11] = {
 # ifndef OPENSSL_NO_EC
 #  ifndef OPENSSL_NO_EC2M
     TLS_GROUP_ENTRY("sect163k1", "sect163k1", "EC", 0),
@@ -203,6 +210,10 @@ static const OSSL_PARAM param_group_list[][10] = {
     TLS_GROUP_ENTRY("ffdhe4096", "ffdhe4096", "DH", 35),
     TLS_GROUP_ENTRY("ffdhe6144", "ffdhe6144", "DH", 36),
     TLS_GROUP_ENTRY("ffdhe8192", "ffdhe8192", "DH", 37),
+# endif
+# ifndef OPENSSL_NO_ECX
+    TLS_GROUP_ENTRY("X25519MLKEM768", "X25519MLKEM768",
+                    "X25519MLKEM768", 38),
 # endif
 };
 #endif /* !defined(OPENSSL_NO_EC) || !defined(OPENSSL_NO_DH) */

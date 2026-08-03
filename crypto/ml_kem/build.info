@@ -1,0 +1,3 @@
+LIBS = ../../libcrypto
+
+SOURCE[../../libcrypto]=ml_kem.c

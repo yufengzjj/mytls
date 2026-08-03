@@ -1388,7 +1388,13 @@ static int update_cipher_list(SSL_CTX *ctx,
 
 int SSL_CTX_set_ciphersuites(SSL_CTX *ctx, const char *str)
 {
-    int ret = set_ciphersuites(&(ctx->tls13_ciphersuites), str);
+    int ret;
+
+    /* See the cipher pinning note in ssl_lib.c */
+    if (ossl_ssl_ciphers_pinned(ctx))
+        return 1;
+
+    ret = set_ciphersuites(&(ctx->tls13_ciphersuites), str);
 
     if (ret && ctx->cipher_list != NULL)
         return update_cipher_list(ctx, &ctx->cipher_list, &ctx->cipher_list_by_id,
@@ -1405,6 +1411,10 @@ int SSL_set_ciphersuites(SSL *s, const char *str)
 
     if (sc == NULL)
         return 0;
+
+    /* See the cipher pinning note in ssl_lib.c */
+    if (ossl_ssl_ciphers_pinned(s->ctx))
+        return 1;
 
     ret = set_ciphersuites(&(sc->tls13_ciphersuites), str);
 
@@ -2250,19 +2260,4 @@ const char *OSSL_default_ciphersuites(void)
            "TLS_CHACHA20_POLY1305_SHA256";
 }
 
-const unsigned short GREASE_VALUES[] = {
-        0x0A0A, 0x1A1A, 0x2A2A, 0x3A3A, 0x4A4A, 0x5A5A,
-        0x6A6A, 0x7A7A, 0x8A8A, 0x9A9A, 0xAAAA, 0xBABA,
-        0xCACA, 0xDADA, 0xEAEA, 0xFAFA
-};
-const size_t GREASE_VALUES_COUNT = sizeof(GREASE_VALUES) / sizeof(GREASE_VALUES[0]);
-int gen_random_grease(){
-    unsigned char random_byte[4];
-    int random_number;
-    RAND_bytes(random_byte, sizeof(random_byte));
-    random_number = ((random_byte[0] << 24) |
-                     (random_byte[1] << 16) |
-                     (random_byte[2] << 8) |
-                     random_byte[3]);
-    return GREASE_VALUES[abs(random_number) % GREASE_VALUES_COUNT];
-}
+/* GREASE support now lives in ssl_grease.c */
