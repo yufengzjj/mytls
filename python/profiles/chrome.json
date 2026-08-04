@@ -54,7 +54,7 @@
     "legacy_version": "0x0303",
     "session_id_len": 32,
     "cipher_suites": [
-      "0x6a6a",
+      "0xbaba",
       "0x1301",
       "0x1302",
       "0x1303",
@@ -73,11 +73,74 @@
     ],
     "extensions": [
       {
-        "type": 51914,
-        "hex": "0xcaca",
+        "type": 60138,
+        "hex": "0xeaea",
         "length": 0,
         "grease": true,
         "body": ""
+      },
+      {
+        "type": 0,
+        "hex": "0x0000",
+        "length": 14,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 27,
+        "hex": "0x001b",
+        "length": 3,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 51,
+        "hex": "0x0033",
+        "length": 1263,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 18,
+        "hex": "0x0012",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 11,
+        "hex": "0x000b",
+        "length": 2,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 17613,
+        "hex": "0x44cd",
+        "length": 5,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 10,
+        "hex": "0x000a",
+        "length": 12,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 35,
+        "hex": "0x0023",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 65037,
+        "hex": "0xfe0d",
+        "length": 250,
+        "grease": false,
+        "body": null
       },
       {
         "type": 23,
@@ -94,65 +157,9 @@
         "body": null
       },
       {
-        "type": 17613,
-        "hex": "0x44cd",
-        "length": 5,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 27,
-        "hex": "0x001b",
-        "length": 3,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 35,
-        "hex": "0x0023",
-        "length": 0,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 13,
-        "hex": "0x000d",
-        "length": 24,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 65037,
-        "hex": "0xfe0d",
-        "length": 282,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 10,
-        "hex": "0x000a",
-        "length": 12,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 16,
-        "hex": "0x0010",
-        "length": 14,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 0,
-        "hex": "0x0000",
-        "length": 14,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 51,
-        "hex": "0x0033",
-        "length": 1263,
+        "type": 65281,
+        "hex": "0xff01",
+        "length": 1,
         "grease": false,
         "body": null
       },
@@ -164,6 +171,20 @@
         "body": null
       },
       {
+        "type": 13,
+        "hex": "0x000d",
+        "length": 24,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 16,
+        "hex": "0x0010",
+        "length": 14,
+        "grease": false,
+        "body": null
+      },
+      {
         "type": 45,
         "hex": "0x002d",
         "length": 2,
@@ -171,35 +192,72 @@
         "body": null
       },
       {
-        "type": 65281,
-        "hex": "0xff01",
-        "length": 1,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 11,
-        "hex": "0x000b",
-        "length": 2,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 18,
-        "hex": "0x0012",
-        "length": 0,
-        "grease": false,
-        "body": null
-      },
-      {
-        "type": 56026,
-        "hex": "0xdada",
+        "type": 39578,
+        "hex": "0x9a9a",
         "length": 1,
         "grease": true,
         "body": "00"
       }
     ],
-    "raw": "160301071801000714030389bdde5517794e926e9300f65c3486f2b42ff1e7d2fed9c0831b18feba4af97e20c49962726bad6f464f033c41ec6477ec098bc17a2af50e69a0560b203a3799a600206a6a130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f0035010006abcaca000000170000002b000706fafa0304030344cd00050003026832001b000302000200230000000d0018001609040905090604030804040105030805050108060601fe0d011a0000010001c4002098553c5699a32957970886a402a964f2033f899b173c23b505f6bd3f7f99ba7d00f034413d1c5ca555aba1ae611e344ecb12f80f87b9b9735726c88e72463d5445fd5867d03df5d7065bd2776aab5370e7f4a96ad48fa425f4c53e591a60ec2c446b962e6ecfb2f17a8a979b30632ddbec095279203c11c8d526bc11b1e972b9982b490aedf122f60231b3f64d2ac99aada2493f52b151b2b579875a3f5f38194707c7de07b0aae28c22da28022e15769afa71b24278316a5d9713b04d7bea6f2afb414e555208c7be7a47ec7c400ac1d5015a027b579768832c03a5dad748146063eb1b99eb570b56874e7ef46ae48b3c3c3252e60338747267f0f78d12d4f49874a6bcda395c9a90856977d3d335de2a92000a000c000a5a5a11ec001d001700180010000e000c02683208687474702f312e310000000e000c0000096c6f63616c686f7374003304ef04ed5a5a00010011ec04c0b4584dde212fb4574026033261356c2861983e93251e2855cc1305ebe5508d5a240211064e0a7d00ec19b6871b7589a49c25841d31b0ff26c37cab451329a61f110255340726149b7bcc7f4ce2a3bd18737bf375cbf8424ea20c57125d2746ce01638dde9737ae1b0189c43cb8342264091b98d8b39535344c2c7f8a985a3e5a3e23e4b959e843e236590b06060a3820deb5164dca83fbabcdc85b51f6cb410785bdff9064bdbcb881b07416c68aea920fd3277f06b03bbe484be07baeca54071e838f48974771a63ffbe6cb20d3668f5535aa8a5fb91961a3dc6130b6aa5ca97201799c69c1bc3c836273fa4d3670644fc877f6c57f98a18044418674262dca1a4a28d486687860fca71498273fc66a3c01f31a79c9c98e92381e057fb695c53dd2a6a3938dc10acd61f6585f87cf1bc800516c7fdb0b2e197b2ad2a05ad217699628a6add7bf1c41534b7990e5c7292c15bf120a4d6ca532742629e5ea2404d234758663ca8115196680f89a5606b273d834400fca2abc48618e008c0925cae4da0ebfd76bfb5a37be1403855a8c6a9ab036c87b4ea63099737f40dcc35667ceb352877ba74e51b3a541b560fe588d9f996226b925e681aaea840951a82e13a0580ba6c7b56988bab6ac62f5b742292f0a134765b9186198592679483b9b894d198166bc021bf32361959542896f92e779b0292372b5cfddccb7de520e900ab247a872ce78b05f4c074ee9ccb686adb15cb689ca9d961c5a3660276bf1c13eb119b4023ea2f84b529b16cb78bc94b1b49e6c4c8019c9bb7374e531c07508d0e4f495fc1b09329a41bfe40f433b88c8019d5dba4b343b0105a85e355576cec34be7ea86c1e095ebe05efaf20ada624bef41511708c1ac59bd73655483100593825711536585038ab18cc4ef46ac52a4277cb72b8391b2bd296665020b3a817e46e231343c9ad4a1a55e761251c73537167c19a976dbba3fd5aa9c71329253b1b7d955766872c1eb3c928d1b3e4a6297e4ca70a6874fc3f3087de1a999e781c1692a425577c87c4edc3982d2d66663fb595e9a4e3cbcc83ff34ef2410ebc86a5b1699c8393c9dcf6b5fc20037745a7ad541e4a25c76bf9c9a44abd4ea6369ac4400d8bc80607580eb97ce0a5a723dc5abeea8dae4ccd4ab3c5f5fc524e5cae0d8c457b5c410f099ccef20bf3d6507466ab7899acc4215626f042528bb562ea115c70cdfa832981ca021b714b65e981f940960d9646702646c5f3b8e394a5191a787088a9a0f7ac6b0b72a4f62ab9a91e23e94be933b37ff56475db1772d655cc28c58481afd14c6ef37a3ffb5b2137128b8a08426cbc8252a970fc599a5419895f38a4f7c9c6777ab550670a2deb5e3d0223d618c1e8a6720da9629db83c7c5606dea9a18c842651652478d0b831858b0a5256e083547b6293f13820d500a40a76c87372b1e260bdb4879bacabab64f33dcdda98d4f180e78b0188e846b1ab830b21401102b6e24acb2ca08abc7693cba4880582c160e598a6c76716d58db7c715447a4596b1c75642b3bdfb17846457efa5454665286d147766593fdf003f69e742b6b27fe7d466e4f3104ea8be46c5c8e943cc99d02546520fee89c5b7ac10797f432145ed9c36973afb1d350222da59c105853380905feafdb54e21d91c5948023156f8d6535e384d1db6f0b14dfb40a426b12e7fbc44da0867ade632c348001d0020022e1915ee43863c1b381f3cd0753649d0ef328ce1a0e5adbbeafe7709b4f008000500050100000000002d00020101ff01000100000b0002010000120000dada000100"
+    "raw": "16030106f8010006f40303ed3e27d4dee4adb9b01cc2a7dd2abeb99049370a2323e61486a2bce7995c0928205cb4cd5c509a501a718cc0233c4d304bd661551c002bd9f1e4cc1027c48c03f70020baba130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f00350100068beaea00000000000e000c0000096c6f63616c686f7374001b0003020002003304ef04edfafa00010011ec04c040d25d78dca25a5ca22623cedbeb056997125eb60c497240828249a9e44ec9093cb595a2f25b5d9c0765edec5aa647444aea5eead9978922b3374b3621c07c549780c16074f4c7b5aa9941d21c85318922391706cca8814a13574e966c07b708b5982e54b34354f95547c3a49bec2ed0342b3fb49270b0b1c3b55353a2cb22894daf484692a7449f7a15cd2a21a6f3cc3e8b0687d066f7523f3abacb22b28c1f6ca49781533bc3b439c92eae72a7147ba9a5da7371ca795611beb0b5a6cfc4370de9776edba673a43be3170d53dc0385244d7c367aed5200564895378087236269df914c3404593b8571187b062181202c43290b18a659bbc92c00717bebc97709bc6633231a74081cc018bee09e479886bfb25138f1cd84e80f34481a280331a6733e955319d9809891867afac13627aaab6fa388f411844f54c2e5b1811e002ee512b7281aa0e0b9248e592d2651833d83a52d931c7cfa90c1e87070d1309d35c35555a5869289fb38ccefaa82f16443e27a5da80733da43360818602ca996a4d608b7d64ec77b8c2be339241b960cd026a7bb7972b36eafcc3ae6a4bd1bf6083f700160966dcd8b1ccc1997712c2e2f51a249a0c609d0bde9545848d09448285ea899c1db535d779075adda45c5b3478b9900335909baaba8a0e84c2741a18d8214776a5fe89c205335bccff4c536c95a892742e2850446852156796d171c6c77fab49d53a506c525769c79b4a406d063992e383698fc364b645d2d4a2cb5bc264f93bba3fc33fd321fe0c1185313be80671a99971d8af9113f1561c48cccb7fc130ba23c52e3b7a0146a2eac882d6b49774c8e4aa5235fd9428c22a567153e871b66cdf28d800ab77a037aeca433f4d5422315bed4d93319b896a1c2b8a7736426695f2ea6964d32cf55b3c17a4c67d9db8883703c9e537b55805ad1d577ebc1c39cd150f63a60e3a33d39297b0df20c4efc01044106d8f44017cccba8b5992fca7b5d6664f1d7378eb9a51c3c7e02f228bc22a3f6255521ac06133823ecf9af4fdc6cc9512802534fe26b1e4b6b2afa0402b58ca1f8da89fa75661f60562a81589e0785b6009b0a540630e2bfb29cb2cba9585fbb55ddb865e711632a218b6c4899cb415e3af6be7f1a170f555f76634b2b8c8c963aadfe016e997c01a327a8f4a418dadc949d888e3ea063b2916f5aa0691ddb0f1c812d577b492a82bbc24bb302901f0dea9d420202c5d5cb50023d7ab417d7746a81bab0a6d0761f4914cdec4e3b872360d13573f62c00c0ab32f588c2b1669f63ce44ca9a3ec6c3b81a0bad5687752c13d4005e2d2a7e7b88429a017aa7a88de33486a0b2b0842b19ff5545d1a7070b047899450cef791b76471dbdd325cf96c0339410d2812f0b591410ac8082505c81a07753560bd94b13c218244c0083650477bbd4766d8484dc22580dd512775424b8962146e3c64e7a483281caa0b7953df2472b9743fc5b3f063acdc7f2c2fd795d284bbfce03aa99b201633677ed16bf257499fe361c14a45e60b256e6b1b14fe55a56582628f8cf7606190793c8219ca38192b5cbdc6ae32132b3986a31c4bd01a3bfb30842e765a01848041e9500a949cb9e2a927981501ce856bf102bb8566cad244f2f557522e2b6ab7a196ba1c67e2d95964a4ac0e49006a87a1203e8facb8b94a4d9404fbba506eff2ab12320e89494e477c2bd525001d0020c272ae66fb64febf41cb900f1a51fbf24f4abc788ea8ec59ca696ec269607f5e00120000000b0002010044cd00050003026832000a000c000afafa11ec001d0017001800230000fe0d00fa0000010001000020b97a3e12418b13f4c97a469a822010b8d58dcc4e925596bea50e250f57458f6700d0296e06d2e0120001a2b8e2b8f7e88679641ef9333c73b6ce64989d37029073ab8349bac0040484f83de3ade0879ab901c190cfafdc4821f959dee37bedfc6ff235f1b678197d4136d4dde0b33c38c2d2012aef6cad7b41b3d3dfc2c49c250601a36277027da7c37e04b286b7858f85ab5f0f362796df8b90e8715f382cf971bb0e04f3d305b489e6c91b25732a9e58e4549e69f07b18f1c86728623a9a9eae4018ab293fa900aef00ba142dcc044695cc313f4ec16aa17a2490683244361f18f92f2c33fb7e29c3b12477483e10b6ab300170000002b000706fafa03040303ff01000100000500050100000000000d00180016090409050906040308040401050308050501080606010010000e000c02683208687474702f312e31002d000201019a9a000100"
   },
-  "captured_at": "2026-08-04T06:28:34+00:00"
+  "captured_at": "2026-08-04T10:47:03+00:00",
+  "xhr": {
+    "header_block": "82cb87048863ccf62c81d35d05c8c6cac953032a2f2a7f068840e92ac7b0d31aaf7f068321ec477f05842d35a7d773969d29ad1718628390744e7426e3cd34cb03accc0e8a3fc5c47f0485b600fd286f",
+    "priority": {
+      "exclusive": true,
+      "depends_on": 0,
+      "weight": 220
+    },
+    "headers": [
+      [
+        "sec-ch-ua-platform",
+        "\"Windows\""
+      ],
+      [
+        "user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36"
+      ],
+      [
+        "sec-ch-ua",
+        "\"Not;A=Brand\";v=\"8\", \"Chromium\";v=\"150\", \"Google Chrome\";v=\"150\""
+      ],
+      [
+        "sec-ch-ua-mobile",
+        "?0"
+      ],
+      [
+        "accept",
+        "*/*"
+      ],
+      [
+        "sec-fetch-site",
+        "same-origin"
+      ],
+      [
+        "sec-fetch-mode",
+        "cors"
+      ],
+      [
+        "sec-fetch-dest",
+        "empty"
+      ],
+      [
+        "referer",
+        "https://localhost:8443/api/all"
+      ],
+      [
+        "accept-encoding",
+        "gzip, deflate, br, zstd"
+      ],
+      [
+        "accept-language",
+        "en-US,en;q=0.9"
+      ],
+      [
+        "priority",
+        "u=1, i"
+      ]
+    ]
+  }
 }

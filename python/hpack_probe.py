@@ -373,19 +373,40 @@ class _Session:
     """
 
     def __init__(self, *, want_reference: bool, timeout: float, quiet: bool,
-                 want_kinds: frozenset = frozenset()) -> None:
+                 want_kinds: frozenset = frozenset(),
+                 want_xhr: bool = False) -> None:
         self.want_reference = want_reference
+        #: Hold the connection open past the first request to also catch the
+        #: page's own /xhr-sample. The browser sends one by itself; our own
+        #: client has to be told to, which is what selftest does.
+        self.want_xhr = want_xhr
         #: Kinds of peet response to hold out for; empty means the first will do.
         self.want_kinds = want_kinds
         self.timeout = timeout
         self.quiet = quiet
         self.lock = threading.Lock()
         self.record: dict | None = None
+        #: The page's own GET, decoded and kept raw: the only measurement of
+        #: what this browser's XHRs look like that does not need a third party.
+        self.xhr: dict | None = None
         self.reference: dict | None = None
         #: Set once the profile is captured: from then on we are only waiting
         #: for the reference, and only for so long.
         self.deadline: float | None = None
         self.done = threading.Event()
+
+    def claim_xhr(self, info: dict, decoded: list[tuple[str, str]]) -> None:
+        """Keep the first /xhr-sample request; later ones would be identical."""
+        with self.lock:
+            if self.xhr is not None:
+                return
+            self.xhr = {
+                "header_block": info["header_block"],
+                "priority": info.get("priority"),
+                "headers": [[k, v] for k, v in decoded if not k.startswith(":")],
+            }
+        if not self.want_reference:
+            self.done.set()
 
     def note(self, msg: str) -> None:
         if not self.quiet:
@@ -398,7 +419,7 @@ class _Session:
                 return False
             self.record = record
             self.deadline = time.monotonic() + self.timeout
-        if not self.want_reference:
+        if not self.want_reference and not self.want_xhr:
             self.done.set()
         return True
 
@@ -485,13 +506,15 @@ def _graceful_close(sock: ssl.SSLSocket) -> None:
 
 def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
             want_reference: bool = False, timeout: float = 25.0,
-            want_kinds: frozenset = frozenset()) -> dict | None:
+            want_kinds: frozenset = frozenset(),
+            want_xhr: bool = False) -> dict | None:
     """Serve until the profile is captured (and the reference, if asked for).
 
     Returns None if the listening socket is closed from under us, which is how
     selftest stops a capture that never arrived.
     """
     state = _Session(want_reference=want_reference, timeout=timeout, quiet=quiet,
+                     want_xhr=want_xhr,
                      want_kinds=want_kinds)
     threads: list[threading.Thread] = []
     srv.settimeout(0.5)
@@ -517,6 +540,10 @@ def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
 
     if state.record is not None and state.reference is not None:
         state.record["reference"] = state.reference
+    if state.record is not None and state.xhr is not None:
+        # Attached after the fact rather than into the frozen frame list: the
+        # profile is the first request, and this is a second, separate one.
+        state.record["xhr"] = state.xhr
     return state.record
 
 
@@ -735,6 +762,11 @@ const post = b => fetch("/reference", {method: "POST", body: b});
 const grab = u => fetch(u + (u.indexOf("?") < 0 ? "?" : "&") + "_=" + Date.now())
                     .then(r => r.json()).catch(() => null);
 const warn = t => document.getElementById("w").innerHTML = t;
+// A plain same-origin GET whose only purpose is to be an XHR: its HEADERS frame
+// is what the xhr template is measured from. Cross-origin services cannot give
+// us this - a browser that blocks the fetch (every iOS Safari) would leave the
+// xhr half guessed forever.
+fetch("/xhr-sample");
 Promise.all([grab("%(peet)s"), grab("%(ja3)s")]).then(([peet, ja3zone]) => {
   post(JSON.stringify({peet: peet, ja3zone: ja3zone})).then(() => {
     say(peet ? "captured, and the tls.peet.ws reference with it"
@@ -904,10 +936,10 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
 
         elif ftype == 1 and flags & 0x04:  # HEADERS + END_HEADERS
             info = describe(ftype, flags, stream, payload)
-            headers = dict(
-                (k if isinstance(k, str) else k.decode(),
-                 v if isinstance(v, str) else v.decode())
-                for k, v in decoder.decode(bytes.fromhex(info["header_block"])))
+            decoded = [(k if isinstance(k, str) else k.decode(),
+                        v if isinstance(v, str) else v.decode())
+                       for k, v in decoder.decode(bytes.fromhex(info["header_block"]))]
+            headers = dict(decoded)
             path, method = headers.get(":path", ""), headers.get(":method", "")
 
             if capturing:
@@ -921,10 +953,12 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
                 }
                 if state.claim_record(record) and not state.want_reference:
                     send_response(sock, encoder, stream, b"200", b"text/plain", b"hi")
-                    return
-                send_response(sock, encoder, stream, b"200", b"text/html", PAGE)
-                state.note(f"  waiting up to {state.timeout:.0f}s for the browser "
-                           f"to fetch tls.peet.ws (keep the tab open)")
+                    if not state.want_xhr:
+                        return
+                else:
+                    send_response(sock, encoder, stream, b"200", b"text/html", PAGE)
+                    state.note(f"  waiting up to {state.timeout:.0f}s for the "
+                               f"browser to fetch tls.peet.ws (keep the tab open)")
 
             elif method == "POST" and path.startswith("/reference/done"):
                 send_response(sock, encoder, stream, b"200", b"text/plain", b"ok")
@@ -933,6 +967,10 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
 
             elif method == "POST" and path.startswith("/reference"):
                 bodies[stream] = bytearray()
+
+            elif method == "GET" and path.startswith("/xhr-sample"):
+                state.claim_xhr(info, decoded)
+                send_response(sock, encoder, stream, b"200", b"text/plain", b"ok")
 
             elif method == "GET" and not path.startswith("/favicon"):
                 # Any connection serves the page: after clicking through the
@@ -974,7 +1012,8 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
 # --- driving our own client -------------------------------------------------
 
 def run_client(authority: str, brand: str | None, *, quiet: bool = False,
-               like: dict[str, str] | None = None) -> None:
+               like: dict[str, str] | None = None,
+               xhr: dict | None = None) -> None:
     """Send one request through the brand's transport at our own server.
 
     `authority` and not a port: it goes into the HPACK block verbatim and
@@ -1011,6 +1050,20 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
     with httpx.Client(transport=transport, timeout=15) as c:
         try:
             c.get(f"https://{authority}/api/all", headers=headers)
+            if xhr is not None:
+                # A second request on the *same* connection, the way the page's
+                # own fetch arrived. Its HPACK block only comes out right if the
+                # first one did too - the dynamic table carries over - so this
+                # tests the encoder far harder than one frame in isolation.
+                prof = browser_fp.profile(brand)
+                was, prof.header_profile = prof.header_profile, "xhr"
+                sent = dict(xhr.get("headers") or [])
+                prof.sec_fetch_site = sent.get("sec-fetch-site")
+                extra = {"Referer": sent["referer"]} if "referer" in sent else {}
+                try:
+                    c.get(f"https://{authority}/xhr-sample", headers=extra)
+                finally:
+                    prof.header_profile = was
         except Exception as exc:  # noqa: BLE001 - server closes early by design
             if not quiet:
                 print(f"(request ended with {type(exc).__name__}: {exc})")
@@ -1271,6 +1324,40 @@ def _short(value: str | None, limit: int = 72) -> str:
     return value if len(value) <= limit else f"{value[:limit]}... ({len(value)//2}B)"
 
 
+def diff_xhr(a: dict, b: dict, na: str, nb: str) -> bool:
+    """Compare the page's own GET - the second HEADERS block on the connection.
+
+    Only possible because both sides sent the same first request first: the
+    HPACK dynamic table carries over, so this block matching means the encoder
+    agreed about what to index as well as how to encode it.
+    """
+    xa, xb = a.get("xhr"), b.get("xhr")
+    print("\n=== HPACK header block (xhr, same connection) ===")
+    if xa is None or xb is None:
+        which = na if xa is None else nb
+        print(f"  no /xhr-sample in {which} - capture again to get one "
+              f"(the probe's page fetches it by itself)")
+        return True
+    same = True
+    pa, pb = xa.get("priority"), xb.get("priority")
+    if pa != pb:
+        same = False
+        print(f"  priority DIFFER\n      {na}: {pa}\n      {nb}: {pb}")
+    else:
+        print(f"  priority OK ({pa or 'no PRIORITY flag'})")
+
+    ba, bb = bytes.fromhex(xa["header_block"]), bytes.fromhex(xb["header_block"])
+    print(f"{na}: {len(ba)} bytes\n{nb}: {len(bb)} bytes\n")
+    if ba == bb:
+        print("xhr HPACK bytes are IDENTICAL")
+        return same
+    print("!! xhr HPACK bytes DIFFER")
+    for name, blk in ((na, ba), (nb, bb)):
+        print(f"  {name}: " + " ".join(
+            f"{k}={v}" for k, v in _decode(blk)))
+    return False
+
+
 def diff_records(a: dict, b: dict, na: str, nb: str) -> int:
     """Full comparison of two captures: TLS, h2 frames, then HPACK bytes."""
     def headers_frame(rec):
@@ -1296,6 +1383,7 @@ def diff_records(a: dict, b: dict, na: str, nb: str) -> int:
 
     if ba == bb:
         print("\nHPACK bytes are IDENTICAL")
+        ok &= diff_xhr(a, b, na, nb)
         return 0 if ok else 1
 
     print("\nfirst differing byte offsets:")
@@ -1376,12 +1464,15 @@ def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
         return 1
 
     got: list[dict] = []
+    want_xhr = ref.get("xhr") is not None
     thread = threading.Thread(
-        target=lambda: got.extend(filter(None, [capture(srv, ctx, quiet=True)])),
+        target=lambda: got.extend(filter(None, [
+            capture(srv, ctx, quiet=True, want_xhr=want_xhr, timeout=10.0)])),
         daemon=True)
     thread.start()
     try:
-        run_client(authority, brand, quiet=True, like=headers_of(ref))
+        run_client(authority, brand, quiet=True, like=headers_of(ref),
+                   xhr=ref.get("xhr"))
     finally:
         thread.join(timeout=20)
         srv.close()

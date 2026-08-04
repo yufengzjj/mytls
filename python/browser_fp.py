@@ -171,6 +171,8 @@ def _read_capture(path: Path) -> dict:
         "priority": headers_frame.get("priority"),
         "priority_frames": sum(1 for f in frames if f["type"] == "PRIORITY"),
         "captured_at": data.get("captured_at"),
+        # Present only when the probe caught the page's own fetch; see Profile.
+        **({"xhr": data["xhr"]} if "xhr" in data else {}),
     }
 
 
@@ -311,7 +313,20 @@ class Profile:
         #: {kind: {"headers": [...], "priority": {...}}} from REFERENCES_DIR, or
         #: {} when this brand has no reference - then the templates fall back to
         #: what can be worked out from the capture alone.
-        self.reference: dict[str, dict] = reference or {}
+        self.reference: dict[str, dict] = dict(reference or {})
+
+        #: The capture's own /xhr-sample request, if the probe caught one. A
+        #: same-origin GET the probe's page issued, so unlike the peet half it
+        #: needs no third party and no CORS - which is the only way to measure
+        #: the xhr template on a browser that cannot be told to allow it (any
+        #: iOS Safari). A peet entry still wins: it is a request to somebody
+        #: else's site, which is what the template is for.
+        if "xhr" in cap and "xhr" not in self.reference:
+            self.reference["xhr"] = {
+                "headers": [tuple(h) for h in cap["xhr"]["headers"]],
+                "priority": cap["xhr"].get("priority"),
+                "from": "capture",
+            }
 
         #: Request headers as captured, pseudo-headers excluded, in wire order.
         self.headers: list[tuple[str, str]] = list(cap["headers"])
@@ -411,17 +426,25 @@ class Profile:
 
         Chrome does not give an XHR the same stream priority as a navigation -
         weight 220 against 256, measured - so this is per kind, and the XHR one
-        is only known when a reference supplied it.
+        is only known when a measurement supplied it.
+
+        A measured kind is used *verbatim*, and that includes measuring no
+        priority at all: Safari puts one on its navigation and none on its
+        XHRs, so falling back to the navigation's would add a PRIORITY flag the
+        browser does not send. The fallback is only for a kind never measured.
         """
         kind = kind or self.header_profile
-        prio = (self.reference.get(kind) or {}).get("priority")
-        if prio:
-            return {
-                "priority_exclusive": bool(prio["exclusive"]),
-                "priority_depends_on": prio["depends_on"],
-                "priority_weight": prio["weight"],
-            }
-        return self.headers_priority
+        entry = self.reference.get(kind)
+        if entry is None:
+            return self.headers_priority
+        prio = entry.get("priority")
+        if not prio:
+            return {}
+        return {
+            "priority_exclusive": bool(prio["exclusive"]),
+            "priority_depends_on": prio["depends_on"],
+            "priority_weight": prio["weight"],
+        }
 
     @property
     def meta(self) -> dict:
@@ -1250,9 +1273,11 @@ def describe(brand: str | None = None) -> str:
     prio = (f"exclusive={live['priority_exclusive']} "
             f"dep={live['priority_depends_on']} weight={live['priority_weight']}"
             if live else "none (no PRIORITY flag on HEADERS)")
-    templates = ", ".join(
-        f"{kind}={'reference' if kind in prof.reference else 'derived'}"
-        for kind in ("navigate", "xhr"))
+    def origin(kind: str) -> str:
+        entry = prof.reference.get(kind)
+        return entry.get("from", "reference") if entry else "derived"
+
+    templates = ", ".join(f"{kind}={origin(kind)}" for kind in ("navigate", "xhr"))
     captured_lang = prof.header_map.get("accept-language", "")
     lines = [
         f"{prof.brand}  ({prof.label})",

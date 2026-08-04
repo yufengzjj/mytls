@@ -168,6 +168,7 @@
         OPT_S_NO_EMS, \
         OPT_S_NO_TX_CERT_COMP, \
         OPT_S_NO_RX_CERT_COMP, \
+        OPT_S_FP_PROFILE, \
         OPT_S__LAST
 
 # define OPT_S_OPTIONS \
@@ -229,7 +230,9 @@
         {"no_etm", OPT_S_NO_ETM, '-', \
             "Disable Encrypt-then-Mac extension"}, \
         {"no_ems", OPT_S_NO_EMS, '-', \
-            "Disable Extended master secret extension"}
+            "Disable Extended master secret extension"}, \
+        {"fp_profile", OPT_S_FP_PROFILE, 's', \
+            "Client fingerprint profile to imitate (chrome, safari_ios, ...)"}
 
 # define OPT_S_CASES \
         OPT_S__FIRST: case OPT_S__LAST: break; \
@@ -268,6 +271,7 @@
         case OPT_S_DEBUGBROKE: \
         case OPT_S_NO_MIDDLEBOX: \
         case OPT_S_NO_ETM: \
+        case OPT_S_FP_PROFILE: \
         case OPT_S_NO_EMS
 
 #define IS_NO_PROT_FLAG(o) \

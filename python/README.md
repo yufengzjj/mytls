@@ -366,9 +366,17 @@ const char *SSL_get_fp_profile(const SSL *s);
 const char *SSL_fp_profile_name(size_t idx);   /* walks the built-in list, NULL past the end */
 ```
 
-There is also an SSL_CONF command, `FingerprintProfile` / `-fp_profile`, so `openssl.cnf`
-and the `openssl` command line can select one — C-side regression testing does not have to
-drag Python in.
+There is also an SSL_CONF command, `FingerprintProfile`, which `s_client` and `s_server`
+expose as `-fp_profile` and which can equally come from `openssl.cnf` — C-side regression
+testing does not have to drag Python in:
+
+```bash
+openssl s_client -connect localhost:8443 -fp_profile safari_ios
+```
+
+Verified against the probe: no flag sends 16 cipher suites in a 1744-byte ClientHello,
+`-fp_profile safari_ios` sends 21 in a 517-byte one (the padding rule firing), and an
+unknown name fails loudly rather than falling back.
 
 **The Python side does not have to think about any of this**: `Transport("safari_ios")`
 sets the TLS profile as well, and `transport.tls_profile` reads back what actually took
@@ -727,11 +735,32 @@ python hpack_probe.py where chrome    # → localhost:8443
 `--skip-selftest` skips it, but then nothing has checked the fingerprint at all.
 
 **Do not treat OpenSSL's own `make test` as an acceptance criterion.** This fork pins the
-cipher list, the signature algorithms and the certificate compression algorithms, so 14
-configurations in `test_ssl_new` necessarily fail (including `04-client_auth` and
-`26-tls13_client_auth`) — that is the **cost** of the change, not a bug. To use it as a
-regression test, run the same set against the commit before the change and compare
-**which** tests fail, not whether any do.
+cipher list, the signature algorithms and the certificate compression algorithms, so 16 of
+the 31 configurations in `test_ssl_new` necessarily fail — that is the **cost** of the
+change, not a bug. To use it as a regression test, run the same set against the commit
+before the change and compare **which** tests fail, not whether any do. Running the
+comparison by hand, without building the whole test suite:
+
+```bash
+cd <build tree>
+make -j"$(nproc)" test/ssl_test
+export CTLOG_FILE=$PWD/test/ct/log_list.cnf TEST_CERTS_DIR=$PWD/test/certs
+for cnf in test/ssl-tests/*.cnf; do
+    test/ssl_test "$cnf" default >/dev/null 2>&1 || echo "FAIL $(basename "$cnf" .cnf)"
+done
+```
+
+The failing set as of the profile work:
+
+```
+02-protocol-version  04-client_auth  05-sni  07-dtls-protocol-version  10-resumption
+11-dtls_resumption  14-curves  16-dtls-certstatus  19-mac-then-encrypt  20-cert-select
+22-compression  23-srp  25-cipher  26-tls13_client_auth  28-seclevel
+29-dtls-sctp-label-bug
+```
+
+Identical before and after that work, measured by rebuilding the library from the previous
+commit in the same tree with the same Configure options.
 
 Once online, run `verify_fp.py` (below) as well; it is the only check that proves a real
 server agrees.

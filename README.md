@@ -27,8 +27,25 @@ const char *SSL_fp_profile_name(size_t idx);   /* walks the built-in list, NULL 
 
 A profile set on an `SSL` overrides the one on its `SSL_CTX`, so a single process can hold
 connections using different profiles at the same time. With none set, `chrome` is used.
-There is also an SSL_CONF command, `FingerprintProfile` / `-fp_profile`, so `openssl.cnf`
-and the command line can select one too.
+There is also an SSL_CONF command, `FingerprintProfile`, exposed by `s_client` and
+`s_server` as `-fp_profile` and settable from `openssl.cnf`:
+
+```bash
+openssl s_client -connect example.com:443 -fp_profile safari_ios
+```
+
+```ini
+# or from a config file, for anything that reads one
+openssl_conf = init
+[init]
+ssl_conf = ssl_sect
+[ssl_sect]
+mytls = mytls_sect
+[mytls_sect]
+FingerprintProfile = safari_ios
+```
+
+An unknown name is an error, not a silent fallback.
 
 From Python:
 
@@ -152,10 +169,19 @@ own bytes against our own reference, so it cannot catch a mistake that runs thro
 ### Do not run `make test`
 
 This fork pins the cipher list, the signature algorithms and the certificate compression
-algorithms, so 14 configurations in `test_ssl_new` **necessarily fail** (including
-`04-client_auth` and `26-tls13_client_auth`). That is the cost of the change, not a bug.
-To use it as a regression test, run the same set against the commit before the change and
-compare **which** tests fail, not whether any do.
+algorithms, so 16 of the 31 configurations in `test_ssl_new` **necessarily fail** (measured
+with the Configure line above):
+
+```
+02-protocol-version  04-client_auth  05-sni  07-dtls-protocol-version  10-resumption
+11-dtls_resumption  14-curves  16-dtls-certstatus  19-mac-then-encrypt  20-cert-select
+22-compression  23-srp  25-cipher  26-tls13_client_auth  28-seclevel
+29-dtls-sctp-label-bug
+```
+
+That is the cost of the change, not a bug. To use it as a regression test, run the same set
+against the commit before the change and compare **which** tests fail, not whether any do —
+the profile work was checked that way and the failing set came out identical.
 
 ---
 

@@ -1,16 +1,16 @@
 {
   "brand": "safari_ios",
-  "collected_at": "2026-08-04T06:56:24+00:00",
+  "collected_at": "2026-08-04T10:31:28+00:00",
   "peet": [
     {
       "donate": "Please consider donating to keep this API running. Visit https://tls.peet.ws",
-      "ip": "221.44.183.219:59092",
+      "ip": "221.44.183.219:59879",
       "http_version": "h2",
       "method": "GET",
       "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
       "tls": {
         "ciphers": [
-          "TLS_GREASE (0x3A3A)",
+          "TLS_GREASE (0xCACA)",
           "TLS_AES_128_GCM_SHA256",
           "TLS_AES_256_GCM_SHA384",
           "TLS_CHACHA20_POLY1305_SHA256",
@@ -34,7 +34,7 @@
         ],
         "extensions": [
           {
-            "name": "TLS_GREASE (0x4a4a)"
+            "name": "TLS_GREASE (0xbaba)"
           },
           {
             "name": "server_name (0)",
@@ -52,7 +52,7 @@
           {
             "name": "supported_groups (10)",
             "supported_groups": [
-              "TLS_GREASE (0x5a5a)",
+              "TLS_GREASE (0x4a4a)",
               "X25519 (29)",
               "P-256 (23)",
               "P-384 (24)",
@@ -102,10 +102,10 @@
             "name": "key_share (51)",
             "shared_keys": [
               {
-                "TLS_GREASE (0x5a5a)": "00"
+                "TLS_GREASE (0x4a4a)": "00"
               },
               {
-                "X25519 (29)": "8129fd3acf78e30b691d615c3add50be813673803b279ba276a473e0a16c8279"
+                "X25519 (29)": "b578bb6042491577de0dd8791cb65b93b2b2662d891a2321e37f08e8b2ef7931"
               }
             ]
           },
@@ -116,7 +116,7 @@
           {
             "name": "supported_versions (43)",
             "versions": [
-              "TLS_GREASE (0x4a4a)",
+              "TLS_GREASE (0x9a9a)",
               "TLS 1.3",
               "TLS 1.2",
               "TLS 1.1",
@@ -145,8 +145,8 @@
         "ja4_r": "t13d2014h2_000a,002f,0035,009c,009d,1301,1302,1303,c008,c009,c00a,c012,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0017,001b,002b,002d,0033,ff01_0403,0804,0401,0503,0805,0805,0501,0806,0601,0201",
         "peetprint": "GREASE-772-771-770-769|2-1.1|GREASE-29-23-24-25|1027-2052-1025-1283-2053-2053-1281-2054-1537-513|1|1|GREASE-4865-4866-4867-49196-49195-52393-49200-49199-52392-49162-49161-49172-49171-157-156-53-47-49160-49170-10|0-10-11-13-16-18-21-23-27-43-45-5-51-65281-GREASE-GREASE",
         "peetprint_hash": "fdf2c64009327d63a456cbab56a7bdde",
-        "client_random": "3f7a21145d4cb7fc748fbbe44678bae5c9c64489e17ed1b8400d205bd402a2cc",
-        "session_id": "0f7a2303fb7124c0a89155effbc616f027b8359591ef9cd3e83a996d02a5be1d"
+        "client_random": "55f7a608f615307e0ba8c363a44f87639d946f6d613078da30e19c71354744a1",
+        "session_id": "51eaadccfeb3cee58b48dccadedc82cfda3a90430df0c7dd8570b16b0490cfdd"
       },
       "http2": {
         "akamai_fingerprint": "2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p",
@@ -170,7 +170,7 @@
           {
             "frame_type": "HEADERS",
             "stream_id": 1,
-            "length": 302,
+            "length": 306,
             "headers": [
               ":method: GET",
               ":scheme: https",
@@ -179,7 +179,7 @@
               "sec-fetch-dest: document",
               "user-agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
               "accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-              "referer: https://192.168.1.7:8443/",
+              "referer: https://192-168-1-7.nip.io:8443/",
               "sec-fetch-site: none",
               "sec-fetch-mode: navigate",
               "accept-language: zh-CN,zh-Hans;q=0.9",
@@ -200,21 +200,20 @@
         ]
       },
       "tcpip": {
-        "cap_length": 583,
+        "cap_length": 130,
         "dst_port": 443,
-        "src_port": 59092,
+        "src_port": 59879,
         "ip": {
-          "id": 18561,
           "ttl": 53,
           "ip_version": 4,
           "dst_ip": "205.185.123.167",
           "src_ip": "221.44.183.219"
         },
         "tcp": {
-          "ack": 1765333154,
-          "checksum": 57891,
-          "seq": 1699666979,
-          "window": 2061
+          "ack": 2710161209,
+          "checksum": 56122,
+          "seq": 483953981,
+          "window": 2048
         }
       }
     }
