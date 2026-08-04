@@ -1663,6 +1663,13 @@ struct ssl_connection_st {
         unsigned char *alpn;
         size_t alpn_len;
         /*
+         * Set on a client when the server answers our application_settings
+         * (ALPS) offer with one of its own. It obliges us to send an
+         * EncryptedExtensions of our own before Finished - see
+         * tls_construct_client_encrypted_extensions().
+         */
+        int alps_negotiated;
+        /*
          * Next protocol negotiation. For the client, this is the protocol that
          * we sent in NextProtocol and is set when handling ServerHello
          * extensions. For a server, this is the client's selected_protocol from

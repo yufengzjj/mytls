@@ -14,6 +14,29 @@
  *                                                                           *
  *****************************************************************************/
 
+/*
+ * Which message opens the client's second flight in TLSv1.3, and therefore owns
+ * the deferred handshake write key change.
+ *
+ * With middlebox compat (or after early data) the client puts off installing
+ * its handshake write keys until the last possible moment, so that the dummy
+ * CCS and any early data still go out under the previous state. Whichever
+ * message comes first then has to do it - and exactly one of them, because
+ * change_cipher_state() restarts the record sequence numbers, so a second call
+ * would make every record after it fail to authenticate.
+ *
+ * Stock OpenSSL splits this between Certificate and Finished with a
+ * `cert_req == 0` test at each site. ALPS (draft-vvv-tls-alps) puts an
+ * EncryptedExtensions of our own in front of both, so the choice is made here
+ * instead and each constructor just asks whether it is the one.
+ */
+static ossl_inline int ossl_statem_client13_flight_opener(const SSL_CONNECTION *s)
+{
+    if (s->ext.alps_negotiated)
+        return TLS_ST_CW_ENCRYPTED_EXTENSIONS;
+    return s->s3.tmp.cert_req == 0 ? TLS_ST_CW_FINISHED : TLS_ST_CW_CERT;
+}
+
 /* Max message length definitions */
 
 /* The spec allows for a longer length than this, but we limit it */
@@ -196,6 +219,8 @@ __owur MSG_PROCESS_RETURN tls_process_hello_req(SSL_CONNECTION *s, PACKET *pkt);
 __owur MSG_PROCESS_RETURN dtls_process_hello_verify(SSL_CONNECTION *s, PACKET *pkt);
 __owur CON_FUNC_RETURN tls_construct_end_of_early_data(SSL_CONNECTION *s,
                                                        WPACKET *pkt);
+__owur CON_FUNC_RETURN tls_construct_client_encrypted_extensions(SSL_CONNECTION *s,
+                                                                 WPACKET *pkt);
 
 /* some server-only functions */
 __owur MSG_PROCESS_RETURN tls_process_client_hello(SSL_CONNECTION *s,

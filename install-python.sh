@@ -12,7 +12,7 @@
 #
 #   PREFIX=/opt/mytls PYTHON_VERSION=3.11.15 JOBS=8 ./install-python.sh
 #
-# Flags: --skip-deps --skip-openssl --skip-python --yes
+# Flags: --skip-deps --skip-openssl --skip-python --skip-selftest --yes
 #
 set -euo pipefail
 
@@ -23,13 +23,14 @@ JOBS="${JOBS:-$( (nproc || sysctl -n hw.ncpu || echo 4) 2>/dev/null )}"
 # Leave empty to let Configure detect the platform (works for x86_64 and arm64).
 OPENSSL_TARGET="${OPENSSL_TARGET:-}"
 
-SKIP_DEPS=0 SKIP_OPENSSL=0 SKIP_PYTHON=0 ASSUME_YES=0
+SKIP_DEPS=0 SKIP_OPENSSL=0 SKIP_PYTHON=0 SKIP_SELFTEST=0 ASSUME_YES=0
 for arg in "$@"; do
     case "$arg" in
-        --skip-deps)    SKIP_DEPS=1 ;;
-        --skip-openssl) SKIP_OPENSSL=1 ;;
-        --skip-python)  SKIP_PYTHON=1 ;;
-        --yes|-y)       ASSUME_YES=1 ;;
+        --skip-deps)     SKIP_DEPS=1 ;;
+        --skip-openssl)  SKIP_OPENSSL=1 ;;
+        --skip-python)   SKIP_PYTHON=1 ;;
+        --skip-selftest) SKIP_SELFTEST=1 ;;
+        --yes|-y)        ASSUME_YES=1 ;;
         -h|--help)      sed -n '/^# Build/,/^# Flags/p' "$0" | sed 's/^# \?//'; exit 0 ;;
         *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
     esac
@@ -126,9 +127,17 @@ build_openssl() {
     ssldir="$(detect_openssldir)"
     say "building OpenSSL -> $PREFIX (openssldir=$ssldir, -j$JOBS)"
 
+    # -Wl,-rpath,$(LIBRPATH) bakes $PREFIX/lib into everything we link,
+    # including apps/openssl. Without it the CLI resolves libcrypto through the
+    # default search path and picks up the distro's, which fails with e.g.
+    # "BIO_f_brotli: symbol not found" - our library has it, theirs does not.
+    # LIBRPATH is OpenSSL's own variable for this and expands to $(libdir), so
+    # it stays correct if --libdir changes. Single-quoted on purpose: it has to
+    # reach the makefile unexpanded.
     # shellcheck disable=SC2086 - OPENSSL_TARGET is intentionally word-split
     ./Configure $OPENSSL_TARGET shared enable-brotli \
-        --prefix="$PREFIX" --libdir=lib --openssldir="$ssldir"
+        --prefix="$PREFIX" --libdir=lib --openssldir="$ssldir" \
+        '-Wl,-rpath,$(LIBRPATH)'
 
     grep -q "OPENSSL_NO_BROTLI" include/openssl/configuration.h 2>/dev/null \
         && warn "brotli support did NOT get enabled - a server that compresses
@@ -171,14 +180,43 @@ PY="$PYENV_ROOT/versions/$PYTHON_VERSION/bin/python$(echo "$PYTHON_VERSION" | cu
 [ -x "$PY" ] || die "$PY is missing - the CPython build did not finish"
 
 # --- 5. Python packages -----------------------------------------------------
-# httpx is pinned: python/chrome_h2.py patches httpcore internals and checks it.
+# httpx is pinned: python/chrome_h2.py subclasses httpcore internals, and checks
+# the version it got.
 say "installing Python packages"
 "$PY" -m pip install --quiet --upgrade pip
-"$PY" -m pip install --quiet "httpx[http2]==0.27.2" brotli zstandard
+# socks: chrome_h2's transport supports socks5:// proxies, which need socksio.
+"$PY" -m pip install --quiet "httpx[http2,socks]==0.27.2" brotli zstandard
 
 # --- 6. check ---------------------------------------------------------------
+# Linkage first, because getting this wrong is silent: a binary that resolves
+# libssl somewhere else still runs, it just isn't our library, and the
+# fingerprint is quietly the stock one. Both checks run with LD_LIBRARY_PATH
+# unset on purpose - nothing here may depend on the caller's environment.
+say "checking linkage"
+check_links_to_prefix() {
+    local what="$1" bin="$2" resolved
+    if ! command -v ldd >/dev/null 2>&1; then
+        return 0    # not Linux, or no ldd; the runtime checks below still apply
+    fi
+    resolved="$(env -u LD_LIBRARY_PATH ldd "$bin" 2>/dev/null \
+                | awk '/libssl\.so/ {print $3}')"
+    case "$resolved" in
+        "$PREFIX"/*) printf '  %-9s: %s\n' "$what" "$resolved" ;;
+        "")          die "$what does not link libssl at all ($bin)" ;;
+        *)           die "$what resolves libssl to $resolved, not $PREFIX/lib.
+         The build did not get its rpath - re-run without --skip-openssl." ;;
+    esac
+}
+
+env -u LD_LIBRARY_PATH "$PREFIX/bin/openssl" version >/dev/null 2>&1 \
+    || die "$PREFIX/bin/openssl cannot start without LD_LIBRARY_PATH set.
+         Expected an rpath baked in; re-run without --skip-openssl."
+check_links_to_prefix "cli" "$PREFIX/bin/openssl"
+check_links_to_prefix "python" \
+    "$("$PY" -c 'import _ssl; print(_ssl.__file__)')"
+
 say "checking"
-"$PY" - <<'EOF'
+env -u LD_LIBRARY_PATH "$PY" - <<'EOF'
 import ssl
 import sys
 from pathlib import Path
@@ -202,8 +240,82 @@ import chrome_h2  # noqa: E402
 ctx = ssl.create_default_context()
 names = [c["name"] for c in ctx.get_ciphers()]
 print(f"  ciphers : {len(names)} ({'pinned OK' if len(names) == 15 else 'UNEXPECTED'})")
-print(f"  h2 patch: {'on' if chrome_h2.is_enabled() else 'OFF'}")
+
+# Building one proves the httpcore subclassing still fits this httpx.
+chrome_h2.ChromeTransport().close()
+print(f"  h2      : ChromeTransport OK, akamai {chrome_h2.AKAMAI_FINGERPRINT}")
 EOF
+
+# --- 7. self-test -----------------------------------------------------------
+# Linkage only proves we loaded the right library; this proves the library still
+# emits Chrome's bytes. hpack_probe.py stands up a local HTTP/2 server, our own
+# client connects to it, and the ClientHello, the HTTP/2 frames and the HPACK
+# block it captured are compared against a real Chrome 150 capture kept in
+# python/references/. Entirely local: no network, no third-party service, and
+# the same result on an air-gapped machine.
+self_test() {
+    local ref="$ROOT/python/references/chrome150_probe.json"
+    local port tmp srv rc=0 i
+
+    # The port is not free to choose: `:authority` is `localhost:<port>`, so it
+    # is part of the HPACK block. Take it from the reference or the byte
+    # comparison fails on a difference that means nothing.
+    port="$("$PY" "$ROOT/python/hpack_probe.py" port "$ref")" \
+        || die "cannot read the port out of $ref"
+    if [ -n "${PROBE_PORT:-}" ] && [ "$PROBE_PORT" != "$port" ]; then
+        warn "PROBE_PORT=$PROBE_PORT but the reference was captured on $port;
+         the HPACK block will differ in :authority. The ClientHello and
+         HTTP/2 layers are still meaningful."
+        port="$PROBE_PORT"
+    fi
+
+    tmp="$(mktemp -d)"
+
+    ( cd "$ROOT/python" && "$PY" hpack_probe.py serve --port "$port" \
+        --out "$tmp/ours.json" --openssl "$PREFIX/bin/openssl" ) \
+        > "$tmp/serve.log" 2>&1 &
+    srv=$!
+
+    # The server generates a self-signed cert on first run, so give it a moment.
+    for i in $(seq 1 30); do
+        grep -q listening "$tmp/serve.log" 2>/dev/null && break
+        kill -0 "$srv" 2>/dev/null || break
+        sleep 1
+    done
+
+    # It closes the stream early by design, so the client always reports an
+    # error; the capture is what matters.
+    ( cd "$ROOT/python" && "$PY" hpack_probe.py client --port "$port" ) \
+        > "$tmp/client.log" 2>&1 || true
+
+    for i in $(seq 1 15); do          # serve exits after one capture
+        kill -0 "$srv" 2>/dev/null || break
+        sleep 1
+    done
+    kill "$srv" 2>/dev/null || true
+    wait "$srv" 2>/dev/null || true
+
+    if [ ! -s "$tmp/ours.json" ]; then
+        cat "$tmp/serve.log" "$tmp/client.log" >&2
+        rm -rf "$tmp"
+        die "the probe captured nothing - see the output above.
+         If port $port is already in use, free it and re-run: the port cannot
+         simply be changed, it is baked into the reference's :authority."
+    fi
+
+    "$PY" "$ROOT/python/hpack_probe.py" diff "$ref" "$tmp/ours.json" || rc=$?
+    rm -rf "$tmp"
+    return "$rc"
+}
+
+if [ "$SKIP_SELFTEST" -eq 1 ]; then
+    warn "skipping the self-test; nothing has checked that the build still
+         reproduces Chrome's bytes."
+else
+    say "self-test: our bytes vs the Chrome 150 capture"
+    self_test || die "this build does NOT reproduce Chrome's bytes - see the diff above.
+         Every line should read OK and the HPACK block should be identical."
+fi
 
 cat <<EOF
 
@@ -215,6 +327,8 @@ $(say "done")
     export PATH="\$PYENV_ROOT/bin:\$PATH"
     eval "\$(pyenv init -)"
 
-  fingerprint check against the reference capture (needs network):
-    cd python && "$PY" verify_fp.py --resume
+  the byte-level self-test above ran offline. the remaining check needs
+  network, and is the only one that proves a real server agrees with us:
+    cd python && "$PY" verify_fp.py            # h2 layer + header values
+    cd python && "$PY" verify_fp.py --resume   # TLS layer incl. the PSK ext
 EOF

@@ -1062,7 +1062,13 @@ typedef enum {
     TLS_ST_EARLY_DATA,
     TLS_ST_PENDING_EARLY_DATA_END,
     TLS_ST_CW_END_OF_EARLY_DATA,
-    TLS_ST_SR_END_OF_EARLY_DATA
+    TLS_ST_SR_END_OF_EARLY_DATA,
+    /*
+     * Appended rather than grouped with the other TLS_ST_CW_* states: this is
+     * a public enum, and inserting in the middle would renumber everything
+     * after it.
+     */
+    TLS_ST_CW_ENCRYPTED_EXTENSIONS
 } OSSL_HANDSHAKE_STATE;
 
 /*

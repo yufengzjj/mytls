@@ -21,25 +21,61 @@ OpenSSL 无关、完全由 Python 决定的指纹：
 
 | 文件 | 作用 |
 |---|---|
-| `chrome_h2.py` | 主角。`import` 即给 httpcore/h2/hpack 打补丁；`describe()` / `TARGET` 报告当前对标的版本 |
+| `chrome_h2.py` | 主角。提供 `ChromeTransport` / `AsyncChromeTransport`；`describe()` / `TARGET` 报告当前对标的版本 |
 | `verify_fp.py` | 拿 `references/chrome150_peet.json` 当基准逐字段校验 |
-| `hpack_probe.py` | 起一个 h2 服务器，抓客户端的**原始 ClientHello 和 HPACK 字节**，用于和真 Chrome 逐字节 diff |
+| `hpack_probe.py` | 起一个 h2 服务器，抓客户端的**原始 ClientHello、h2 帧和 HPACK 字节**；`diff` 三层一起比 |
 | `references/chrome150_peet.json` | 真 Chrome 150 在 tls.peet.ws 上的完整指纹 |
-| `references/chrome150_probe.json` | 真 Chrome 150 的**原始 ClientHello + HEADERS 帧**（`hpack_probe.py` 抓的） |
+| `references/chrome150_probe.json` | 真 Chrome 150 的**原始 ClientHello + 首个 h2 帧序列**（`hpack_probe.py` 抓的）。`chrome_h2` 的一切都从这个文件派生 |
 
 ---
 
 ## 用法
 
 ```python
-import chrome_h2          # 打补丁，必须在建 client 之前
+import chrome_h2
 import httpx
 
-r = httpx.Client(http2=True).get("https://example.com/")
+with httpx.Client(transport=chrome_h2.ChromeTransport()) as client:
+    r = client.get("https://example.com/")
 ```
 
-不用传任何参数，也不用改现有代码 —— `requests` / `aiohttp` 之外凡是走
-`httpx` + `httpcore` 的都自动生效（补丁打在 httpcore 的模块属性上）。
+异步用 `httpx.AsyncClient(transport=chrome_h2.AsyncChromeTransport())`。
+
+**`import` 本身什么都不改。** 只有拿到这个 transport 的 client 才有 Chrome 的行为，
+同一进程里别的 client 照旧 —— 可以直接对照：
+
+```python
+httpx.Client(transport=chrome_h2.ChromeTransport())  # 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
+httpx.Client(http2=True)                             # 1:4096;2:0;4:65535;5:16384;3:100;6:65536|16777216|0|m,a,s,p
+```
+
+### 代理
+
+代理参数传给 **transport**，走代理时指纹照样生效：
+
+```python
+transport = chrome_h2.ChromeTransport(proxy="http://user:pass@127.0.0.1:8080")
+with httpx.Client(transport=transport) as client:
+    client.get("https://example.com/")
+```
+
+`http://`、`https://`、`socks5://` 都支持，同步异步都一样。
+
+已实测：经 CONNECT 代理和经 SOCKS5 代理各打到本地探针一次，
+ClientHello + h2 帧 + HPACK **455 字节与直连完全相同**；再经两种代理访问
+tls.peet.ws，akamai 与直连一致，而同一进程里不带 transport 的 client 仍是 httpcore 原样。
+
+`socks5h://` **不能用** —— 那是 httpx 0.27.2 自己不认（`Unknown scheme for proxy URL`），
+与本模块无关。SOCKS5 需要 `socksio`，`install-python.sh` 已经装
+（`httpx[http2,socks]`）。
+
+**一个坑**：`verify`、`limits`、`proxy` 这类参数要给 **transport**，不是 Client ——
+httpx 一旦收到 transport，自己那份就不用了：
+
+```python
+chrome_h2.ChromeTransport(verify=ctx, proxy=P)   # 对
+httpx.Client(transport=..., verify=ctx, proxy=P) # 静默失效
+```
 
 想知道当前对标的是什么：
 
@@ -54,7 +90,12 @@ chrome_h2 target
   cache-control : not sent
   profile       : navigate (capture was sec-fetch-mode: navigate)
   akamai        : 1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
+  akamai md5    : 52d84b11737d980aef856699f885ca86
+  settings      : 1=65536, 2=0, 4=6291456, 6=262144
+  window update : 15663105
+  headers prio  : exclusive=True dep=0 weight=256
   derived from  : .../references/chrome150_probe.json
+  captured at   : 2026-08-03T10:57:34+00:00
   patched       : yes
 ```
 
@@ -66,14 +107,14 @@ chrome_h2 target
 chrome_h2.PROFILE = "navigate"      # 或 "xhr"
 chrome_h2.ACCEPT_LANGUAGE = "zh-CN,zh;q=0.9"
 chrome_h2.SEND_CACHE_CONTROL = True # 见下方"两个会变的头"
-
-chrome_h2.disable()                 # 还原成 httpcore 原样
-chrome_h2.enable()
 ```
 
-**没有 `CHROME_VERSION` 这个开关。** 版本、UA、`sec-ch-ua`、`accept`、`sec-fetch-*`、
-header 顺序全部从 `REFERENCE_CAPTURE` 指向的抓包**派生**，不是手写常量 —— 见下面的
-[换 Chrome 版本](#换-chrome-版本)。
+这三个是模块级的，对所有 transport 生效（要"还原成原样"直接别用 transport 就行）。
+
+**没有 `CHROME_VERSION`，也没有写死的 akamai 常量。** 版本、UA、`sec-ch-ua`、
+`accept`、`sec-fetch-*`、header 顺序，以及 SETTINGS、WINDOW_UPDATE、HEADERS 优先级、
+伪头顺序，全部从 `REFERENCE_CAPTURE` 指向的抓包**派生** —— 见下面的
+[换目标](#换目标chrome-新版本或别的客户端)。
 
 ---
 
@@ -124,17 +165,25 @@ Chrome  1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p   md5 52d84b11737d980a
 httpx   1:4096;2:0;4:65535;5:16384;3:100;6:65536|16777216|0|m,a,s,p
 ```
 
-数值取自 Chromium `net/http/http_network_session.cc` 的 `AddDefaultHttp2Settings()`
-和 `net/spdy/spdy_session.cc` 的 `SendInitialData()`。`spdy::SettingsMap` 是
-`std::map`，所以按 ID 升序发 1,2,4,6 —— **没有** MAX_CONCURRENT_STREAMS(3) 和
-MAX_FRAME_SIZE(5)。WINDOW_UPDATE = 15M − 65535 = 15663105。
+这些**不是写死的常量**，是从抓包里的 SETTINGS 帧按原样读出来的（`chrome_h2.SETTINGS`
+是 `[(id, value)]` 的有序列表，不是 dict —— 顺序本身就是指纹的一部分，不能被排序掉）。
+上面的值可以和 Chromium 源码对上：`net/http/http_network_session.cc` 的
+`AddDefaultHttp2Settings()` 和 `net/spdy/spdy_session.cc` 的 `SendInitialData()`；
+`spdy::SettingsMap` 是 `std::map`，所以按 ID 升序发 1,2,4,6 —— **没有**
+MAX_CONCURRENT_STREAMS(3) 和 MAX_FRAME_SIZE(5)。WINDOW_UPDATE = 15M − 65535 = 15663105。
 
-伪头顺序 `m,a,s,p` httpcore 本来就一致，没动。
+id 3 即使不上线也会塞进 `local_settings`：httpcore 拿它给信号量定容量，而 h2 在这个 key
+缺失时返回 2³²+1，httpcore 会去 acquire 四十多亿次，请求永远发不出去。控制上线内容的是
+`_ChromeSettings.__iter__`，不是删 key。
+
+伪头顺序也来自抓包（`chrome_h2.PSEUDO_ORDER`）。Chrome 的 `m,a,s,p` 和 httpcore 本来就
+一致，但别的客户端不一定 —— 换目标时它会自动跟着变。
 
 ### 2. HEADERS 帧的优先级
 
-Chrome 不发独立 PRIORITY 帧（所以 akamai 第三段是 `0`），但会在 HEADERS 上带
-RFC 7540 优先级：exclusive=1, depends_on=0, weight=256。
+同样派生自抓包。Chrome 不发独立 PRIORITY 帧（所以 akamai 第三段是 `0`），但会在 HEADERS
+上带 RFC 7540 优先级：exclusive=1, depends_on=0, weight=256。抓包里没有优先级时就不带
+PRIORITY 标志。
 
 同时**去掉**了 httpcore 在 HEADERS 之后发的 per-stream WINDOW_UPDATE —— 我们已经在
 SETTINGS 里宣告 6MB 流窗口，Chrome 不发这一帧。
@@ -192,7 +241,8 @@ h2 的 never-indexed 规则源码注释里写明是"照 Firefox 和 nghttp2"，�
 * **akamai 指纹** —— SETTINGS、连接级 WINDOW_UPDATE、PRIORITY、**伪头**顺序，
   就这四段
 
-这两样能对着 `references/` 里的真 Chrome 抓包逐字段比对，对上就是对上了。
+这两样能对着 `references/` 里的真 Chrome 抓包逐字段比对，对上就是对上了。akamai 这四段
+如今是直接从抓包读的，不是照着源码抄进代码的常量 —— 抄错的可能性被去掉了。
 
 ### 第二档：header 的集合 —— 逻辑上站得住，但不进任何哈希
 
@@ -228,6 +278,31 @@ akamai 和 TLS 照样全对。
 
 三层都有真实 Chrome 参照，全部验证通过。**注意这里的"通过"只对第一档构成指纹证据**，
 第二、三档是"与真 Chrome 一致"，不等于"有人在查"。
+
+### 新机器上怎么确认构建是对的
+
+`install-python.sh` 自带两道，装完自动跑，**都不需要外网**：
+
+| | 查什么 | 失败表现 |
+|---|---|---|
+| 链接检查 | CLI 与 Python 加载的 libssl 是不是 `$PREFIX/lib` 里那个 | 直接 `die` |
+| 自检 | 本机起 h2 服务器，自己连自己，把 **ClientHello + h2 帧 + HPACK 字节**和 `references/chrome150_probe.json` 逐项比 | 打出 diff 后 `die` |
+
+第二道就是下面「原始字节」那一节的自动化版本，覆盖三层里的全部三层。它对端口敏感
+（`:authority` 里带端口），所以端口是从参考抓包里读出来的，**不能随便改**：
+
+```bash
+python hpack_probe.py port references/chrome150_probe.json   # → 8443
+```
+
+要跳过用 `--skip-selftest`，但那样就没有任何东西检查过指纹了。
+
+**不要拿 OpenSSL 自带的 `make test` 当验收标准。** 这个 fork 钉死了 cipher 列表、
+sigalgs 和证书压缩算法，`test_ssl_new` 里有 14 个配置因此必然失败（含
+`04-client_auth`、`26-tls13_client_auth`）—— 那是改造的**代价**，不是 bug。真要用它
+做回归，得和改动前的 commit 跑同一组测试、比**失败集合是否一致**，而不是看有没有失败。
+
+联网之后再跑一次 `verify_fp.py`（见下），那是唯一能证明"真实服务端也认"的检查。
 
 ### TLS + h2 帧 + 头
 
@@ -298,27 +373,57 @@ chrome_h2.ACCEPT_LANGUAGE = "en-US,en;q=0.9" # 全新 profile 是 en-US
 
 ---
 
-## 换 Chrome 版本
+## 换目标（Chrome 新版本，或别的客户端）
 
-抓一次新的就行，不用改代码：
+抓一次新的就行，Python 侧不用改代码：
 
 ```bash
 python hpack_probe.py serve --out references/chrome151_probe.json
-# Chrome 访问 https://localhost:8443/api/all 一次
+# 目标客户端访问 https://localhost:8443/api/all 一次
+
+# 先试用，不改文件
+CHROME_H2_CAPTURE=references/chrome151_probe.json python your_script.py
 ```
 
-然后把 `chrome_h2.py` 里的 `REFERENCE_CAPTURE` 指到新文件。`TARGET`、UA、
-`sec-ch-ua`、`accept`、header 顺序、`accept-language` 默认值、要不要发
-`cache-control`，全部自动跟着变。
+满意了再把 `chrome_h2.py` 里的 `REFERENCE_CAPTURE` 指过去。
+
+**Python 侧全自动的部分：**
+
+| | 来源 |
+|---|---|
+| UA、`sec-ch-ua`、`accept`、`sec-fetch-*`、header 集合与顺序 | HEADERS 帧解出来的 HPACK |
+| `accept-language` 默认值、要不要发 `cache-control` | 同上 |
+| SETTINGS 的 id / 顺序 / 数值 | SETTINGS 帧 |
+| 连接级 WINDOW_UPDATE（0 = 不发） | WINDOW_UPDATE 帧 |
+| HEADERS 优先级（没有就不带 PRIORITY 标志） | HEADERS 帧标志位 |
+| 伪头顺序（akamai 最后一段） | HPACK 里的 `:` 开头字段 |
 
 **这样设计是因为手写常量会烂。** `sec-ch-ua` 的品牌排列 Chromium 每个大版本都重排 ——
-Chrome 150 是 `"Not;A=Brand";v="8"` 打头，早期版本是末尾的 `"Not_A Brand";v="99"`。
-以前光改一个 `CHROME_VERSION` 只会得到一个**看着像、实际不对**的值。现在这种错误做不出来了。
+Chrome 150 是 `"Not;A=Brand";v="8"` 打头，早期版本是末尾的 `"Not_A Brand";v="99"`；
+akamai 那串数字更是抄错了也看不出来。现在这两类错误都做不出来了。
 
-换完之后跑一遍验证确认新旧差异：
+**不自动的部分：TLS 层。** 抓包里的 ClientHello 只用来 diff，没有任何代码消费它 ——
+cipher 列表、扩展集合、sigalgs、key_share 个数全部写死在 C 里
+（`ssl/ssl_lib.c`、`ssl/statem/extensions_clnt.c`、`ssl/statem/extensions.c`），
+改了要重新编译。所以：
+
+* **换 Chrome 版本 / 换成 Android Chrome** —— 同一份 BoringSSL，ClientHello 大概率不用动，
+  跑一次 `diff` 就知道。
+* **换成 Safari / iOS / 原生 App** —— TLS 栈完全不同，等于把 C 那部分重做一遍。
+  h2 层倒是抓一次就跟着变了（连伪头顺序都是）。
+
+换完之后 diff 一遍，三层一起比：
 
 ```bash
-python hpack_probe.py diff references/chrome150_probe.json references/chrome151_probe.json
+python hpack_probe.py serve --out /tmp/ours.json &
+python hpack_probe.py client
+python hpack_probe.py diff references/chrome151_probe.json /tmp/ours.json
+```
+
+```
+=== ClientHello ===          ← 差异要改 C 并重编
+=== HTTP/2 frame layer ===   ← 差异说明 chrome_h2 没吃到新抓包
+=== HPACK header block ===   ← 逐字节
 ```
 
 ---
@@ -339,9 +444,14 @@ python hpack_probe.py diff references/chrome150_probe.json references/chrome151_
 * **`xhr` 模板仍是手写的。** 只有 `navigate` 是从抓包派生的 —— 我没有 XHR 的一手抓包。
   它用的 UA / `sec-ch-ua` / `accept-language` 会跟着抓包走，但头的集合与顺序是推断的。
 * **SETTINGS GREASE 不模拟。** Chrome 能发第五个 GREASE 设置，但 id 和值都是每连接随机，
-  且 `enable_http2_settings_grease` 默认关。网上流传的固定值本身就是特征。
-* **`xhr` 模板的顺序未经一手抓包确认**，头的集合是确定的，顺序是推断的。
-* **这是 monkeypatch。** httpx/httpcore/h2 版本一变就可能失配，`import` 时会校验并告警。
+  且 `enable_http2_settings_grease` 默认关。网上流传的固定值本身就是特征。抓包里若出现
+  独立 PRIORITY 帧，`import` 时会告警——那一段不复现。
+* **这是对 httpcore 内部类的子类化。** httpcore 把 HTTP/2 类的 import 写在
+  `handle_request()` 函数体里，没有钩子可用，所以改的是**赋值那一步**：给连接对象
+  的 `_connection` 装一个 property，它在 httpcore 刚建好 `HTTP2Connection`、还没发
+  preface 时把它改挂成我们的子类。好处是**一行 httpcore 的连接逻辑都没抄**，直连、
+  代理隧道、SOCKS 三条路径共用同一个钩子。httpx/httpcore/h2 版本一变仍可能失配，
+  建 transport 时会校验并告警。
   升级前请重跑上面全部验证。
 * **只覆盖 h2。** `httpx.Client()`（http/1.1）没有 SETTINGS 那种指纹面，只剩头顺序，
   但本模块的头模板只作用于 h2 路径。

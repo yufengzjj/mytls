@@ -626,7 +626,7 @@ CON_FUNC_RETURN tls_construct_finished(SSL_CONNECTION *s, WPACKET *pkt)
             && !s->server
             && (s->early_data_state != SSL_EARLY_DATA_NONE
                 || (s->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) != 0)
-            && s->s3.tmp.cert_req == 0
+            && ossl_statem_client13_flight_opener(s) == TLS_ST_CW_FINISHED
             && (!ssl->method->ssl3_enc->change_cipher_state(s,
                     SSL3_CC_HANDSHAKE | SSL3_CHANGE_CIPHER_CLIENT_WRITE))) {;
         /* SSLfatal() already called */

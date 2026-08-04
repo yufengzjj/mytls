@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import chrome_h2  # noqa: E402, F401  (patches httpcore on import)
+import chrome_h2  # noqa: E402
 import httpx  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
@@ -84,7 +84,7 @@ def fetch_resumed() -> dict:
 
 
 def fetch_plain() -> dict:
-    with httpx.Client(http2=True, timeout=30) as c:
+    with httpx.Client(transport=chrome_h2.ChromeTransport(), timeout=30) as c:
         return c.get(URL, headers={"User-Agent": UA}).json()
 
 

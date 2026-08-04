@@ -437,6 +437,32 @@ static int do_compressed_cert(SSL_CONNECTION *sc)
  * move to next when the TLSv1.3 client is writing messages to be sent to the
  * server.
  */
+/* The tail of the client's second flight, reached by several paths. */
+static void client13_write_cert_or_finished(SSL_CONNECTION *s)
+{
+    OSSL_STATEM *st = &s->statem;
+
+    if (s->s3.tmp.cert_req == 0)
+        st->hand_state = TLS_ST_CW_FINISHED;
+    else if (do_compressed_cert(s))
+        st->hand_state = TLS_ST_CW_COMP_CERT;
+    else
+        st->hand_state = TLS_ST_CW_CERT;
+}
+
+/*
+ * Everything the client sends once the server's Finished has been read (and
+ * the compat CCS, if any, written). draft-vvv-tls-alps puts our
+ * EncryptedExtensions here, ahead of Certificate/CertificateVerify/Finished.
+ */
+static void client13_write_second_flight(SSL_CONNECTION *s)
+{
+    if (s->ext.alps_negotiated)
+        s->statem.hand_state = TLS_ST_CW_ENCRYPTED_EXTENSIONS;
+    else
+        client13_write_cert_or_finished(s);
+}
+
 static WRITE_TRAN ossl_statem_client13_write_transition(SSL_CONNECTION *s)
 {
     OSSL_STATEM *st = &s->statem;
@@ -479,12 +505,8 @@ static WRITE_TRAN ossl_statem_client13_write_transition(SSL_CONNECTION *s)
         else if ((s->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) != 0
                  && s->hello_retry_request == SSL_HRR_NONE)
             st->hand_state = TLS_ST_CW_CHANGE;
-        else if (s->s3.tmp.cert_req == 0)
-            st->hand_state = TLS_ST_CW_FINISHED;
-        else if (do_compressed_cert(s))
-            st->hand_state = TLS_ST_CW_COMP_CERT;
         else
-            st->hand_state = TLS_ST_CW_CERT;
+            client13_write_second_flight(s);
 
         s->ts_msg_read = ossl_time_now();
         return WRITE_TRAN_CONTINUE;
@@ -498,12 +520,11 @@ static WRITE_TRAN ossl_statem_client13_write_transition(SSL_CONNECTION *s)
 
     case TLS_ST_CW_END_OF_EARLY_DATA:
     case TLS_ST_CW_CHANGE:
-        if (s->s3.tmp.cert_req == 0)
-            st->hand_state = TLS_ST_CW_FINISHED;
-        else if (do_compressed_cert(s))
-            st->hand_state = TLS_ST_CW_COMP_CERT;
-        else
-            st->hand_state = TLS_ST_CW_CERT;
+        client13_write_second_flight(s);
+        return WRITE_TRAN_CONTINUE;
+
+    case TLS_ST_CW_ENCRYPTED_EXTENSIONS:
+        client13_write_cert_or_finished(s);
         return WRITE_TRAN_CONTINUE;
 
     case TLS_ST_CW_COMP_CERT:
@@ -966,6 +987,11 @@ int ossl_statem_client_construct_message(SSL_CONNECTION *s,
     case TLS_ST_PENDING_EARLY_DATA_END:
         *confunc = NULL;
         *mt = SSL3_MT_DUMMY;
+        break;
+
+    case TLS_ST_CW_ENCRYPTED_EXTENSIONS:
+        *confunc = tls_construct_client_encrypted_extensions;
+        *mt = SSL3_MT_ENCRYPTED_EXTENSIONS;
         break;
 
     case TLS_ST_CW_CERT:
@@ -3803,6 +3829,7 @@ CON_FUNC_RETURN tls_construct_client_certificate(SSL_CONNECTION *s,
             && SSL_IS_FIRST_HANDSHAKE(s)
             && (s->early_data_state != SSL_EARLY_DATA_NONE
                 || (s->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) != 0)
+            && ossl_statem_client13_flight_opener(s) == TLS_ST_CW_CERT
             && (!ssl->method->ssl3_enc->change_cipher_state(s,
                     SSL3_CC_HANDSHAKE | SSL3_CHANGE_CIPHER_CLIENT_WRITE))) {
         /*
@@ -3892,6 +3919,7 @@ CON_FUNC_RETURN tls_construct_client_compressed_certificate(SSL_CONNECTION *sc,
     if (SSL_IS_FIRST_HANDSHAKE(sc)
             && (sc->early_data_state != SSL_EARLY_DATA_NONE
                 || (sc->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) != 0)
+            && ossl_statem_client13_flight_opener(sc) == TLS_ST_CW_CERT
             && (!ssl->method->ssl3_enc->change_cipher_state(sc,
                     SSL3_CC_HANDSHAKE | SSL3_CHANGE_CIPHER_CLIENT_WRITE))) {
         /*
@@ -4183,5 +4211,64 @@ CON_FUNC_RETURN tls_construct_end_of_early_data(SSL_CONNECTION *s, WPACKET *pkt)
     }
 
     s->early_data_state = SSL_EARLY_DATA_FINISHED_WRITING;
+    return CON_FUNC_SUCCESS;
+}
+
+/*
+ * The client half of Application-Layer Protocol Settings (draft-vvv-tls-alps).
+ *
+ * ALPS is not the one-way extension its name suggests. Once the server answers
+ * our offer with application_settings of its own in EncryptedExtensions, the
+ * draft says we "MUST send an EncryptedExtensions message" back, carrying the
+ * settings for the negotiated protocol, after the server's Finished and before
+ * our Certificate/CertificateVerify/Finished. A server that negotiated ALPS
+ * and does not get it aborts - the draft prescribes missing_extension, while
+ * Google's frontends send unexpected_message, because what actually happens is
+ * that they read a Finished where an EncryptedExtensions was due.
+ *
+ * The settings blob is opaque to TLS and ours is empty: for h2 it would carry
+ * a SETTINGS frame, and the browser we imitate declares none either - ALPS is
+ * used server-to-client, to deliver ACCEPT_CH. Only the extension's presence is
+ * required.
+ */
+CON_FUNC_RETURN tls_construct_client_encrypted_extensions(SSL_CONNECTION *s,
+                                                          WPACKET *pkt)
+{
+    SSL *ssl = SSL_CONNECTION_GET_SSL(s);
+
+    if (!ossl_assert(s->ext.alps_negotiated)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_SHOULD_NOT_HAVE_BEEN_CALLED);
+        return CON_FUNC_ERROR;
+    }
+
+    /* EncryptedExtensions is a bare extension block: Extension extensions<0..2^16-1>. */
+    if (!WPACKET_start_sub_packet_u16(pkt)
+            || !WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_application_settings)
+            || !WPACKET_put_bytes_u16(pkt, 0)
+            || !WPACKET_close(pkt)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return CON_FUNC_ERROR;
+    }
+
+    /*
+     * We open the client's second flight, so the deferred handshake write key
+     * change is ours - see ossl_statem_client13_flight_opener(). It has to
+     * happen after the body is written and before the record is sealed, so that
+     * this message is the first one encrypted under the new keys; Certificate
+     * and Finished do it in the same place for the same reason.
+     */
+    if (SSL_IS_FIRST_HANDSHAKE(s)
+            && (s->early_data_state != SSL_EARLY_DATA_NONE
+                || (s->options & SSL_OP_ENABLE_MIDDLEBOX_COMPAT) != 0)
+            && !ssl->method->ssl3_enc->change_cipher_state(s,
+                    SSL3_CC_HANDSHAKE | SSL3_CHANGE_CIPHER_CLIENT_WRITE)) {
+        /*
+         * Fatal: this leaves enc_write_ctx inconsistent, so ssl3_send_alert
+         * may crash.
+         */
+        SSLfatal(s, SSL_AD_NO_ALERT, SSL_R_CANNOT_CHANGE_CIPHER);
+        return CON_FUNC_ERROR;
+    }
+
     return CON_FUNC_SUCCESS;
 }

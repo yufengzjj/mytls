@@ -1124,10 +1124,11 @@ EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
  * offered, which is why an http/1.1-only ClientHello from Chrome carries no
  * ALPS and has one extension fewer.
  *
- * We have no settings of our own to send or to act on; the point is purely
- * that the extension is present, and that a server which answers with its own
- * settings in EncryptedExtensions does not trip the unsolicited-extension
- * check.
+ * We have no settings of our own to declare, but ALPS is not a one-way
+ * extension: a server that answers with its own settings expects an
+ * EncryptedExtensions message back before our Finished. That is built in
+ * tls_construct_client_encrypted_extensions(); all this side does is record
+ * that the server took us up on the offer.
  */
 static const unsigned char alps_h2[] = { 0x02, 'h', '2' };
 
@@ -1137,6 +1138,13 @@ EXT_RETURN tls_construct_ctos_alps(SSL_CONNECTION *s, WPACKET *pkt,
 {
     size_t i;
     int offers_h2 = 0;
+
+    /*
+     * Cleared here rather than at parse time: this runs for every ClientHello,
+     * so a second handshake on the same SSL cannot inherit the first one's
+     * answer.
+     */
+    s->ext.alps_negotiated = 0;
 
     if (s->ext.alpn == NULL || !SSL_IS_FIRST_HANDSHAKE(s))
         return EXT_RETURN_NOT_SENT;
@@ -1173,12 +1181,17 @@ EXT_RETURN tls_construct_ctos_alps(SSL_CONNECTION *s, WPACKET *pkt,
 int tls_parse_stoc_alps(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
                         X509 *x, size_t chainidx)
 {
-    /* The server's application settings, which we have no use for. */
+    /*
+     * The server's settings themselves are of no use to us - for h2 they carry
+     * ACCEPT_CH, which only a browser acts on. What matters is that ALPS is now
+     * negotiated, which commits us to sending an EncryptedExtensions message.
+     */
     if (!PACKET_forward(pkt, PACKET_remaining(pkt))) {
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_BAD_EXTENSION);
         return 0;
     }
 
+    s->ext.alps_negotiated = 1;
     return 1;
 }
 

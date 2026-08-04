@@ -181,6 +181,13 @@ def describe(ftype: int, flags: int, stream: int, payload: bytes) -> dict:
         ]
     elif ftype == 8:  # WINDOW_UPDATE
         out["increment"] = struct.unpack("!I", payload)[0] & 0x7FFFFFFF
+    elif ftype == 2:  # PRIORITY
+        dep = struct.unpack("!I", payload[:4])[0]
+        out["priority"] = {
+            "exclusive": bool(dep >> 31),
+            "depends_on": dep & 0x7FFFFFFF,
+            "weight": payload[4] + 1,
+        }
     elif ftype == 1:  # HEADERS
         body = payload
         if flags & 0x08:  # PADDED
@@ -289,13 +296,15 @@ def handle_h2(sock: ssl.SSLSocket) -> dict | None:
 
 def client(args: argparse.Namespace) -> int:
     sys.path.insert(0, str(HERE))
-    import chrome_h2  # noqa: F401  patches httpcore
+    import chrome_h2
     import httpx
 
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
-    with httpx.Client(http2=True, verify=ctx, timeout=15) as c:
+    # verify goes on the transport: httpx ignores its own when given one.
+    transport = chrome_h2.ChromeTransport(verify=ctx)
+    with httpx.Client(transport=transport, timeout=15) as c:
         try:
             c.get(f"https://localhost:{args.port}/api/all")
         except Exception as exc:  # noqa: BLE001 - server closes early by design
@@ -312,6 +321,83 @@ def _decode(block: bytes) -> list[tuple[str, str]]:
         return x if isinstance(x, str) else x.decode("utf-8", "replace")
 
     return [(text(k), text(v)) for k, v in hpack.Decoder().decode(block)]
+
+
+def akamai_fingerprint(rec: dict) -> str:
+    """The akamai HTTP/2 fingerprint of a capture.
+
+    Four fields: the client's SETTINGS in wire order, the connection-level
+    WINDOW_UPDATE, any standalone PRIORITY frames, and the pseudo-header order.
+    chrome_h2 derives exactly these from a capture, so this is what tells you
+    whether a new capture needs any code change at all.
+    """
+    frames = rec["frames"]
+
+    def find(kind, pred=lambda _f: True):
+        return next((f for f in frames if f["type"] == kind and pred(f)), None)
+
+    # An ACK carries no payload, so an empty settings list is not the client's.
+    settings = find("SETTINGS", lambda f: bool(f.get("settings")) and not f["flags"] & 0x01)
+    window = find("WINDOW_UPDATE", lambda f: f["stream"] == 0)
+    headers = find("HEADERS")
+
+    fields = [
+        ";".join(f"{s['id']}:{s['value']}" for s in settings["settings"])
+        if settings else "0",
+        str(window["increment"]) if window else "0",
+        ",".join(
+            f"{f['stream']}:{int(f['priority']['exclusive'])}"
+            f":{f['priority']['depends_on']}:{f['priority']['weight']}"
+            for f in frames if f["type"] == "PRIORITY"
+        ) or "0",
+        ",".join(k[1] for k, _ in _decode(bytes.fromhex(headers["header_block"]))
+                 if k.startswith(":")) if headers else "",
+    ]
+    return "|".join(fields)
+
+
+def diff_h2(a: dict, b: dict, na: str, nb: str) -> bool:
+    """Compare the akamai layer: SETTINGS, WINDOW_UPDATE, PRIORITY, pseudo-headers."""
+    print("=== HTTP/2 frame layer ===")
+    fa, fb = akamai_fingerprint(a), akamai_fingerprint(b)
+    print(f"  {na}: {fa}")
+    print(f"  {nb}: {fb}")
+
+    names = ("settings", "window_update", "priority", "pseudo_headers")
+    same = True
+    for name, x, y in zip(names, fa.split("|"), fb.split("|")):
+        if x == y:
+            print(f"  {name:<16} OK")
+            continue
+        same = False
+        print(f"  {name:<16} DIFFER\n      {na}: {x}\n      {nb}: {y}")
+
+    # Not part of the fingerprint, but chrome_h2 reproduces it and a mismatch
+    # here means the HEADERS frame has the wrong flags and length.
+    def prio(rec):
+        f = next((x for x in rec["frames"] if x["type"] == "HEADERS"), None)
+        return f.get("priority") if f else None
+
+    pa, pb = prio(a), prio(b)
+    if pa == pb:
+        print(f"  headers_priority OK")
+    else:
+        same = False
+        print(f"  headers_priority DIFFER\n      {na}: {pa}\n      {nb}: {pb}")
+    return same
+
+
+def port_of(rec: dict) -> int:
+    """The port the capture was taken on, read out of `:authority`.
+
+    A capture is only byte-comparable against one taken on the same port:
+    `:authority` is `localhost:8443`, so the port lands in the HPACK block and
+    a mismatch shows up as a difference in the first few bytes.
+    """
+    frame = next(f for f in rec["frames"] if f["type"] == "HEADERS")
+    authority = dict(_decode(bytes.fromhex(frame["header_block"])))[":authority"]
+    _, _, port = authority.rpartition(":")
+    return int(port)
 
 
 def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
@@ -374,6 +460,8 @@ def diff(args: argparse.Namespace) -> int:
 
     ok = diff_client_hello(a.get("client_hello"), b.get("client_hello"),
                            args.a, args.b)
+    print()
+    ok &= diff_h2(a, b, args.a, args.b)
 
     print(f"\n=== HPACK header block ===")
     print(f"{args.a}: {len(ba)} bytes")
@@ -422,6 +510,12 @@ def main() -> int:
     d.add_argument("a")
     d.add_argument("b")
     d.set_defaults(func=diff)
+
+    p2 = sub.add_parser(
+        "port", help="print the port a capture was taken on (see port_of)")
+    p2.add_argument("capture")
+    p2.set_defaults(func=lambda a: (
+        print(port_of(json.loads(Path(a.capture).read_text()))), 0)[1])
 
     args = p.parse_args()
     return args.func(args)
