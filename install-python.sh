@@ -180,11 +180,11 @@ PY="$PYENV_ROOT/versions/$PYTHON_VERSION/bin/python$(echo "$PYTHON_VERSION" | cu
 [ -x "$PY" ] || die "$PY is missing - the CPython build did not finish"
 
 # --- 5. Python packages -----------------------------------------------------
-# httpx is pinned: python/chrome_h2.py subclasses httpcore internals, and checks
-# the version it got.
+# httpx is pinned: python/browser_fp.py subclasses httpcore internals, and
+# checks the version it got.
 say "installing Python packages"
 "$PY" -m pip install --quiet --upgrade pip
-# socks: chrome_h2's transport supports socks5:// proxies, which need socksio.
+# socks: browser_fp's transports support socks5:// proxies, which need socksio.
 "$PY" -m pip install --quiet "httpx[http2,socks]==0.27.2" brotli zstandard
 
 # --- 6. check ---------------------------------------------------------------
@@ -235,86 +235,37 @@ for name in ("zlib", "_ctypes", "sqlite3", "lzma", "bz2"):
 print(f"  modules : {'all present' if not missing else 'MISSING ' + ', '.join(missing)}")
 
 sys.path.insert(0, str(Path.cwd() / "python"))
-import chrome_h2  # noqa: E402
+import browser_fp  # noqa: E402
 
 ctx = ssl.create_default_context()
 names = [c["name"] for c in ctx.get_ciphers()]
 print(f"  ciphers : {len(names)} ({'pinned OK' if len(names) == 15 else 'UNEXPECTED'})")
 
-# Building one proves the httpcore subclassing still fits this httpx.
-chrome_h2.ChromeTransport().close()
-print(f"  h2      : ChromeTransport OK, akamai {chrome_h2.AKAMAI_FINGERPRINT}")
+if not browser_fp.PROFILES:
+    sys.exit(f"  !! no browser profiles in {browser_fp.PROFILES_DIR}")
+# Building one per brand proves the httpcore subclassing still fits this httpx.
+for brand, prof in sorted(browser_fp.PROFILES.items()):
+    browser_fp.Transport(brand).close()
+    print(f"  h2      : {brand} ({prof.label}) OK, akamai {prof.akamai_fingerprint}")
 EOF
 
 # --- 7. self-test -----------------------------------------------------------
 # Linkage only proves we loaded the right library; this proves the library still
-# emits Chrome's bytes. hpack_probe.py stands up a local HTTP/2 server, our own
-# client connects to it, and the ClientHello, the HTTP/2 frames and the HPACK
-# block it captured are compared against a real Chrome 150 capture kept in
-# python/references/. Entirely local: no network, no third-party service, and
-# the same result on an air-gapped machine.
-self_test() {
-    local ref="$ROOT/python/references/chrome150_probe.json"
-    local port tmp srv rc=0 i
-
-    # The port is not free to choose: `:authority` is `localhost:<port>`, so it
-    # is part of the HPACK block. Take it from the reference or the byte
-    # comparison fails on a difference that means nothing.
-    port="$("$PY" "$ROOT/python/hpack_probe.py" port "$ref")" \
-        || die "cannot read the port out of $ref"
-    if [ -n "${PROBE_PORT:-}" ] && [ "$PROBE_PORT" != "$port" ]; then
-        warn "PROBE_PORT=$PROBE_PORT but the reference was captured on $port;
-         the HPACK block will differ in :authority. The ClientHello and
-         HTTP/2 layers are still meaningful."
-        port="$PROBE_PORT"
-    fi
-
-    tmp="$(mktemp -d)"
-
-    ( cd "$ROOT/python" && "$PY" hpack_probe.py serve --port "$port" \
-        --out "$tmp/ours.json" --openssl "$PREFIX/bin/openssl" ) \
-        > "$tmp/serve.log" 2>&1 &
-    srv=$!
-
-    # The server generates a self-signed cert on first run, so give it a moment.
-    for i in $(seq 1 30); do
-        grep -q listening "$tmp/serve.log" 2>/dev/null && break
-        kill -0 "$srv" 2>/dev/null || break
-        sleep 1
-    done
-
-    # It closes the stream early by design, so the client always reports an
-    # error; the capture is what matters.
-    ( cd "$ROOT/python" && "$PY" hpack_probe.py client --port "$port" ) \
-        > "$tmp/client.log" 2>&1 || true
-
-    for i in $(seq 1 15); do          # serve exits after one capture
-        kill -0 "$srv" 2>/dev/null || break
-        sleep 1
-    done
-    kill "$srv" 2>/dev/null || true
-    wait "$srv" 2>/dev/null || true
-
-    if [ ! -s "$tmp/ours.json" ]; then
-        cat "$tmp/serve.log" "$tmp/client.log" >&2
-        rm -rf "$tmp"
-        die "the probe captured nothing - see the output above.
-         If port $port is already in use, free it and re-run: the port cannot
-         simply be changed, it is baked into the reference's :authority."
-    fi
-
-    "$PY" "$ROOT/python/hpack_probe.py" diff "$ref" "$tmp/ours.json" || rc=$?
-    rm -rf "$tmp"
-    return "$rc"
-}
-
+# emits the captured browsers' bytes. `hpack_probe.py selftest` stands up a
+# local HTTP/2 server, drives our own client at it, and compares the
+# ClientHello, the HTTP/2 frames and the HPACK block against every capture in
+# python/profiles/. Entirely local: no network, no third-party service, and the
+# same result on an air-gapped machine.
 if [ "$SKIP_SELFTEST" -eq 1 ]; then
     warn "skipping the self-test; nothing has checked that the build still
-         reproduces Chrome's bytes."
+         reproduces the captured browsers' bytes."
 else
-    say "self-test: our bytes vs the Chrome 150 capture"
-    self_test || die "this build does NOT reproduce Chrome's bytes - see the diff above.
-         Every line should read OK and the HPACK block should be identical."
+    say "self-test: our bytes vs every capture in python/profiles"
+    ( cd "$ROOT/python" && "$PY" hpack_probe.py selftest \
+        --openssl "$PREFIX/bin/openssl" ${PROBE_PORT:+--port "$PROBE_PORT"} ) \
+        || die "this build does NOT reproduce the captured bytes - see the diff
+         above. Every line should read OK and the HPACK block should be
+         identical."
 fi
 
 cat <<EOF
@@ -331,4 +282,8 @@ $(say "done")
   network, and is the only one that proves a real server agrees with us:
     cd python && "$PY" verify_fp.py            # h2 layer + header values
     cd python && "$PY" verify_fp.py --resume   # TLS layer incl. the PSK ext
+
+  what is installed, and how to add a browser:
+    cd python && "$PY" hpack_probe.py list
+    cd python && "$PY" hpack_probe.py serve   # then point any browser at it
 EOF

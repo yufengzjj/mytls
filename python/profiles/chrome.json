@@ -1,0 +1,205 @@
+{
+  "brand": "chrome",
+  "frames": [
+    {
+      "type": "SETTINGS",
+      "flags": 0,
+      "stream": 0,
+      "length": 24,
+      "settings": [
+        {
+          "id": 1,
+          "name": "HEADER_TABLE_SIZE",
+          "value": 65536
+        },
+        {
+          "id": 2,
+          "name": "ENABLE_PUSH",
+          "value": 0
+        },
+        {
+          "id": 4,
+          "name": "INITIAL_WINDOW_SIZE",
+          "value": 6291456
+        },
+        {
+          "id": 6,
+          "name": "MAX_HEADER_LIST_SIZE",
+          "value": 262144
+        }
+      ]
+    },
+    {
+      "type": "WINDOW_UPDATE",
+      "flags": 0,
+      "stream": 0,
+      "length": 4,
+      "increment": 15663105
+    },
+    {
+      "type": "HEADERS",
+      "flags": 37,
+      "stream": 1,
+      "length": 460,
+      "priority": {
+        "exclusive": true,
+        "depends_on": 0,
+        "weight": 256
+      },
+      "header_block": "82418aa0e41d139d09b8f34d3387048660759981d14740874148b1275ad1ffb7fe749d3f70c176c1d527f3f7de0fe5efe7e94fe6f4f61e935b4ff3f7de0fe42d83f9fa53f9c473cd4154bd3d87a4bfcfdf783f90b60fe7408b4148b1275ad1ad49e33505023f30408d4148b1275ad1ad5d034ca7b29f88fe791aa90fe11fcf4092b6b9ac1c8558d520a4b6c2ad617b5a54251f01317ad5d07f66a281b0dae053fae46aa43f8429a77a8102e0fb5391aa71afb53cb8d7f6a435d74179163cc64b0db2eaecb8a7f59b1efd19fe94a0dd4aa62293a9ffb52f4f61e92b016c0b81702e05370e51d8661b65d5d97353e5497ca589d34d1f43aeba0c41a4c7a98f33a69a3fdf9a68fa1d75d0620d263d4c79a68fbed00177fe8d48e62b03ee697e8d48e62b1e0b1d7f46a4731581d754df5f2c7cfdf6800bbdf43aeba0c41a4c7a9841a6a8b22c5f249c754c5fbef046cfdf6800bbbf408a4148b4a549275906497f83a8f517408a4148b4a549275a93c85f86a87dcd30d25f408a4148b4a549275ad416cf023f31408a4148b4a549275a42a13f8690e4b692d49f50929bd9abfa5242cb40d25fa523b3e94f684c9f518b2d4b70ddf45abefb4005df4086aec31ec327d785b6007d286f"
+    }
+  ],
+  "client_hello": {
+    "record_version": "0x0301",
+    "legacy_version": "0x0303",
+    "session_id_len": 32,
+    "cipher_suites": [
+      "0x6a6a",
+      "0x1301",
+      "0x1302",
+      "0x1303",
+      "0xc02b",
+      "0xc02f",
+      "0xc02c",
+      "0xc030",
+      "0xcca9",
+      "0xcca8",
+      "0xc013",
+      "0xc014",
+      "0x009c",
+      "0x009d",
+      "0x002f",
+      "0x0035"
+    ],
+    "extensions": [
+      {
+        "type": 51914,
+        "hex": "0xcaca",
+        "length": 0,
+        "grease": true,
+        "body": ""
+      },
+      {
+        "type": 23,
+        "hex": "0x0017",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 43,
+        "hex": "0x002b",
+        "length": 7,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 17613,
+        "hex": "0x44cd",
+        "length": 5,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 27,
+        "hex": "0x001b",
+        "length": 3,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 35,
+        "hex": "0x0023",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 13,
+        "hex": "0x000d",
+        "length": 24,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 65037,
+        "hex": "0xfe0d",
+        "length": 282,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 10,
+        "hex": "0x000a",
+        "length": 12,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 16,
+        "hex": "0x0010",
+        "length": 14,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 0,
+        "hex": "0x0000",
+        "length": 14,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 51,
+        "hex": "0x0033",
+        "length": 1263,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 5,
+        "hex": "0x0005",
+        "length": 5,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 45,
+        "hex": "0x002d",
+        "length": 2,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 65281,
+        "hex": "0xff01",
+        "length": 1,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 11,
+        "hex": "0x000b",
+        "length": 2,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 18,
+        "hex": "0x0012",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 56026,
+        "hex": "0xdada",
+        "length": 1,
+        "grease": true,
+        "body": "00"
+      }
+    ],
+    "raw": "160301071801000714030389bdde5517794e926e9300f65c3486f2b42ff1e7d2fed9c0831b18feba4af97e20c49962726bad6f464f033c41ec6477ec098bc17a2af50e69a0560b203a3799a600206a6a130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f0035010006abcaca000000170000002b000706fafa0304030344cd00050003026832001b000302000200230000000d0018001609040905090604030804040105030805050108060601fe0d011a0000010001c4002098553c5699a32957970886a402a964f2033f899b173c23b505f6bd3f7f99ba7d00f034413d1c5ca555aba1ae611e344ecb12f80f87b9b9735726c88e72463d5445fd5867d03df5d7065bd2776aab5370e7f4a96ad48fa425f4c53e591a60ec2c446b962e6ecfb2f17a8a979b30632ddbec095279203c11c8d526bc11b1e972b9982b490aedf122f60231b3f64d2ac99aada2493f52b151b2b579875a3f5f38194707c7de07b0aae28c22da28022e15769afa71b24278316a5d9713b04d7bea6f2afb414e555208c7be7a47ec7c400ac1d5015a027b579768832c03a5dad748146063eb1b99eb570b56874e7ef46ae48b3c3c3252e60338747267f0f78d12d4f49874a6bcda395c9a90856977d3d335de2a92000a000c000a5a5a11ec001d001700180010000e000c02683208687474702f312e310000000e000c0000096c6f63616c686f7374003304ef04ed5a5a00010011ec04c0b4584dde212fb4574026033261356c2861983e93251e2855cc1305ebe5508d5a240211064e0a7d00ec19b6871b7589a49c25841d31b0ff26c37cab451329a61f110255340726149b7bcc7f4ce2a3bd18737bf375cbf8424ea20c57125d2746ce01638dde9737ae1b0189c43cb8342264091b98d8b39535344c2c7f8a985a3e5a3e23e4b959e843e236590b06060a3820deb5164dca83fbabcdc85b51f6cb410785bdff9064bdbcb881b07416c68aea920fd3277f06b03bbe484be07baeca54071e838f48974771a63ffbe6cb20d3668f5535aa8a5fb91961a3dc6130b6aa5ca97201799c69c1bc3c836273fa4d3670644fc877f6c57f98a18044418674262dca1a4a28d486687860fca71498273fc66a3c01f31a79c9c98e92381e057fb695c53dd2a6a3938dc10acd61f6585f87cf1bc800516c7fdb0b2e197b2ad2a05ad217699628a6add7bf1c41534b7990e5c7292c15bf120a4d6ca532742629e5ea2404d234758663ca8115196680f89a5606b273d834400fca2abc48618e008c0925cae4da0ebfd76bfb5a37be1403855a8c6a9ab036c87b4ea63099737f40dcc35667ceb352877ba74e51b3a541b560fe588d9f996226b925e681aaea840951a82e13a0580ba6c7b56988bab6ac62f5b742292f0a134765b9186198592679483b9b894d198166bc021bf32361959542896f92e779b0292372b5cfddccb7de520e900ab247a872ce78b05f4c074ee9ccb686adb15cb689ca9d961c5a3660276bf1c13eb119b4023ea2f84b529b16cb78bc94b1b49e6c4c8019c9bb7374e531c07508d0e4f495fc1b09329a41bfe40f433b88c8019d5dba4b343b0105a85e355576cec34be7ea86c1e095ebe05efaf20ada624bef41511708c1ac59bd73655483100593825711536585038ab18cc4ef46ac52a4277cb72b8391b2bd296665020b3a817e46e231343c9ad4a1a55e761251c73537167c19a976dbba3fd5aa9c71329253b1b7d955766872c1eb3c928d1b3e4a6297e4ca70a6874fc3f3087de1a999e781c1692a425577c87c4edc3982d2d66663fb595e9a4e3cbcc83ff34ef2410ebc86a5b1699c8393c9dcf6b5fc20037745a7ad541e4a25c76bf9c9a44abd4ea6369ac4400d8bc80607580eb97ce0a5a723dc5abeea8dae4ccd4ab3c5f5fc524e5cae0d8c457b5c410f099ccef20bf3d6507466ab7899acc4215626f042528bb562ea115c70cdfa832981ca021b714b65e981f940960d9646702646c5f3b8e394a5191a787088a9a0f7ac6b0b72a4f62ab9a91e23e94be933b37ff56475db1772d655cc28c58481afd14c6ef37a3ffb5b2137128b8a08426cbc8252a970fc599a5419895f38a4f7c9c6777ab550670a2deb5e3d0223d618c1e8a6720da9629db83c7c5606dea9a18c842651652478d0b831858b0a5256e083547b6293f13820d500a40a76c87372b1e260bdb4879bacabab64f33dcdda98d4f180e78b0188e846b1ab830b21401102b6e24acb2ca08abc7693cba4880582c160e598a6c76716d58db7c715447a4596b1c75642b3bdfb17846457efa5454665286d147766593fdf003f69e742b6b27fe7d466e4f3104ea8be46c5c8e943cc99d02546520fee89c5b7ac10797f432145ed9c36973afb1d350222da59c105853380905feafdb54e21d91c5948023156f8d6535e384d1db6f0b14dfb40a426b12e7fbc44da0867ade632c348001d0020022e1915ee43863c1b381f3cd0753649d0ef328ce1a0e5adbbeafe7709b4f008000500050100000000002d00020101ff01000100000b0002010000120000dada000100"
+  },
+  "captured_at": "2026-08-04T06:28:34+00:00"
+}

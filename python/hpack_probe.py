@@ -1,20 +1,35 @@
-"""Capture the raw HPACK bytes a client sends, so Chrome and we can be diffed.
+"""Capture the raw bytes a browser sends, so it and we can be diffed.
 
-Runs a minimal HTTP/2 server over TLS and dumps the HEADERS frame exactly as it
-arrived - the header block fragment is written out verbatim, before anything
-decodes it. Point Chrome at it, then point our own client at it, and compare.
+Runs a minimal HTTP/2 server over TLS and records the ClientHello and the first
+HEADERS frame exactly as they arrived - the header block fragment is written out
+verbatim, before anything decodes it. Point a browser at it to capture that
+browser, then point our own client at it and compare.
 
-    # terminal 1
-    python hpack_probe.py serve --out chrome.json
+    # wait for any browser at all
+    python hpack_probe.py serve
 
     # Windows, fresh profile so no cookies/extensions get in the way
     chrome.exe --user-data-dir=%TEMP%\\cfp --ignore-certificate-errors ^
                https://localhost:8443/api/all
 
-    # terminal 2, once Chrome has been captured
-    python hpack_probe.py serve --out ours.json &
-    python hpack_probe.py client
-    python hpack_probe.py diff chrome.json ours.json
+    # that is all - it stored profiles/chrome.json and browser_fp now has a
+    # "chrome" transport
+    python hpack_probe.py list
+    python hpack_probe.py selftest
+
+Which browser it was is read off the request it just sent, so nothing has to be
+named up front - point Chrome, Firefox or a phone at the address and each lands
+in its own file. A brand is a browser, not a browser version: capturing Chrome
+again replaces profiles/chrome.json, and the version stays inside the capture.
+
+The page we serve back then has the browser fetch tls.peet.ws and post the
+answer here, so the same visit also writes references/<brand>.json - what an
+independent fingerprinter made of that browser, which is the one thing our own
+parsing cannot check about itself. --no-reference skips it.
+
+`selftest` does the whole loop in one process - stand up the server, drive our
+own client at it, compare byte for byte - which is what proves a fresh build
+still reproduces the captured browser. It needs no network.
 
 Only the first HEADERS frame of a connection is recorded: the HPACK dynamic
 table starts empty there, which is the only state both sides are guaranteed to
@@ -27,14 +42,24 @@ import argparse
 import datetime
 import json
 import os
+import re
 import socket
 import ssl
 import struct
 import subprocess
 import sys
+import threading
+import time
+import typing
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+#: Kept in step with browser_fp.PROFILES_DIR, but spelled out here so capturing
+#: does not depend on httpx being importable.
+PROFILES_DIR = Path(os.environ.get("BROWSER_FP_PROFILES") or HERE / "profiles")
+#: The other half: what tls.peet.ws made of the same browser. Only verify_fp.py
+#: reads these, and only when checking against a live server.
+REFERENCES_DIR = Path(os.environ.get("BROWSER_FP_REFERENCES") or HERE / "references")
 #: Generated artefacts live outside the tree so nothing lands in git.
 WORK = Path(os.environ.get("HPACK_PROBE_DIR", Path.home() / ".cache/hpack_probe"))
 CERT = WORK / "cert.pem"
@@ -51,6 +76,21 @@ SETTING_NAMES = {
     4: "INITIAL_WINDOW_SIZE", 5: "MAX_FRAME_SIZE", 6: "MAX_HEADER_LIST_SIZE",
     8: "ENABLE_CONNECT_PROTOCOL",
 }
+
+
+def profile_path(brand: str) -> Path:
+    """Where `brand`'s capture lives. One file per brand, no version in the name."""
+    if not re.fullmatch(r"[a-z][a-z0-9_]*", brand):
+        msg = (f"bad brand {brand!r}: use lowercase letters, digits and "
+               f"underscores, starting with a letter (chrome, chrome_android, "
+               f"edge)")
+        raise SystemExit(msg)
+    if re.search(r"\d{2,}$", brand):
+        print(f"note: {brand!r} looks like it carries a version. A brand is a "
+              f"browser, not a browser version - the version is read off the "
+              f"capture's user-agent, and one capture per brand means nothing "
+              f"stays pinned to an old one.", file=sys.stderr)
+    return PROFILES_DIR / f"{brand}.json"
 
 
 def ensure_cert(openssl: str) -> None:
@@ -204,114 +244,629 @@ def describe(ftype: int, flags: int, stream: int, payload: bytes) -> dict:
     return out
 
 
-def serve(args: argparse.Namespace) -> int:
-    ensure_cert(args.openssl)
+# --- capturing --------------------------------------------------------------
+
+def listen(port: int) -> socket.socket:
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", port))  # noqa: S104 - must be reachable from Windows
+    srv.listen(8)
+    return srv
+
+
+def tls_context(openssl: str) -> ssl.SSLContext:
+    ensure_cert(openssl)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(str(CERT), str(KEY))
     ctx.set_alpn_protocols(["h2", "http/1.1"])
+    # No session tickets, ever. Python's server hands them out by default, so a
+    # browser that has been here before comes back with a pre_shared_key and the
+    # capture is a *resumed* handshake - one extra extension, several hundred
+    # bytes, and different every time depending on whether the user happened to
+    # visit earlier. Our own client never resumes, so a capture that did is not
+    # a usable reference.
+    ctx.num_tickets = 0                     # TLS 1.3
+    ctx.options |= ssl.OP_NO_TICKET         # TLS 1.2
+    return ctx
 
-    srv = socket.socket()
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", args.port))  # noqa: S104 - must be reachable from Windows
-    srv.listen(8)
-    print(f"listening on :{args.port} — waiting for an h2 client "
-          f"(https://localhost:{args.port}/api/all)")
 
-    while True:
-        raw, peer = srv.accept()
-        # Peek first: wrap_socket() would consume the ClientHello.
-        client_hello = parse_client_hello(peek_client_hello(raw))
-        try:
-            sock = ctx.wrap_socket(raw, server_side=True)
-        except ssl.SSLError as exc:
-            print(f"  {peer[0]}: TLS failed ({exc.reason})")
-            raw.close()
-            continue
+class _Session:
+    """What one capture run is collecting, shared across connections.
 
-        if sock.selected_alpn_protocol() != "h2":
-            print(f"  {peer[0]}: negotiated "
-                  f"{sock.selected_alpn_protocol()!r}, not h2 — ignoring")
-            sock.close()
-            continue
+    A browser is not one connection. The navigation we capture arrives on one,
+    and the page's fetch back to us may well arrive on another - Chrome is free
+    to open a second connection to the same origin, and does. So connections are
+    served concurrently and the results land here; the first HEADERS frame to
+    arrive anywhere is the profile, and any /reference POST finishes the run.
+    """
 
-        try:
-            record = handle_h2(sock)
-        except (ConnectionError, ssl.SSLError, struct.error) as exc:
-            print(f"  {peer[0]}: {type(exc).__name__}: {exc}")
-            sock.close()
-            continue
+    def __init__(self, *, want_reference: bool, timeout: float, quiet: bool,
+                 want_kinds: frozenset = frozenset()) -> None:
+        self.want_reference = want_reference
+        #: Kinds of peet response to hold out for; empty means the first will do.
+        self.want_kinds = want_kinds
+        self.timeout = timeout
+        self.quiet = quiet
+        self.lock = threading.Lock()
+        self.record: dict | None = None
+        self.reference: dict | None = None
+        #: Set once the profile is captured: from then on we are only waiting
+        #: for the reference, and only for so long.
+        self.deadline: float | None = None
+        self.done = threading.Event()
+
+    def note(self, msg: str) -> None:
+        if not self.quiet:
+            print(msg, flush=True)
+
+    def claim_record(self, record: dict) -> bool:
+        """True if this connection is the one that captured the profile."""
+        with self.lock:
+            if self.record is not None:
+                return False
+            self.record = record
+            self.deadline = time.monotonic() + self.timeout
+        if not self.want_reference:
+            self.done.set()
+        return True
+
+    def add_reference(self, part: dict) -> bool:
+        """Merge in what one source answered; True once peet's half is in.
+
+        The two sources arrive together when the browser can reach both, and
+        separately when peet had to be pasted, so this accumulates rather than
+        replaces. Only peet completes the run: check.ja3.zone alone is worth
+        keeping but not worth stopping for, since the paste box is still up.
+        """
+        with self.lock:
+            merged = {**(self.reference or {})}
+            for name, value in part.items():
+                if name == "peet":
+                    merged["peet"] = _as_list(merged.get("peet")) + [value]
+                else:
+                    merged[name] = value
+            self.reference = merged
+            have = {peet_kind(e) for e in _as_list(merged.get("peet"))}
+            complete = bool(have) and self.want_kinds <= have
+        if complete:
+            self.done.set()
+        return complete
+
+    def extend(self, seconds: float) -> None:
+        """Keep waiting - the page failed automatically and offered a paste box."""
+        with self.lock:
+            if self.deadline is not None:
+                self.deadline = max(self.deadline, time.monotonic() + seconds)
+
+    def missing(self) -> list[str]:
+        """Which kinds of peet response the run is still holding out for."""
+        with self.lock:
+            have = {peet_kind(e) for e in _as_list((self.reference or {}).get("peet"))}
+        return sorted((self.want_kinds or {"any"}) - have)
+
+    def expired(self) -> bool:
+        return self.deadline is not None and time.monotonic() > self.deadline
+
+
+def _serve_connection(raw: socket.socket, peer: tuple, ctx: ssl.SSLContext,
+                      state: _Session) -> None:
+    # Peek first: wrap_socket() would consume the ClientHello.
+    client_hello = parse_client_hello(peek_client_hello(raw))
+    try:
+        sock = ctx.wrap_socket(raw, server_side=True)
+    except ssl.SSLError as exc:
+        state.note(f"  {peer[0]}: TLS failed ({exc.reason})")
+        raw.close()
+        return
+
+    if sock.selected_alpn_protocol() != "h2":
+        state.note(f"  {peer[0]}: negotiated "
+                   f"{sock.selected_alpn_protocol()!r}, not h2 - ignoring")
+        sock.close()
+        return
+
+    try:
+        handle_h2(sock, state, client_hello=client_hello, peer=peer[0])
+    except (ConnectionError, ssl.SSLError, struct.error, TimeoutError) as exc:
+        state.note(f"  {peer[0]}: {type(exc).__name__}: {exc}")
+    finally:
+        _graceful_close(sock)
+
+
+def _graceful_close(sock: ssl.SSLSocket) -> None:
+    """Let the peer read our last response before the socket goes away.
+
+    Closing while inbound data is still unread makes the kernel answer with RST,
+    which throws away everything we just wrote - the page would see its POST
+    fail even though the file is already on disk.
+    """
+    try:
+        sock.settimeout(1.0)
+        sock.shutdown(socket.SHUT_WR)
+        while sock.recv(65536):
+            pass
+    except OSError:
+        pass
+    finally:
         sock.close()
 
-        if record is None:
+
+def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
+            want_reference: bool = False, timeout: float = 25.0,
+            want_kinds: frozenset = frozenset()) -> dict | None:
+    """Serve until the profile is captured (and the reference, if asked for).
+
+    Returns None if the listening socket is closed from under us, which is how
+    selftest stops a capture that never arrived.
+    """
+    state = _Session(want_reference=want_reference, timeout=timeout, quiet=quiet,
+                     want_kinds=want_kinds)
+    threads: list[threading.Thread] = []
+    srv.settimeout(0.5)
+
+    while not state.done.is_set() and not state.expired():
+        try:
+            raw, peer = srv.accept()
+        except TimeoutError:
             continue
-        record["client_hello"] = client_hello
-        record["captured_at"] = datetime.datetime.now(
-            datetime.timezone.utc).replace(microsecond=0).isoformat()
-        Path(args.out).write_text(json.dumps(record, indent=2))
-        print(f"  captured from {peer[0]} -> {args.out}")
-        if client_hello:
-            g = [e for e in client_hello["extensions"] if e["grease"]]
-            print(f"    ClientHello   {len(client_hello['raw']) // 2}B, "
-                  f"{len(client_hello['cipher_suites'])} ciphers, "
-                  f"{len(client_hello['extensions'])} extensions"
-                  + (f", GREASE bodies {[e['length'] for e in g]}" if g else ""))
-        for f in record["frames"]:
-            extra = ""
-            if f["type"] == "SETTINGS" and f.get("settings"):
-                extra = " " + ", ".join(
-                    f"{x['name']}={x['value']}" for x in f["settings"])
-            elif f["type"] == "WINDOW_UPDATE":
-                extra = f" increment={f['increment']}"
-            elif f["type"] == "HEADERS":
-                extra = (f" priority={f.get('priority')}"
-                         f" block={f['length']}B")
-            print(f"    {f['type']:<14}{extra}")
-        return 0
+        except OSError:
+            if state.record is None:
+                return None
+            break
+        t = threading.Thread(target=_serve_connection,
+                             args=(raw, peer, ctx, state), daemon=True)
+        t.start()
+        threads.append(t)
+
+    # Long enough for the winning connection to finish writing its response -
+    # the page is waiting on that 200 to say it is done.
+    for t in threads:
+        t.join(timeout=2)
+
+    if state.record is not None and state.reference is not None:
+        state.record["reference"] = state.reference
+    return state.record
 
 
-def handle_h2(sock: ssl.SSLSocket) -> dict | None:
-    if read_exactly(sock, len(PREFACE)) != PREFACE:
+def summarise(record: dict) -> None:
+    client_hello = record.get("client_hello")
+    if client_hello:
+        g = [e for e in client_hello["extensions"] if e["grease"]]
+        print(f"    ClientHello   {len(client_hello['raw']) // 2}B, "
+              f"{len(client_hello['cipher_suites'])} ciphers, "
+              f"{len(client_hello['extensions'])} extensions"
+              + (f", GREASE bodies {[e['length'] for e in g]}" if g else ""))
+    for f in record["frames"]:
+        extra = ""
+        if f["type"] == "SETTINGS" and f.get("settings"):
+            extra = " " + ", ".join(
+                f"{x['name']}={x['value']}" for x in f["settings"])
+        elif f["type"] == "WINDOW_UPDATE":
+            extra = f" increment={f['increment']}"
+        elif f["type"] == "HEADERS":
+            extra = f" priority={f.get('priority')} block={f['length']}B"
+        print(f"    {f['type']:<14}{extra}")
+
+
+def headers_of(record: dict) -> dict[str, str]:
+    """The captured request headers, decoded. Only for reading who sent it."""
+    frame = next(f for f in record["frames"] if f["type"] == "HEADERS")
+    return dict(_decode(bytes.fromhex(frame["header_block"])))
+
+
+def brand_of(record: dict) -> str:
+    """Which brand this capture is, according to the client's own user-agent."""
+    sys.path.insert(0, str(HERE))
+    import browser_fp
+
+    return browser_fp.brand_for(headers_of(record))
+
+
+def serve(args: argparse.Namespace) -> int:
+    """Capture one client and store it under the brand it says it is.
+
+    The browser identifies itself in the request it just sent, so the brand is
+    read off the capture rather than typed in beforehand: point any browser at
+    the address, and it lands in the right file. --brand overrides that, --out
+    stores at a path without registering a brand at all.
+    """
+    if args.brand and args.out:
+        print("give --brand or --out, not both", file=sys.stderr)
+        return 2
+    if args.brand:
+        profile_path(args.brand)          # reject a bad name before we listen
+
+    # A path capture has nowhere to file a reference, and our own client cannot
+    # run the page's javascript, so asking for one would only waste the timeout.
+    want_reference = not args.out and not args.no_reference
+
+    ctx = tls_context(args.openssl)
+    srv = listen(args.port)
+    print(f"listening on :{args.port} - waiting for any h2 client "
+          f"(https://localhost:{args.port}/api/all)")
+
+    record = capture(srv, ctx, want_reference=want_reference,
+                     timeout=args.reference_timeout,
+                     want_kinds=frozenset({"navigate", "cors"}) if args.both
+                     else frozenset())
+    srv.close()
+    if record is None:
+        return 1
+
+    peer = record.pop("peer", "?")
+    reference = record.pop("reference", None)
+    if args.out:
+        out, brand = Path(args.out), None
+    else:
+        try:
+            brand = args.brand or brand_of(record)
+        except Exception as exc:  # noqa: BLE001 - the capture is worth keeping
+            fallback = Path("capture.json")
+            fallback.write_text(json.dumps(record, indent=2))
+            print(f"  captured from {peer}, but {exc}\n"
+                  f"  kept it at {fallback} - re-run with --brand, or move it "
+                  f"into {PROFILES_DIR} yourself", file=sys.stderr)
+            return 1
+        out = profile_path(brand)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        record = {"brand": brand, **record}
+
+    replacing = out.exists()
+    out.write_text(json.dumps(record, indent=2))
+    ua = headers_of(record).get("user-agent", "?")
+    print(f"  captured from {peer}: {ua}")
+    print(f"  {'replaced' if replacing else 'stored as'} {out}")
+
+    # We refuse to issue tickets, but a browser that collected one before that
+    # was true still offers it, and the capture is then a resumed handshake.
+    ch = record.get("client_hello") or {}
+    if any(e["hex"] == "0x0029" for e in ch.get("extensions", [])):
+        print("  !! this ClientHello carries pre_shared_key: the browser resumed "
+              "a session it had from an earlier visit, so the capture has one "
+              "extension our client never sends. Re-capture from a fresh "
+              "browser profile (a new --user-data-dir).", file=sys.stderr)
+
+    if brand and reference:
+        ref_out = REFERENCES_DIR / f"{brand}.json"
+        REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
+        was = ref_out.exists()
+        previous = json.loads(ref_out.read_text()) if was else {}
+        if "tls" in previous:                 # the pre-container format
+            previous = {"peet": previous}
+        merged = merge_reference(previous, reference, ua)
+        ref_out.write_text(json.dumps(
+            {"brand": brand, "collected_at": record["captured_at"], **merged},
+            indent=2))
+        detail = [f"peet {peet_kind(e) or '?'} "
+                  f"ja4 {e.get('tls', {}).get('ja4', '?')}"
+                  for e in _as_list(merged.get("peet"))]
+        if merged.get("ja3zone"):
+            detail.append(f"ja3 {merged['ja3zone'].get('hash', '?')}")
+        print(f"  {'replaced' if was else 'stored as'} {ref_out}"
+              f"  ({'; '.join(detail) or 'empty'})")
+        if not merged.get("peet"):
+            print("  (no tls.peet.ws half: the xhr header template cannot be "
+                  "derived without it, and verify_fp.py has less to compare)")
+    elif want_reference:
+        print("  no reference at all - the browser reached neither service. "
+              "Everything except `verify_fp.py` still works.")
+
+    summarise(record)
+    if brand:
+        report_profile(brand)
+    return 0
+
+
+def report_profile(brand: str) -> None:
+    """Show what the freshly captured brand now looks like to browser_fp.
+
+    Capturing is the whole act of adding a browser - there is no code to write
+    afterwards - so the capture step is where you get to see the transport it
+    produced.
+    """
+    sys.path.insert(0, str(HERE))
+    try:
+        import browser_fp
+        browser_fp.reload()
+        print()
+        print(browser_fp.describe(brand))
+    except Exception as exc:  # noqa: BLE001 - the capture is already saved
+        print(f"\n(capture saved, but browser_fp could not read it back: "
+              f"{type(exc).__name__}: {exc})", file=sys.stderr)
+
+
+#: Served to the browser once its request has been captured, to collect the
+#: other half of the picture. tls.peet.ws reports the fingerprint of whoever
+#: asks, so the only way to learn what the *real* browser looks like there is to
+#: have the real browser ask - which is what this page does, before posting the
+#: answer back to us.
+#:
+#: Two sources, because only one of them can be reached from a plain browser:
+#:
+#: * check.ja3.zone answers `access-control-allow-origin: *` on the response
+#:   itself, so every browser can fetch it - a phone included, with no flags. It
+#:   only reports JA3, but JA3 *is* the thing our own parsing cannot check about
+#:   itself, since a ClientHello can never be compared byte for byte.
+#: * tls.peet.ws reports far more (ja4, peetprint, the whole h2 layer) but only
+#:   sends CORS headers on the OPTIONS preflight, never on the GET, so a plain
+#:   browser blocks it. Two ways round that, both offered by the page: start the
+#:   browser with --disable-web-security (renderer-side only, it does not touch
+#:   the network stack, so the capture is unaffected), or open peet in a tab and
+#:   paste the JSON back.
+PEET_URL = "https://tls.peet.ws/api/all"
+JA3_URL = "https://check.ja3.zone/"
+
+PAGE = ("""<!doctype html>
+<meta charset="utf-8"><title>hpack_probe</title>
+<style>body{font:14px/1.6 system-ui;margin:3em;max-width:46em}
+code{background:#eee;padding:2px 4px}textarea{width:100%%;font:12px monospace}
+#f{margin-top:2em;padding:1em;border:1px solid #ccc;border-radius:6px}</style>
+<body>
+<p id="s">captured. collecting the reference...</p>
+<div id="f">
+  <p id="w"></p>
+  <p>The fetch above is an <b>XHR</b>, and a browser does not send the same
+  headers for one of those as for a <b>navigation</b>. To record the navigation
+  variant too, <a href="%(peet)s" target="_blank" rel="noopener">open %(peet)s</a>
+  in a tab, copy the whole JSON and paste it here:</p>
+  <textarea id="t" rows="6" placeholder="paste the JSON"></textarea>
+  <p><button id="b">save it</button> <button id="d">skip</button></p>
+</div>
+<script>
+const say = t => document.getElementById("s").textContent = t;
+const post = b => fetch("/reference", {method: "POST", body: b});
+// Cache-busted through the URL, not {cache:"no-store"} - that option makes
+// Chrome add `pragma: no-cache` and `cache-control: no-cache`, which would
+// then be in the reference as if the browser always sent them.
+const grab = u => fetch(u + (u.indexOf("?") < 0 ? "?" : "&") + "_=" + Date.now())
+                    .then(r => r.json()).catch(() => null);
+const warn = t => document.getElementById("w").innerHTML = t;
+Promise.all([grab("%(peet)s"), grab("%(ja3)s")]).then(([peet, ja3zone]) => {
+  post(JSON.stringify({peet: peet, ja3zone: ja3zone})).then(() => {
+    say(peet ? "captured, and the tls.peet.ws reference with it"
+             : (ja3zone ? "captured; check.ja3.zone answered but tls.peet.ws did not"
+                        : "captured; no reference could be collected"));
+    if (!peet) {
+      warn("<b>The browser blocked the tls.peet.ws fetch</b> - it sends no CORS "
+         + "header on the response itself. Starting the browser with "
+         + "<code>--user-data-dir=&lt;temp&gt; --disable-web-security</code> "
+         + "lets it through; otherwise paste it below.");
+    }
+  });
+});
+document.getElementById("b").onclick = () =>
+  post(document.getElementById("t").value)
+    .then(() => fetch("/reference/done", {method: "POST"}))
+    .then(() => say("done - saved the pasted navigation as well"));
+document.getElementById("d").onclick = () =>
+  fetch("/reference/done", {method: "POST"})
+    .then(() => say("done - you can close this tab"));
+</script>
+""" % {"peet": PEET_URL, "ja3": JA3_URL}).encode()
+
+MAX_REFERENCE = 1 << 20
+#: Extra time granted once the page has told us its fetch was blocked and put a
+#: paste box on screen. Long enough to open a tab, copy and paste.
+PASTE_GRACE = 180.0
+
+
+def reference_part(body: bytes) -> dict | None:
+    """What one POST to /reference carries, or None if it carries nothing.
+
+    Either the page's own `{"peet": ..., "ja3zone": ...}` - with nulls for
+    whatever it could not reach - or a bare tls.peet.ws response pasted in by
+    hand, which is recognisable by its "tls" key.
+    """
+    try:
+        data = json.loads(body)
+    except ValueError:
         return None
+    if not isinstance(data, dict):
+        return None
+    if "tls" in data:
+        return {"peet": data}
+    part = {k: v for k, v in data.items() if k in ("peet", "ja3zone") and v}
+    return part or None
+
+
+def peet_kind(entry: dict) -> str | None:
+    """`navigate` or `cors` - which kind of request this peet response describes."""
+    for frame in (entry or {}).get("http2", {}).get("sent_frames", []):
+        if frame.get("frame_type") != "HEADERS":
+            continue
+        sent = dict(h.split(": ", 1) for h in frame.get("headers", []) if ": " in h)
+        return sent.get("sec-fetch-mode")
+    return None
+
+
+def _as_list(value: typing.Any) -> list:
+    if not value:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def merge_reference(previous: dict, fresh: dict, user_agent: str) -> dict:
+    """Keep the kinds this visit could not produce, if it is the same browser.
+
+    One visit yields one kind: the page's own fetch is always `cors`, and the
+    `navigate` variant only arrives when the JSON is pasted in from a real
+    navigation. Both are worth having - navigate is where the default header
+    template's `referer` position comes from - so they accumulate rather than
+    replace. A capture from a different browser build drops the old entries
+    instead, since a stale order is worse than a derived one.
+    """
+    entries = [e for e in _as_list(fresh.get("peet")) if e]
+    kinds = {peet_kind(e) for e in entries}
+    for old in _as_list(previous.get("peet")):
+        if not old or old.get("user_agent") != user_agent:
+            continue
+        if peet_kind(old) in kinds:
+            continue
+        entries.append(old)
+        kinds.add(peet_kind(old))
+
+    ja3zone = fresh.get("ja3zone")
+    if not ja3zone:
+        old = previous.get("ja3zone")
+        ja3zone = old if old and old.get("user_agent") == user_agent else None
+
+    out: dict = {}
+    if entries:
+        out["peet"] = entries
+    if ja3zone:
+        out["ja3zone"] = ja3zone
+    return out
+
+
+def send_response(sock: ssl.SSLSocket, encoder, stream: int, status: bytes,
+                  ctype: bytes, body: bytes) -> None:
+    """One HEADERS + one DATA. Bodies here are far below any max frame size."""
+    hdr = encoder.encode([(b":status", status), (b"content-type", ctype),
+                          (b"content-length", str(len(body)).encode()),
+                          (b"cache-control", b"no-store")])
+    sock.sendall(struct.pack("!I", len(hdr))[1:] + b"\x01\x04"
+                 + struct.pack("!I", stream) + hdr)
+    sock.sendall(struct.pack("!I", len(body))[1:] + b"\x00\x01"
+                 + struct.pack("!I", stream) + body)
+
+
+def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
+              client_hello: dict | None = None, peer: str = "?") -> None:
+    """Serve one connection, contributing whatever it carries to `state`.
+
+    The profile is finished the moment the first request arrives anywhere and is
+    never affected by what follows: its frame list is frozen there, so serving a
+    page and taking a POST back cannot contaminate it.
+    """
+    import hpack
+
+    if read_exactly(sock, len(PREFACE)) != PREFACE:
+        return
     sock.sendall(b"\x00\x00\x00\x04\x00\x00\x00\x00\x00")  # empty SETTINGS
 
-    frames = []
-    while True:
-        ftype, flags, stream, payload = read_frame(sock)
-        frames.append(describe(ftype, flags, stream, payload))
+    # Every HEADERS block on the connection has to go through one decoder, in
+    # order, or the HPACK dynamic table desyncs and later blocks fail to decode.
+    decoder, encoder = hpack.Decoder(), hpack.Encoder()
+    frames: list[dict] = []
+    capturing = state.record is None
+    bodies: dict[int, bytearray] = {}
+
+    while not state.done.is_set():
+        if state.deadline is not None:
+            remaining = state.deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            sock.settimeout(remaining)
+        try:
+            ftype, flags, stream, payload = read_frame(sock)
+        except (TimeoutError, ConnectionError, ssl.SSLError, struct.error):
+            if capturing and state.record is None:
+                raise
+            return          # the profile is safe; the reference is optional
+
+        if capturing:
+            frames.append(describe(ftype, flags, stream, payload))
+
         if ftype == 4 and not flags & 0x01:
             sock.sendall(b"\x00\x00\x00\x04\x01\x00\x00\x00\x00")  # ACK
-        if ftype == 1 and flags & 0x04:  # HEADERS + END_HEADERS
-            body = b"hi"
-            # Just `:status: 200` - static index 8, one byte. Enough to keep
-            # the client happy, and nothing else to get wrong.
-            hdr = bytes([0x88])
-            sock.sendall(
-                struct.pack("!I", len(hdr))[1:] + b"\x01\x04"
-                + struct.pack("!I", stream) + hdr)
-            sock.sendall(
-                struct.pack("!I", len(body))[1:] + b"\x00\x01"
-                + struct.pack("!I", stream) + body)
-            return {"frames": frames}
+
+        elif ftype == 1 and flags & 0x04:  # HEADERS + END_HEADERS
+            info = describe(ftype, flags, stream, payload)
+            headers = dict(
+                (k if isinstance(k, str) else k.decode(),
+                 v if isinstance(v, str) else v.decode())
+                for k, v in decoder.decode(bytes.fromhex(info["header_block"])))
+            path, method = headers.get(":path", ""), headers.get(":method", "")
+
+            if capturing:
+                capturing = False
+                record = {
+                    "frames": frames,
+                    "client_hello": client_hello,
+                    "captured_at": datetime.datetime.now(
+                        datetime.timezone.utc).replace(microsecond=0).isoformat(),
+                    "peer": peer,
+                }
+                if state.claim_record(record) and not state.want_reference:
+                    send_response(sock, encoder, stream, b"200", b"text/plain", b"hi")
+                    return
+                send_response(sock, encoder, stream, b"200", b"text/html", PAGE)
+                state.note(f"  waiting up to {state.timeout:.0f}s for the browser "
+                           f"to fetch tls.peet.ws (keep the tab open)")
+
+            elif method == "POST" and path.startswith("/reference/done"):
+                send_response(sock, encoder, stream, b"200", b"text/plain", b"ok")
+                state.done.set()
+                return
+
+            elif method == "POST" and path.startswith("/reference"):
+                bodies[stream] = bytearray()
+
+            elif method == "GET" and not path.startswith("/favicon"):
+                # Any connection serves the page: after clicking through the
+                # certificate warning the browser may retry on a fresh one.
+                send_response(sock, encoder, stream, b"200", b"text/html", PAGE)
+
+            else:
+                send_response(sock, encoder, stream, b"404", b"text/plain", b"")
+
+        elif ftype == 0 and stream in bodies:  # DATA for the reference POST
+            bodies[stream] += payload
+            if len(bodies[stream]) > MAX_REFERENCE:
+                del bodies[stream]
+                send_response(sock, encoder, stream, b"413", b"text/plain", b"")
+            elif flags & 0x01:  # END_STREAM
+                send_response(sock, encoder, stream, b"200", b"text/plain", b"ok")
+                body = bytes(bodies.pop(stream))
+                part = reference_part(body)
+                if part is None:
+                    state.note(f"  unusable reply from the page "
+                               f"({body[:120].decode('utf-8', 'replace') or 'empty'})")
+                    state.extend(PASTE_GRACE)
+                    continue
+                state.note(f"  reference: {', '.join(sorted(part))} "
+                           f"({len(body)} bytes)")
+                if state.add_reference(part):
+                    return
+                # Still short of what was asked for; the paste box is up.
+                missing = state.missing()
+                state.note(
+                    f"  still missing the {' and '.join(missing)} variant of "
+                    f"tls.peet.ws - paste it into the page or press skip"
+                    if missing != ["any"] else
+                    f"  tls.peet.ws is still missing - paste its JSON into the "
+                    f"page or press skip")
+                state.extend(PASTE_GRACE)
 
 
-def client(args: argparse.Namespace) -> int:
+# --- driving our own client -------------------------------------------------
+
+def run_client(port: int, brand: str | None, *, quiet: bool = False) -> None:
+    """Send one request through the brand's transport at our own server."""
     sys.path.insert(0, str(HERE))
-    import chrome_h2
+    import browser_fp
     import httpx
 
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     # verify goes on the transport: httpx ignores its own when given one.
-    transport = chrome_h2.ChromeTransport(verify=ctx)
+    transport = browser_fp.Transport(brand, verify=ctx)
     with httpx.Client(transport=transport, timeout=15) as c:
         try:
-            c.get(f"https://localhost:{args.port}/api/all")
+            c.get(f"https://localhost:{port}/api/all")
         except Exception as exc:  # noqa: BLE001 - server closes early by design
-            print(f"(request ended with {type(exc).__name__}: {exc})")
-    print("done — check the server's --out file")
+            if not quiet:
+                print(f"(request ended with {type(exc).__name__}: {exc})")
+
+
+def client(args: argparse.Namespace) -> int:
+    run_client(args.port, args.brand)
+    print("done - check the server's output file")
     return 0
 
+
+# --- comparing --------------------------------------------------------------
 
 def _decode(block: bytes) -> list[tuple[str, str]]:
     """Decode for display only - hpack returns str or bytes by version."""
@@ -328,7 +883,7 @@ def akamai_fingerprint(rec: dict) -> str:
 
     Four fields: the client's SETTINGS in wire order, the connection-level
     WINDOW_UPDATE, any standalone PRIORITY frames, and the pseudo-header order.
-    chrome_h2 derives exactly these from a capture, so this is what tells you
+    browser_fp derives exactly these from a capture, so this is what tells you
     whether a new capture needs any code change at all.
     """
     frames = rec["frames"]
@@ -372,7 +927,7 @@ def diff_h2(a: dict, b: dict, na: str, nb: str) -> bool:
         same = False
         print(f"  {name:<16} DIFFER\n      {na}: {x}\n      {nb}: {y}")
 
-    # Not part of the fingerprint, but chrome_h2 reproduces it and a mismatch
+    # Not part of the fingerprint, but browser_fp reproduces it and a mismatch
     # here means the HEADERS frame has the wrong flags and length.
     def prio(rec):
         f = next((x for x in rec["frames"] if x["type"] == "HEADERS"), None)
@@ -380,7 +935,7 @@ def diff_h2(a: dict, b: dict, na: str, nb: str) -> bool:
 
     pa, pb = prio(a), prio(b)
     if pa == pb:
-        print(f"  headers_priority OK")
+        print("  headers_priority OK")
     else:
         same = False
         print(f"  headers_priority DIFFER\n      {na}: {pa}\n      {nb}: {pb}")
@@ -400,9 +955,18 @@ def port_of(rec: dict) -> int:
     return int(port)
 
 
+#: Extensions whose body length is not constant even for one real browser, so
+#: comparing it would fail at random. Only ECH so far: BoringSSL's GREASE ECH
+#: carries a random payload and two Chrome 150 captures of the same URL came out
+#: 218 and 250 bytes. The lengths are still printed, because a client that
+#: always sends exactly one of them is its own kind of tell.
+VARIABLE_LENGTH = {"0xfe0d"}
+
+
 def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
     """Compare the TLS side. GREASE values are wildcarded - they are meant to
-    differ per connection - but their body *lengths* are not."""
+    differ per connection - but their body *lengths* are not, except for
+    VARIABLE_LENGTH."""
     if a is None or b is None:
         print("=== ClientHello ===\n  (missing on one side, skipped)")
         return True
@@ -414,10 +978,11 @@ def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
             "session_id_len": ch["session_id_len"],
             "ciphers": ["GREASE" if int(c, 16) in GREASE else c
                         for c in ch["cipher_suites"]],
-            # Sorted: both Chrome and we shuffle extension order on purpose,
+            # Sorted: both browsers and we shuffle extension order on purpose,
             # so only the set and each body's length are comparable.
             "extensions": sorted(
-                ("GREASE" if e["grease"] else e["hex"], e["length"])
+                ("GREASE" if e["grease"] else e["hex"],
+                 "varies" if e["hex"] in VARIABLE_LENGTH else e["length"])
                 for e in ch["extensions"]),
             # These positions are not shuffled and are part of the shape.
             "first_ext": ("GREASE" if ch["extensions"][0]["grease"]
@@ -428,6 +993,12 @@ def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
 
     sa, sb = shape(a), shape(b)
     print("=== ClientHello ===")
+    for hexid in sorted(VARIABLE_LENGTH):
+        la, lb = (next((e["length"] for e in ch["extensions"] if e["hex"] == hexid), None)
+                  for ch in (a, b))
+        if la is not None or lb is not None:
+            print(f"  {hexid:<16} {na}={la}B {nb}={lb}B"
+                  + ("" if la == lb else "  (length varies per connection, not compared)"))
     same = True
     for key in sa:
         if sa[key] == sb[key]:
@@ -447,25 +1018,21 @@ def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
     return same
 
 
-def diff(args: argparse.Namespace) -> int:
-    a = json.loads(Path(args.a).read_text())
-    b = json.loads(Path(args.b).read_text())
-
+def diff_records(a: dict, b: dict, na: str, nb: str) -> int:
+    """Full comparison of two captures: TLS, h2 frames, then HPACK bytes."""
     def headers_frame(rec):
         return next(f for f in rec["frames"] if f["type"] == "HEADERS")
 
-    fa, fb = headers_frame(a), headers_frame(b)
-    ba = bytes.fromhex(fa["header_block"])
-    bb = bytes.fromhex(fb["header_block"])
+    ba = bytes.fromhex(headers_frame(a)["header_block"])
+    bb = bytes.fromhex(headers_frame(b)["header_block"])
 
-    ok = diff_client_hello(a.get("client_hello"), b.get("client_hello"),
-                           args.a, args.b)
+    ok = diff_client_hello(a.get("client_hello"), b.get("client_hello"), na, nb)
     print()
-    ok &= diff_h2(a, b, args.a, args.b)
+    ok &= diff_h2(a, b, na, nb)
 
-    print(f"\n=== HPACK header block ===")
-    print(f"{args.a}: {len(ba)} bytes")
-    print(f"{args.b}: {len(bb)} bytes")
+    print("\n=== HPACK header block ===")
+    print(f"{na}: {len(ba)} bytes")
+    print(f"{nb}: {len(bb)} bytes")
 
     ha, hb = _decode(ba), _decode(bb)
     if [k for k, _ in ha] != [k for k, _ in hb]:
@@ -492,30 +1059,152 @@ def diff(args: argparse.Namespace) -> int:
     return 1
 
 
+def _load(name: str) -> tuple[dict, str]:
+    """A capture, by path or by brand."""
+    path = Path(name)
+    if not path.exists():
+        candidate = PROFILES_DIR / f"{name}.json"
+        if candidate.exists():
+            path = candidate
+    return json.loads(path.read_text()), str(path)
+
+
+def diff(args: argparse.Namespace) -> int:
+    a, na = _load(args.a)
+    b, nb = _load(args.b)
+    return diff_records(a, b, na, nb)
+
+
+# --- the self-test ----------------------------------------------------------
+
+def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
+    """Capture ourselves impersonating `brand` and diff it against the reference.
+
+    Everything happens in this process and on loopback: the server runs in a
+    thread while our own client drives a request at it. No network, so the same
+    result on an air-gapped machine, and nothing to clean up if it fails.
+    """
+    ref, source = _load(brand)
+    # The port is not free to choose: `:authority` is `localhost:<port>`, so it
+    # is part of the HPACK block. Take it from the reference or the byte
+    # comparison fails on a difference that means nothing.
+    want = port_of(ref)
+    if port is not None and port != want:
+        print(f"note: {brand} was captured on port {want}; using {port} instead "
+              f"means :authority differs and the HPACK block cannot match. The "
+              f"ClientHello and HTTP/2 layers are still meaningful.")
+    else:
+        port = want
+
+    ctx = tls_context(openssl)
+    try:
+        srv = listen(port)
+    except OSError as exc:
+        print(f"cannot listen on :{port} ({exc}). The port cannot simply be "
+              f"changed - it is baked into {source}'s :authority - so free it "
+              f"and re-run.", file=sys.stderr)
+        return 1
+
+    got: list[dict] = []
+    thread = threading.Thread(
+        target=lambda: got.extend(filter(None, [capture(srv, ctx, quiet=True)])),
+        daemon=True)
+    thread.start()
+    try:
+        run_client(port, brand, quiet=True)
+    finally:
+        thread.join(timeout=20)
+        srv.close()
+        thread.join(timeout=5)
+
+    if not got:
+        print(f"the probe captured nothing for {brand}", file=sys.stderr)
+        return 1
+
+    print(f"=== {brand}: our bytes vs {source} ===\n")
+    return diff_records(ref, got[0], brand, "ours")
+
+
+def selftest(args: argparse.Namespace) -> int:
+    if args.brand:
+        targets = [args.brand]
+    else:
+        targets = sorted(p.stem for p in PROFILES_DIR.glob("*.json"))
+    if not targets:
+        print(f"no profiles in {PROFILES_DIR} - capture one with "
+              f"`serve --brand <name>`", file=sys.stderr)
+        return 1
+
+    results = {}
+    for i, brand in enumerate(targets):
+        if i:
+            print()
+        results[brand] = selftest_one(brand, args.openssl, port=args.port)
+
+    if len(targets) > 1:
+        print("\n=== summary ===")
+        for brand, rc in results.items():
+            print(f"  {brand:<16} {'PASS' if rc == 0 else 'FAIL'}")
+    return 0 if all(rc == 0 for rc in results.values()) else 1
+
+
+def list_profiles(_args: argparse.Namespace) -> int:
+    sys.path.insert(0, str(HERE))
+    import browser_fp
+    print(browser_fp.catalog())
+    return 0
+
+
 def main() -> int:
     p = argparse.ArgumentParser(description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("serve", help="capture one client's HEADERS frame")
+    s = sub.add_parser(
+        "serve",
+        help="capture one client and store it as the brand it says it is")
+    s.add_argument("--brand", help="override the brand read off the client's "
+                                   "user-agent (one file per browser, no "
+                                   "version in the name)")
+    s.add_argument("--out", help="store at this path instead, without "
+                                 "registering it as a brand")
+    s.add_argument("--no-reference", action="store_true",
+                   help="do not ask the browser to fetch tls.peet.ws; capture "
+                        "the raw bytes only (offline machines)")
+    s.add_argument("--both", action="store_true",
+                   help="wait for both the XHR and the navigation variant of "
+                        "the reference; the page's own fetch gives the first, "
+                        "pasting tls.peet.ws into the page gives the second")
+    s.add_argument("--reference-timeout", type=float, default=25.0,
+                   help="how long to wait for that fetch (default 25s)")
     s.add_argument("--port", type=int, default=8443)
-    s.add_argument("--out", default="capture.json")
     s.add_argument("--openssl", default=str(Path.home() / "openssl/bin/openssl"))
     s.set_defaults(func=serve)
 
     c = sub.add_parser("client", help="drive our own httpx client at the server")
+    c.add_argument("--brand", help="which profile to impersonate")
     c.add_argument("--port", type=int, default=8443)
     c.set_defaults(func=client)
 
+    t = sub.add_parser(
+        "selftest",
+        help="capture ourselves and diff against a stored brand, offline")
+    t.add_argument("--brand", help="default: every installed brand")
+    t.add_argument("--port", type=int, help="override the reference's port")
+    t.add_argument("--openssl", default=str(Path.home() / "openssl/bin/openssl"))
+    t.set_defaults(func=selftest)
+
+    ls = sub.add_parser("list", help="what browser_fp currently offers")
+    ls.set_defaults(func=list_profiles)
+
     d = sub.add_parser("diff", help="compare two captures byte by byte")
-    d.add_argument("a")
-    d.add_argument("b")
+    d.add_argument("a", help="path, or a brand name")
+    d.add_argument("b", help="path, or a brand name")
     d.set_defaults(func=diff)
 
     p2 = sub.add_parser(
         "port", help="print the port a capture was taken on (see port_of)")
-    p2.add_argument("capture")
-    p2.set_defaults(func=lambda a: (
-        print(port_of(json.loads(Path(a.capture).read_text()))), 0)[1])
+    p2.add_argument("capture", help="path, or a brand name")
+    p2.set_defaults(func=lambda a: (print(port_of(_load(a.capture)[0])), 0)[1])
 
     args = p.parse_args()
     return args.func(args)

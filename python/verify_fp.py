@@ -1,14 +1,21 @@
-"""Diff our fingerprint against a tls.peet.ws capture of real Chrome.
+"""Diff our fingerprint against what a real browser got from the same servers.
 
-Fetches the same endpoint the reference came from and compares field by field.
-Pass --resume to make the second (session-resumed) request the one that gets
-compared, which is what references/chrome150_peet.json is - it carries a
-pre_shared_key, so a plain request is legitimately one extension short.
+references/<brand>.json holds what tls.peet.ws and check.ja3.zone made of the
+real browser, collected by hpack_probe.py during the capture. This asks those
+same services ourselves and compares field by field - the one check here that
+needs network, and the only one that proves an outside party agrees with us.
 
-    python verify_fp.py            # TLS (minus PSK) + the whole h2 layer
-    python verify_fp.py --resume   # TLS including PSK
+Whether the reference is a fresh or a resumed handshake depends on the browser;
+the probe refuses to issue session tickets, so a capture-time reference is
+normally fresh, and then --resume legitimately shows one extra extension
+(0029 pre_shared_key). Compare the run that matches the reference.
+
+    python verify_fp.py                     # TLS + the whole h2 layer + JA3
+    python verify_fp.py --resume            # TLS from a session-resumed handshake
+    python verify_fp.py --brand chrome      # pick a brand explicitly
 """
 
+import argparse
 import json
 import socket
 import ssl
@@ -18,37 +25,42 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-import chrome_h2  # noqa: E402
+import browser_fp as fp  # noqa: E402
 import httpx  # noqa: E402
 
 HERE = Path(__file__).resolve().parent
-REFERENCE = HERE / "references" / "chrome150_peet.json"
-REF = json.loads(REFERENCE.read_text())
 
 
-def _align_to_reference() -> None:
-    """Match the two headers that depend on how the reference was captured.
+def _align_to_reference(prof, ref: dict) -> dict:
+    """Match the headers that depend on how the reference happened to be taken.
 
-    `accept-language` follows the Chrome profile's UI language and
-    `cache-control: max-age=0` only appears on a reload, so the two reference
-    captures legitimately disagree on them. Comparing anything else would be
-    meaningless if these were left mismatched, and making the caller remember
-    to set them by hand is a trap.
+    `accept-language` follows the browser profile's UI language,
+    `cache-control: max-age=0` only appears on a reload, and `sec-fetch-site` /
+    `referer` depend on where the request came from - the reference was reached
+    from a link on the probe's own page, this run is a bare request. Comparing
+    anything else would be meaningless while those were mismatched, and making
+    the caller set them by hand is a trap.
+
+    Returns the extra request headers needed to match, which is how `referer`
+    gets exercised at all: without one, nothing checks that we put it in the
+    place a browser puts it.
     """
-    for frame in REF.get("http2", {}).get("sent_frames", []):
+    for frame in ref.get("http2", {}).get("sent_frames", []):
         if frame.get("frame_type") != "HEADERS":
             continue
         sent = dict(h.split(": ", 1) for h in frame["headers"] if ": " in h)
         if "accept-language" in sent:
-            chrome_h2.ACCEPT_LANGUAGE = sent["accept-language"]
-        chrome_h2.SEND_CACHE_CONTROL = "cache-control" in sent
-        return
+            prof.accept_language = sent["accept-language"]
+        prof.send_cache_control = "cache-control" in sent
+        prof.sec_fetch_site = sent.get("sec-fetch-site")
+        if sent.get("sec-fetch-mode") == "cors":
+            prof.header_profile = "xhr"
+        return {"Referer": sent["referer"]} if "referer" in sent else {}
+    return {}
 
 
-_align_to_reference()
 URL = "https://tls.peet.ws/api/all"
 HOST = "tls.peet.ws"
-UA = REF["user_agent"]
 
 
 def fetch_resumed() -> dict:
@@ -83,41 +95,126 @@ def fetch_resumed() -> dict:
     return json.loads(body[: body.rfind(b"}") + 1])
 
 
-def fetch_plain() -> dict:
-    with httpx.Client(transport=chrome_h2.ChromeTransport(), timeout=30) as c:
-        return c.get(URL, headers={"User-Agent": UA}).json()
+def fetch_plain(brand: str, headers: dict) -> dict:
+    with httpx.Client(transport=fp.Transport(brand), timeout=30) as c:
+        return c.get(URL, headers=headers).json()
+
+
+def _pick(entries: list, want: str):
+    """The peet response describing the kind of request we are checking."""
+    def mode(entry):
+        for frame in (entry or {}).get("http2", {}).get("sent_frames", []):
+            if frame.get("frame_type") == "HEADERS":
+                sent = dict(h.split(": ", 1) for h in frame["headers"] if ": " in h)
+                return sent.get("sec-fetch-mode")
+        return None
+
+    return next((e for e in entries if mode(e) == want), None) or (
+        entries[0] if entries else None)
+
+
+JA3_URL = "https://check.ja3.zone/"
+
+
+def check_ja3(brand: str, reference: dict) -> bool:
+    """Ask a second, unrelated service and compare what can be compared.
+
+    peet and this one parse the same ClientHello with different code, so a field
+    the peet comparison happens not to look at still shows up here.
+
+    The *hash* is deliberately not compared. JA3 hashes the extension list in
+    wire order, and Chrome has shuffled that order per connection since 110 - so
+    two connections from the same real Chrome do not share a JA3 either. We
+    shuffle too. What is comparable is everything the shuffle does not touch:
+    the version, the cipher list in order, the extension *set*, the curves and
+    the point formats.
+    """
+    try:
+        with httpx.Client(transport=fp.Transport(brand), timeout=30) as c:
+            got = c.get(JA3_URL).json()
+    except Exception as exc:  # noqa: BLE001 - a third party being down is not a failure
+        print(f"  (skipped: {type(exc).__name__}: {exc})")
+        return True
+
+    def parts(fingerprint: str) -> list[str]:
+        version, ciphers, extensions, curves, formats = fingerprint.split(",")
+        return [version, ciphers,
+                "-".join(sorted(extensions.split("-"), key=int)), curves, formats]
+
+    names = ("tls version", "ciphers", "extensions (sorted)", "curves", "ec formats")
+    ours, theirs = parts(got["fingerprint"]), parts(reference["fingerprint"])
+    ok = True
+    for name, a, b in zip(names, ours, theirs):
+        ok &= cmp(f"ja3 {name}", a, b)
+    print(f"  {'ja3 hash':<26} not compared (JA3 hashes extension order, which "
+          f"Chrome randomises)")
+    return ok
 
 
 def cmp(label: str, ours, theirs) -> bool:
     ok = ours == theirs
     print("  %-26s %s" % (label, "OK" if ok else "DIFFER"))
     if not ok:
-        print("      chrome150: %s" % (theirs,))
-        print("      ours     : %s" % (ours,))
+        print("      %-9s: %s" % ("reference", theirs))
+        print("      %-9s: %s" % ("ours", ours))
     return ok
 
 
 def main() -> int:
-    resumed = "--resume" in sys.argv
-    got = fetch_resumed() if resumed else fetch_plain()
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--brand", help="which profile to check; default: the only "
+                                    "one installed, or BROWSER_FP_BRAND")
+    ap.add_argument("--resume", action="store_true",
+                    help="compare a session-resumed handshake (TLS only)")
+    ap.add_argument("--xhr", action="store_true",
+                    help="check the xhr header template against the reference's "
+                         "cors entry instead of the navigation one")
+    args = ap.parse_args()
+
+    prof = fp.profile(args.brand)
+    reference = HERE / "references" / f"{prof.brand}.json"
+    if not reference.exists():
+        print(f"no live reference for {prof.brand} at {reference} - capture the "
+              f"browser again, the reference is collected in the same visit.",
+              file=sys.stderr)
+        return 2
+    container = json.loads(reference.read_text())
+    entries = container if "tls" in container else container.get("peet")
+    if isinstance(entries, dict) or entries is None:
+        entries = [entries] if entries else []
+    # A navigation is what the default template reproduces, so prefer it; the
+    # cors entry is what a page's own fetch looks like and checks the xhr one.
+    ref = _pick(entries, "navigate" if not args.xhr else "cors")
+    ja3zone = container.get("ja3zone")
+    if ref is None:
+        print(f"{reference} has no tls.peet.ws half"
+              + (" (only check.ja3.zone, which cannot be compared field by "
+                 "field)" if ja3zone else ""), file=sys.stderr)
+        return 2
+    extra = _align_to_reference(prof, ref)
+
+    resumed = args.resume
+    print(f"checking {prof.brand} ({prof.label}) against {reference.name}\n")
+    got = fetch_resumed() if resumed else fetch_plain(
+        prof.brand, {"User-Agent": ref["user_agent"], **extra})
 
     print("=== TLS ===")
     ok = True
-    ok &= cmp("ja4", got["tls"]["ja4"], REF["tls"]["ja4"])
+    ok &= cmp("ja4", got["tls"]["ja4"], ref["tls"]["ja4"])
     ok &= cmp("ja4_r ciphers",
-              got["tls"]["ja4_r"].split("_")[1], REF["tls"]["ja4_r"].split("_")[1])
+              got["tls"]["ja4_r"].split("_")[1], ref["tls"]["ja4_r"].split("_")[1])
     ok &= cmp("ja4_r extensions",
-              got["tls"]["ja4_r"].split("_")[2], REF["tls"]["ja4_r"].split("_")[2])
+              got["tls"]["ja4_r"].split("_")[2], ref["tls"]["ja4_r"].split("_")[2])
     ok &= cmp("ja4_r sigalgs",
-              got["tls"]["ja4_r"].split("_")[3], REF["tls"]["ja4_r"].split("_")[3])
+              got["tls"]["ja4_r"].split("_")[3], ref["tls"]["ja4_r"].split("_")[3])
     ok &= cmp("ja3 ciphers",
-              got["tls"]["ja3"].split(",")[1], REF["tls"]["ja3"].split(",")[1])
+              got["tls"]["ja3"].split(",")[1], ref["tls"]["ja3"].split(",")[1])
     ok &= cmp("ja3 groups",
-              got["tls"]["ja3"].split(",")[3], REF["tls"]["ja3"].split(",")[3])
+              got["tls"]["ja3"].split(",")[3], ref["tls"]["ja3"].split(",")[3])
     ok &= cmp("ja3 ec_formats",
-              got["tls"]["ja3"].split(",")[4], REF["tls"]["ja3"].split(",")[4])
+              got["tls"]["ja3"].split(",")[4], ref["tls"]["ja3"].split(",")[4])
     ok &= cmp("peetprint_hash",
-              got["tls"]["peetprint_hash"], REF["tls"]["peetprint_hash"])
+              got["tls"]["peetprint_hash"], ref["tls"]["peetprint_hash"])
 
     if resumed:
         # The resumed request is driven over a raw socket speaking HTTP/1.1,
@@ -129,14 +226,14 @@ def main() -> int:
 
     print("\n=== HTTP/2 ===")
     ok &= cmp("akamai", got["http2"]["akamai_fingerprint"],
-              REF["http2"]["akamai_fingerprint"])
+              ref["http2"]["akamai_fingerprint"])
     ok &= cmp("akamai_hash", got["http2"]["akamai_fingerprint_hash"],
-              REF["http2"]["akamai_fingerprint_hash"])
+              ref["http2"]["akamai_fingerprint_hash"])
 
     def frames(d):
         return {f["frame_type"]: f for f in d["http2"]["sent_frames"]}
 
-    gf, rf = frames(got), frames(REF)
+    gf, rf = frames(got), frames(ref)
     ok &= cmp("SETTINGS", gf["SETTINGS"]["settings"], rf["SETTINGS"]["settings"])
     ok &= cmp("WINDOW_UPDATE", gf["WINDOW_UPDATE"]["increment"],
               rf["WINDOW_UPDATE"]["increment"])
@@ -155,6 +252,10 @@ def main() -> int:
         if k in (":authority", ":path", ":method", ":scheme"):
             continue
         ok &= cmp(k, gv.get(k), rv[k])
+
+    if ja3zone:
+        print("\n=== JA3 (check.ja3.zone, independent of peet) ===")
+        ok &= check_ja3(prof.brand, ja3zone)
 
     print("\n%s" % ("全部一致" if ok else "存在差异"))
     return 0 if ok else 1
