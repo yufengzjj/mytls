@@ -146,8 +146,19 @@ def check_ja3(brand: str, reference: dict) -> bool:
     ok = True
     for name, a, b in zip(names, ours, theirs):
         ok &= cmp(f"ja3 {name}", a, b)
-    print(f"  {'ja3 hash':<26} not compared (JA3 hashes extension order, which "
-          f"Chrome randomises)")
+
+    # The hash is only meaningless for a browser that shuffles. Rather than be
+    # told which does, notice: if every sorted field above matched and only the
+    # hash differs, the sole remaining difference is the order.
+    if got["hash"] == reference["hash"]:
+        print("  %-26s %s" % ("ja3 hash", "OK (order matches too)"))
+    elif ok:
+        print("  %-26s %s" % ("ja3 hash", "differs by extension ORDER only"))
+        print("      this is right for a browser that shuffles (Chrome since "
+              "110 - its own two connections do not match either) and WRONG "
+              "for one that does not (Safari)")
+    else:
+        ok &= cmp("ja3 hash", got["hash"], reference["hash"])
     return ok
 
 

@@ -13,24 +13,6 @@
 #include "internal/cryptlib.h"
 #include "statem_local.h"
 
-/*
- * signature_algorithms exactly as Chrome advertises it. Order is significant:
- * unlike the cipher and extension lists, JA4 hashes these in wire order.
- * 0x0904..0x0906 are ML-DSA-44/65/87 (draft-ietf-tls-mldsa), which we cannot
- * verify - see tls_construct_ctos_sig_algs().
- */
-static const uint16_t chrome_sigalgs[] = {
-    0x0904, 0x0905, 0x0906,
-    TLSEXT_SIGALG_ecdsa_secp256r1_sha256,
-    TLSEXT_SIGALG_rsa_pss_rsae_sha256,
-    TLSEXT_SIGALG_rsa_pkcs1_sha256,
-    TLSEXT_SIGALG_ecdsa_secp384r1_sha384,
-    TLSEXT_SIGALG_rsa_pss_rsae_sha384,
-    TLSEXT_SIGALG_rsa_pkcs1_sha384,
-    TLSEXT_SIGALG_rsa_pss_rsae_sha512,
-    TLSEXT_SIGALG_rsa_pkcs1_sha512
-};
-
 EXT_RETURN tls_construct_ctos_renegotiate(SSL_CONNECTION *s, WPACKET *pkt,
                                           unsigned int context, X509 *x,
                                           size_t chainidx)
@@ -338,6 +320,15 @@ EXT_RETURN tls_construct_ctos_session_ticket(SSL_CONNECTION *s, WPACKET *pkt,
             s->ext.session_ticket->data == NULL)
         return EXT_RETURN_NOT_SENT;
 
+    /*
+     * An *empty* session_ticket is an offer of TLSv1.2-style resumption, and
+     * not every browser makes it - Safari does not. A ticket we actually hold
+     * is still sent, so suppressing the offer costs nothing that was not
+     * already unavailable.
+     */
+    if (ticklen == 0 && (ossl_ssl_fp(s)->flags & SSL_FP_EMPTY_TICKET) == 0)
+        return EXT_RETURN_NOT_SENT;
+
     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_session_ticket)
             || !WPACKET_sub_memcpy_u16(pkt, s->session->ext.tick, ticklen)) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
@@ -385,9 +376,14 @@ EXT_RETURN tls_construct_ctos_sig_algs(SSL_CONNECTION *s, WPACKET *pkt,
          * as the browser we are imitating does; that is harmless because no
          * deployed server signs the handshake with them, and if one ever did,
          * tls12_check_peer_sigalg() would reject the unknown algorithm.
+         *
+         * Which list that is comes from the fingerprint profile - see
+         * ssl/ssl_fp_profile.c.
          */
-        for (i = 0; i < OSSL_NELEM(chrome_sigalgs); i++) {
-            if (!WPACKET_put_bytes_u16(pkt, chrome_sigalgs[i])) {
+        const SSL_FP_PROFILE *fp = ossl_ssl_fp(s);
+
+        for (i = 0; i < fp->sigalgs_len; i++) {
+            if (!WPACKET_put_bytes_u16(pkt, fp->sigalgs[i])) {
                 SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
                 return EXT_RETURN_FAIL;
             }
@@ -618,7 +614,9 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
                                                  unsigned int context, X509 *x,
                                                  size_t chainidx)
 {
-    int currv, min_version, max_version, reason;
+    int min_version, max_version, reason;
+    const SSL_FP_PROFILE *fp = ossl_ssl_fp(s);
+    size_t i;
 
     reason = ssl_get_min_max_version(s, &min_version, &max_version, NULL);
     if (reason != 0) {
@@ -643,8 +641,15 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
-    for (currv = max_version; currv >= min_version; currv--) {
-        if (!WPACKET_put_bytes_u16(pkt, currv)) {
+    /*
+     * The advertised list comes from the profile rather than from
+     * [min_version, max_version]: browsers differ here (Chrome offers 1.3 and
+     * 1.2, Safari also offers 1.1 and 1.0) and the list is fingerprint
+     * material. Offering an old version does not mean accepting it -
+     * ssl_choose_client_version() still enforces the real minimum.
+     */
+    for (i = 0; i < fp->versions_len; i++) {
+        if (!WPACKET_put_bytes_u16(pkt, fp->versions[i])) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
             return EXT_RETURN_FAIL;
         }
@@ -687,9 +692,6 @@ EXT_RETURN tls_construct_ctos_psk_kex_modes(SSL_CONNECTION *s, WPACKET *pkt,
 }
 
 #ifndef OPENSSL_NO_TLS1_3
-/* Number of real key shares Chrome puts in a ClientHello */
-# define CHROME_KEY_SHARES 2
-
 static int add_key_share(SSL_CONNECTION *s, WPACKET *pkt, unsigned int curve_id,
                          size_t idx)
 {
@@ -813,7 +815,7 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
          * fingerprint, so we send shares for the first CHROME_KEY_SHARES
          * usable groups rather than just the first one.
          */
-        for (i = 0; i < num_groups && sent < CHROME_KEY_SHARES; i++) {
+        for (i = 0; i < num_groups && sent < ossl_ssl_fp(s)->key_shares; i++) {
             if (!tls_group_allowed(s, pgroups[i], SSL_SECOP_CURVE_SUPPORTED))
                 continue;
 
@@ -1051,7 +1053,8 @@ EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
     unsigned char *padbytes;
     size_t hlen;
 
-    if ((s->options & SSL_OP_TLSEXT_PADDING) == 0)
+    if ((s->options & SSL_OP_TLSEXT_PADDING) == 0
+            || (ossl_ssl_fp(s)->flags & SSL_FP_PADDING) == 0)
         return EXT_RETURN_NOT_SENT;
 
     /*
@@ -1146,6 +1149,9 @@ EXT_RETURN tls_construct_ctos_alps(SSL_CONNECTION *s, WPACKET *pkt,
      */
     s->ext.alps_negotiated = 0;
 
+    if ((ossl_ssl_fp(s)->flags & SSL_FP_ALPS) == 0)
+        return EXT_RETURN_NOT_SENT;
+
     if (s->ext.alpn == NULL || !SSL_IS_FIRST_HANDSHAKE(s))
         return EXT_RETURN_NOT_SENT;
 
@@ -1233,6 +1239,9 @@ EXT_RETURN tls_construct_ctos_ech(SSL_CONNECTION *s, WPACKET *pkt,
     unsigned char cfgid;
     size_t namelen, payloadlen;
     OSSL_LIB_CTX *libctx = SSL_CONNECTION_GET_CTX(s)->libctx;
+
+    if ((ossl_ssl_fp(s)->flags & SSL_FP_ECH_GREASE) == 0)
+        return EXT_RETURN_NOT_SENT;
 
     if (SSL_CONNECTION_IS_DTLS(s))
         return EXT_RETURN_NOT_SENT;

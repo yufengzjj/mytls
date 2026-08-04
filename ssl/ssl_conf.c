@@ -209,6 +209,16 @@ static int cmd_ClientSignatureAlgorithms(SSL_CONF_CTX *cctx, const char *value)
     return rv > 0;
 }
 
+static int cmd_FingerprintProfile(SSL_CONF_CTX *cctx, const char *value)
+{
+    if (cctx->ssl != NULL)
+        return SSL_set_fp_profile(cctx->ssl, value);
+    if (cctx->ctx != NULL)
+        return SSL_CTX_set_fp_profile(cctx->ctx, value);
+    /* NB: ctx == NULL performs syntax checking only */
+    return ossl_ssl_fp_profile_by_name(value) != NULL;
+}
+
 static int cmd_Groups(SSL_CONF_CTX *cctx, const char *value)
 {
     int rv;
@@ -765,6 +775,7 @@ static const ssl_conf_cmd_tbl ssl_conf_cmds[] = {
     SSL_CONF_CMD_STRING(ClientSignatureAlgorithms, "client_sigalgs", 0),
     SSL_CONF_CMD_STRING(Curves, "curves", 0),
     SSL_CONF_CMD_STRING(Groups, "groups", 0),
+    SSL_CONF_CMD_STRING(FingerprintProfile, "fp_profile", 0),
     SSL_CONF_CMD_STRING(ECDHParameters, "named_curve", SSL_CONF_FLAG_SERVER),
     SSL_CONF_CMD_STRING(CipherString, "cipher", 0),
     SSL_CONF_CMD_STRING(Ciphersuites, "ciphersuites", 0),

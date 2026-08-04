@@ -4221,23 +4221,13 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
      */
     SSL_CTX_set_min_proto_version(ret, TLS1_2_VERSION);
     SSL_CTX_set_max_proto_version(ret, TLS1_3_VERSION);
-    /* TLSv1.3 suites, in Chrome's order */
-    SSL_CTX_set_ciphersuites(ret, "TLS_AES_128_GCM_SHA256:"
-                                  "TLS_AES_256_GCM_SHA384:"
-                                  "TLS_CHACHA20_POLY1305_SHA256");
-    /* TLSv1.2 and below, in Chrome's order */
-    SSL_CTX_set_cipher_list(ret, "ECDHE-ECDSA-AES128-GCM-SHA256:"
-                                 "ECDHE-RSA-AES128-GCM-SHA256:"
-                                 "ECDHE-ECDSA-AES256-GCM-SHA384:"
-                                 "ECDHE-RSA-AES256-GCM-SHA384:"
-                                 "ECDHE-ECDSA-CHACHA20-POLY1305:"
-                                 "ECDHE-RSA-CHACHA20-POLY1305:"
-                                 "ECDHE-RSA-AES128-SHA:"
-                                 "ECDHE-RSA-AES256-SHA:"
-                                 "AES128-GCM-SHA256:"
-                                 "AES256-GCM-SHA384:"
-                                 "AES128-SHA:"
-                                 "AES256-SHA");
+    /*
+     * The cipher and group lists come from the default fingerprint profile, so
+     * that ssl/ssl_fp_profile.c stays the only place any browser's lists are
+     * written down. A failure here leaves the library defaults in place, which
+     * the self-test catches immediately.
+     */
+    (void)ossl_ssl_fp_apply_ctx(ret, ossl_ssl_fp_default());
     /*
      * From here on the cipher lists are part of the fingerprint and the public
      * setters will leave them alone. See ossl_ssl_ciphers_pinned().

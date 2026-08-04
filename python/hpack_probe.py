@@ -22,6 +22,18 @@ named up front - point Chrome, Firefox or a phone at the address and each lands
 in its own file. A brand is a browser, not a browser version: capturing Chrome
 again replaces profiles/chrome.json, and the version stays inside the capture.
 
+A phone reaches this machine over the LAN, so it needs an address that is not
+localhost, and a certificate that says so:
+
+    python hpack_probe.py serve --host 192.168.1.5
+
+--host goes into the certificate's SAN and is printed as the URL to open. iOS
+Safari will offer to continue past the untrusted certificate; trusting it
+properly (README) avoids the extra tap. Note that the address ends up in
+`:authority` and decides whether an SNI is sent, so a LAN capture is only
+reproducible from that same address - `where` prints it and selftest says so
+when it cannot get there.
+
 The page we serve back then has the browser fetch tls.peet.ws and post the
 answer here, so the same visit also writes references/<brand>.json - what an
 independent fingerprinter made of that browser, which is the one thing our own
@@ -40,6 +52,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import ipaddress
 import json
 import os
 import re
@@ -75,6 +88,9 @@ SETTING_NAMES = {
     1: "HEADER_TABLE_SIZE", 2: "ENABLE_PUSH", 3: "MAX_CONCURRENT_STREAMS",
     4: "INITIAL_WINDOW_SIZE", 5: "MAX_FRAME_SIZE", 6: "MAX_HEADER_LIST_SIZE",
     8: "ENABLE_CONNECT_PROTOCOL",
+    # RFC 9218. Safari announces it and still puts RFC 7540 priority on its
+    # HEADERS frames, so the two are not alternatives in practice.
+    9: "NO_RFC7540_PRIORITIES",
 }
 
 
@@ -93,16 +109,88 @@ def profile_path(brand: str) -> Path:
     return PROFILES_DIR / f"{brand}.json"
 
 
-def ensure_cert(openssl: str) -> None:
-    if CERT.exists() and KEY.exists():
+def local_ipv4() -> str | None:
+    """This machine's address on the network it routes through, or None.
+
+    A UDP connect() sends nothing - it only asks the kernel which interface
+    would be used - so this is free and works without name resolution. On WSL2
+    it returns the VM's address, which is *not* what a phone can reach; see
+    `serve --host`.
+    """
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("10.255.255.255", 1))
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+def can_bind(host: str) -> bool:
+    """True if `host` is an address this machine actually holds.
+
+    Binding to an address you do not own fails with EADDRNOTAVAIL, which is the
+    only reliable answer - name resolution and gethostname() both lie under
+    WSL, containers and split-horizon DNS.
+    """
+    s = socket.socket()
+    try:
+        s.bind((host, 0))
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def _is_ip(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+    except ValueError:
+        return False
+    return True
+
+
+def _san(hosts: typing.Iterable[str]) -> str:
+    """subjectAltName covering loopback plus whatever else was asked for."""
+    names, ips = ["localhost"], ["127.0.0.1"]
+    for host in hosts:
+        (ips if _is_ip(host) else names).append(host)
+    entries = [f"DNS:{n}" for n in dict.fromkeys(names)]
+    entries += [f"IP:{i}" for i in dict.fromkeys(ips)]
+    return ",".join(entries)
+
+
+def ensure_cert(openssl: str, hosts: typing.Iterable[str] = ()) -> None:
+    """Make sure the server cert covers every name a client might use.
+
+    The SAN accumulates: a run without --host keeps the addresses an earlier
+    run put in, because regenerating means re-installing on every phone that
+    trusted the old one. iOS is the reason for the extensions - since iOS 13 a
+    server certificate is rejected outright unless it has a SAN (CN is
+    ignored), carries extendedKeyUsage=serverAuth and lives no longer than 398
+    days.
+    """
+    stamp = WORK / "cert.san"
+    have = stamp.read_text().split(",") if stamp.exists() else []
+    want = _san(hosts)
+    merged = ",".join(dict.fromkeys([*have, *want.split(",")]))
+    # DNS entries first, IP after: order inside the extension is cosmetic, but
+    # a stable spelling is what lets us compare against the stamp at all.
+    merged = ",".join(sorted(merged.split(","), key=lambda e: e.startswith("IP:")))
+    if CERT.exists() and KEY.exists() and merged == ",".join(have):
         return
+
     WORK.mkdir(parents=True, exist_ok=True)
     conf = WORK / "openssl.cnf"
     conf.write_text(
         "[req]\ndistinguished_name=dn\nx509_extensions=v3\nprompt=no\n"
         "[dn]\nCN=localhost\n"
-        "[v3]\nsubjectAltName=DNS:localhost,IP:127.0.0.1\n"
-        "basicConstraints=CA:FALSE\n",
+        f"[v3]\nsubjectAltName={merged}\n"
+        "basicConstraints=CA:FALSE\n"
+        "keyUsage=digitalSignature,keyEncipherment\n"
+        "extendedKeyUsage=serverAuth\n",
     )
     subprocess.run(  # noqa: S603
         [openssl, "req", "-x509", "-newkey", "rsa:2048", "-nodes",
@@ -110,7 +198,11 @@ def ensure_cert(openssl: str) -> None:
          "-config", str(conf)],
         check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
-    print(f"generated self-signed cert at {CERT}")
+    stamp.write_text(merged)
+    print(f"generated self-signed cert at {CERT}\n  valid for {merged}")
+    if have:
+        print("  the old one is gone - anything that trusted it has to trust "
+              "this one instead")
 
 
 GREASE = {0x0a0a, 0x1a1a, 0x2a2a, 0x3a3a, 0x4a4a, 0x5a5a, 0x6a6a, 0x7a7a,
@@ -254,8 +346,8 @@ def listen(port: int) -> socket.socket:
     return srv
 
 
-def tls_context(openssl: str) -> ssl.SSLContext:
-    ensure_cert(openssl)
+def tls_context(openssl: str, hosts: typing.Iterable[str] = ()) -> ssl.SSLContext:
+    ensure_cert(openssl, hosts)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(str(CERT), str(KEY))
     ctx.set_alpn_protocols(["h2", "http/1.1"])
@@ -480,10 +572,29 @@ def serve(args: argparse.Namespace) -> int:
     # run the page's javascript, so asking for one would only waste the timeout.
     want_reference = not args.out and not args.no_reference
 
-    ctx = tls_context(args.openssl)
+    hosts = [h.strip() for h in (args.host or "").split(",") if h.strip()]
+    detected = local_ipv4()
+    if detected:
+        hosts.append(detected)
+    ctx = tls_context(args.openssl, hosts)
     srv = listen(args.port)
+
+    reach = hosts[0] if hosts else "localhost"
     print(f"listening on :{args.port} - waiting for any h2 client "
-          f"(https://localhost:{args.port}/api/all)")
+          f"(https://{reach}:{args.port}/api/all)")
+    if hosts and not can_bind(hosts[0]):
+        # Under WSL2 the VM sits behind NAT, so the address a phone can reach
+        # is the Windows host's and packets only arrive if Windows forwards
+        # them. Saying so here beats a browser that just hangs.
+        print(f"  {hosts[0]} is not an address this machine holds, so nothing "
+              f"will arrive unless it is forwarded here. Under WSL2, either "
+              f"set networkingMode=mirrored in .wslconfig, or from an admin "
+              f"PowerShell:\n"
+              f"    netsh interface portproxy add v4tov4 listenport={args.port}"
+              f" listenaddress=0.0.0.0 connectport={args.port} "
+              f"connectaddress={detected or '<wsl-ip>'}\n"
+              f"    netsh advfirewall firewall add rule name=hpack_probe "
+              f"dir=in action=allow protocol=TCP localport={args.port}")
 
     record = capture(srv, ctx, want_reference=want_reference,
                      timeout=args.reference_timeout,
@@ -608,8 +719,11 @@ code{background:#eee;padding:2px 4px}textarea{width:100%%;font:12px monospace}
   <p>The fetch above is an <b>XHR</b>, and a browser does not send the same
   headers for one of those as for a <b>navigation</b>. To record the navigation
   variant too, <a href="%(peet)s" target="_blank" rel="noopener">open %(peet)s</a>
-  in a tab, copy the whole JSON and paste it here:</p>
-  <textarea id="t" rows="6" placeholder="paste the JSON"></textarea>
+  in a tab and bring the JSON back here. On a phone, do not drag out a
+  selection: <b>long-press the text &rarr; Select All &rarr; Copy</b>, come back
+  and press the button.</p>
+  <p><button id="c" hidden>read the clipboard</button></p>
+  <textarea id="t" rows="6" placeholder="...or paste the JSON in here"></textarea>
   <p><button id="b">save it</button> <button id="d">skip</button></p>
 </div>
 <script>
@@ -634,10 +748,28 @@ Promise.all([grab("%(peet)s"), grab("%(ja3)s")]).then(([peet, ja3zone]) => {
     }
   });
 });
-document.getElementById("b").onclick = () =>
-  post(document.getElementById("t").value)
-    .then(() => fetch("/reference/done", {method: "POST"}))
-    .then(() => say("done - saved the pasted navigation as well"));
+const ta = document.getElementById("t");
+// Checked here rather than server-side: a half-selected copy is the likely
+// mistake, and the person who can fix it is looking at this page.
+const send = text => {
+  try { JSON.parse(text); } catch (e) {
+    say("that is not whole JSON - copy all of %(peet)s, not part of it");
+    return;
+  }
+  post(text).then(() => fetch("/reference/done", {method: "POST"}))
+            .then(() => say("done - saved the pasted navigation as well"));
+};
+document.getElementById("b").onclick = () => send(ta.value);
+// One tap instead of long-pressing the box and hunting for Paste. Safari shows
+// its own confirmation before handing the clipboard over, so this cannot read
+// anything behind the user's back; where it is unavailable the box still is.
+if (navigator.clipboard && navigator.clipboard.readText) {
+  const c = document.getElementById("c");
+  c.hidden = false;
+  c.onclick = () => navigator.clipboard.readText()
+    .then(t => { ta.value = t; send(t); })
+    .catch(() => say("the browser kept the clipboard to itself - use the box"));
+}
 document.getElementById("d").onclick = () =>
   fetch("/reference/done", {method: "POST"})
     .then(() => say("done - you can close this tab"));
@@ -841,11 +973,35 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
 
 # --- driving our own client -------------------------------------------------
 
-def run_client(port: int, brand: str | None, *, quiet: bool = False) -> None:
-    """Send one request through the brand's transport at our own server."""
+def run_client(authority: str, brand: str | None, *, quiet: bool = False,
+               like: dict[str, str] | None = None) -> None:
+    """Send one request through the brand's transport at our own server.
+
+    `authority` and not a port: it goes into the HPACK block verbatim and
+    decides whether an SNI is sent, so a capture can only be reproduced by
+    addressing the server exactly the way the browser did.
+
+    `like` is a set of captured headers to imitate the *kind* of request from.
+    Which browser sent a capture is one thing; how it got there is another, and
+    three headers depend on the latter - a navigation reached by tapping a link
+    carries `sec-fetch-site: cross-site` and a `referer`, a reload adds
+    `cache-control`, and a page's own fetch is `sec-fetch-mode: cors`. Without
+    this a capture taken any way but by typing the address into a fresh tab
+    could never be reproduced, which says nothing about the fingerprint.
+    """
     sys.path.insert(0, str(HERE))
     import browser_fp
     import httpx
+
+    headers: dict[str, str] = {}
+    if like is not None:
+        prof = browser_fp.profile(brand)
+        if like.get("sec-fetch-mode") == "cors":
+            prof.header_profile = "xhr"
+        prof.sec_fetch_site = like.get("sec-fetch-site")
+        prof.send_cache_control = "cache-control" in like
+        if "referer" in like:
+            headers["Referer"] = like["referer"]
 
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
@@ -854,14 +1010,14 @@ def run_client(port: int, brand: str | None, *, quiet: bool = False) -> None:
     transport = browser_fp.Transport(brand, verify=ctx)
     with httpx.Client(transport=transport, timeout=15) as c:
         try:
-            c.get(f"https://localhost:{port}/api/all")
+            c.get(f"https://{authority}/api/all", headers=headers)
         except Exception as exc:  # noqa: BLE001 - server closes early by design
             if not quiet:
                 print(f"(request ended with {type(exc).__name__}: {exc})")
 
 
 def client(args: argparse.Namespace) -> int:
-    run_client(args.port, args.brand)
+    run_client(f"{args.host}:{args.port}", args.brand)
     print("done - check the server's output file")
     return 0
 
@@ -942,17 +1098,30 @@ def diff_h2(a: dict, b: dict, na: str, nb: str) -> bool:
     return same
 
 
-def port_of(rec: dict) -> int:
-    """The port the capture was taken on, read out of `:authority`.
+def authority_of(rec: dict) -> str:
+    """The `:authority` the capture was taken against.
 
-    A capture is only byte-comparable against one taken on the same port:
-    `:authority` is `localhost:8443`, so the port lands in the HPACK block and
-    a mismatch shows up as a difference in the first few bytes.
+    A capture is only byte-comparable against one taken at the same address.
+    The whole string lands in the HPACK block, so `localhost:8443` and
+    `192.168.1.5:8443` differ within the first few bytes - and the host half
+    decides the ClientHello too, since an IP literal carries no SNI at all
+    while a name does. Phone captures arrive over the LAN, so neither half can
+    be assumed any more.
     """
     frame = next(f for f in rec["frames"] if f["type"] == "HEADERS")
-    authority = dict(_decode(bytes.fromhex(frame["header_block"])))[":authority"]
-    _, _, port = authority.rpartition(":")
-    return int(port)
+    return dict(_decode(bytes.fromhex(frame["header_block"])))[":authority"]
+
+
+def split_authority(authority: str) -> tuple[str, int]:
+    host, sep, port = authority.rpartition(":")
+    if not sep or (host.startswith("[") and not host.endswith("]")):
+        return authority, 443
+    return host, int(port)
+
+
+def port_of(rec: dict) -> int:
+    """Just the port half, for the places that only need to know where to listen."""
+    return split_authority(authority_of(rec))[1]
 
 
 #: Extensions whose body length is not constant even for one real browser, so
@@ -961,6 +1130,73 @@ def port_of(rec: dict) -> int:
 #: 218 and 250 bytes. The lengths are still printed, because a client that
 #: always sends exactly one of them is its own kind of tell.
 VARIABLE_LENGTH = {"0xfe0d"}
+
+#: Extensions whose *body* carries per-connection randomness, so only their
+#: shape can be compared. key_share is not in here: its bodies are handled
+#: specially below, because the group ids in it are fingerprint material even
+#: though the public keys beside them are fresh every time.
+RANDOM_BODY = {"0xfe0d", "0x0029"}
+
+
+def ext_bodies(ch: dict) -> dict[str, str]:
+    """Extension bodies, re-parsed out of the stored raw ClientHello.
+
+    The capture only keeps GREASE bodies inline, but it keeps the whole record,
+    so the bodies are still there - and they have to be compared. Extension
+    *lengths* alone hide real differences: Chrome and Safari both send a 12-byte
+    supported_groups, listing entirely different groups.
+
+    Values are rendered rather than returned raw, so that the parts which are
+    meant to differ per connection do not show up as failures.
+    """
+    raw = bytes.fromhex(ch["raw"])
+    o = 5 + 4 + 2 + 32
+    o += 1 + raw[o]                                   # session_id
+    o += 2 + int.from_bytes(raw[o:o + 2], "big")      # cipher_suites
+    o += 1 + raw[o]                                   # compression methods
+    o += 2                                            # extensions length
+    out: dict[str, str] = {}
+    while o + 4 <= len(raw):
+        etype = int.from_bytes(raw[o:o + 2], "big")
+        elen = int.from_bytes(raw[o + 2:o + 4], "big")
+        body = raw[o + 4:o + 4 + elen]
+        o += 4 + elen
+        name = "GREASE" if etype in GREASE else f"0x{etype:04x}"
+        if etype in GREASE:
+            continue
+        if name in RANDOM_BODY:
+            out[name] = "(random)"
+        elif etype == 51:                             # key_share
+            out[name] = " ".join(_key_share_shape(body))
+        elif etype in U16_LIST:
+            out[name] = " ".join(_u16_list(body, U16_LIST[etype]))
+        else:
+            out[name] = body.hex()
+    return out
+
+
+#: Extensions carrying a list of 2-byte codepoints, and the width of the length
+#: prefix in front of it. Rendered element by element rather than as raw hex
+#: for two reasons: the GREASE entry inside has to be wildcarded like any other
+#: GREASE, and a difference is far easier to place when the elements are split.
+U16_LIST = {10: 2, 43: 1, 13: 2}   # supported_groups, supported_versions, sigalgs
+
+
+def _u16_list(body: bytes, prefix: int) -> list[str]:
+    return [("GREASE" if int.from_bytes(body[o:o + 2], "big") in GREASE
+             else f"0x{int.from_bytes(body[o:o + 2], 'big'):04x}")
+            for o in range(prefix, len(body) - 1, 2)]
+
+
+def _key_share_shape(body: bytes) -> list[str]:
+    """`group:keylen` per entry, GREASE wildcarded, the keys themselves dropped."""
+    entries, o = [], 2
+    while o + 4 <= len(body):
+        group = int.from_bytes(body[o:o + 2], "big")
+        n = int.from_bytes(body[o + 2:o + 4], "big")
+        entries.append(f"{'GREASE' if group in GREASE else f'0x{group:04x}'}:{n}")
+        o += 4 + n
+    return entries
 
 
 def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
@@ -1015,7 +1251,24 @@ def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
         else:
             print(f"      {na}: {sa[key]}")
             print(f"      {nb}: {sb[key]}")
+
+    ba, bb = ext_bodies(a), ext_bodies(b)
+    differing = [k for k in sorted(set(ba) | set(bb)) if ba.get(k) != bb.get(k)]
+    if differing:
+        same = False
+        print("  ext bodies       DIFFER")
+        for k in differing:
+            print(f"      {k}: {na}={_short(ba.get(k))}")
+            print(f"      {' ' * len(k)}  {nb}={_short(bb.get(k))}")
+    else:
+        print("  ext bodies       OK")
     return same
+
+
+def _short(value: str | None, limit: int = 72) -> str:
+    if value is None:
+        return "(absent)"
+    return value if len(value) <= limit else f"{value[:limit]}... ({len(value)//2}B)"
 
 
 def diff_records(a: dict, b: dict, na: str, nb: str) -> int:
@@ -1085,16 +1338,33 @@ def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
     result on an air-gapped machine, and nothing to clean up if it fails.
     """
     ref, source = _load(brand)
-    # The port is not free to choose: `:authority` is `localhost:<port>`, so it
-    # is part of the HPACK block. Take it from the reference or the byte
-    # comparison fails on a difference that means nothing.
-    want = port_of(ref)
+    # The address is not free to choose: `:authority` is part of the HPACK
+    # block and the host half decides whether an SNI goes out. Address the
+    # server the way the captured browser did, or the comparison fails on
+    # differences that mean nothing.
+    authority = authority_of(ref)
+    host, want = split_authority(authority)
+
     if port is not None and port != want:
         print(f"note: {brand} was captured on port {want}; using {port} instead "
               f"means :authority differs and the HPACK block cannot match. The "
               f"ClientHello and HTTP/2 layers are still meaningful.")
+        authority = f"{host}:{port}"
     else:
         port = want
+
+    if not can_bind(host):
+        # A phone capture came in over the LAN, and that address belongs to
+        # whatever the browser could reach - a router-assigned one that has
+        # since changed, or under WSL the Windows host rather than this VM.
+        print(f"note: {brand} was captured at {host}, which is not an address "
+              f"this machine holds, so the request goes to localhost instead. "
+              f":authority differs, so the HPACK block cannot match"
+              + (", and the capture carried no SNI while this one does, so the "
+                 "ClientHello will differ by one extension"
+                 if _is_ip(host) else "")
+              + ". The HTTP/2 layer is still compared in full.")
+        authority = f"localhost:{port}"
 
     ctx = tls_context(openssl)
     try:
@@ -1111,7 +1381,7 @@ def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
         daemon=True)
     thread.start()
     try:
-        run_client(port, brand, quiet=True)
+        run_client(authority, brand, quiet=True, like=headers_of(ref))
     finally:
         thread.join(timeout=20)
         srv.close()
@@ -1176,12 +1446,19 @@ def main() -> int:
                         "pasting tls.peet.ws into the page gives the second")
     s.add_argument("--reference-timeout", type=float, default=25.0,
                    help="how long to wait for that fetch (default 25s)")
+    s.add_argument("--host", help="address the client will use, comma-separated "
+                                  "if several; goes into the certificate's SAN "
+                                  "and is printed as the URL to visit. Needed "
+                                  "for a phone, which reaches this machine over "
+                                  "the LAN and not on localhost")
     s.add_argument("--port", type=int, default=8443)
     s.add_argument("--openssl", default=str(Path.home() / "openssl/bin/openssl"))
     s.set_defaults(func=serve)
 
     c = sub.add_parser("client", help="drive our own httpx client at the server")
     c.add_argument("--brand", help="which profile to impersonate")
+    c.add_argument("--host", default="localhost",
+                   help="must match the capture's :authority to be comparable")
     c.add_argument("--port", type=int, default=8443)
     c.set_defaults(func=client)
 
@@ -1202,9 +1479,10 @@ def main() -> int:
     d.set_defaults(func=diff)
 
     p2 = sub.add_parser(
-        "port", help="print the port a capture was taken on (see port_of)")
+        "where", help="print the :authority a capture was taken at, which is "
+                      "the only address it can be reproduced from")
     p2.add_argument("capture", help="path, or a brand name")
-    p2.set_defaults(func=lambda a: (print(port_of(_load(a.capture)[0])), 0)[1])
+    p2.set_defaults(func=lambda a: (print(authority_of(_load(a.capture)[0])), 0)[1])
 
     args = p.parse_args()
     return args.func(args)

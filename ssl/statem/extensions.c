@@ -936,7 +936,12 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
          * padding length is computed from everything written before it, and
          * TLSv1.3 requires pre_shared_key to be the very last extension.
          */
-        shuffled = ossl_ssl_ext_permutation(s, TLSEXT_IDX_padding);
+        /*
+         * Only some browsers shuffle. Chrome has since 110; Safari sends a
+         * fixed order, which is why its JA3 is stable and ours has to be too.
+         */
+        shuffled = (ossl_ssl_fp(s)->flags & SSL_FP_SHUFFLE_EXTS) != 0
+                   && ossl_ssl_ext_permutation(s, TLSEXT_IDX_padding);
     }
 
     for (i = 0; i < OSSL_NELEM(ext_defs); i++) {
@@ -1891,9 +1896,7 @@ static EXT_RETURN tls_construct_compress_certificate(SSL_CONNECTION *sc, WPACKET
      * configure with "enable-brotli".
      */
     if (!sc->server && (context & SSL_EXT_CLIENT_HELLO) != 0) {
-        static const uint16_t chrome_cert_comp_algs[] = {
-            TLSEXT_comp_cert_brotli
-        };
+        const SSL_FP_PROFILE *fp = ossl_ssl_fp(sc);
 
         if ((sc->options & SSL_OP_NO_RX_CERTIFICATE_COMPRESSION) != 0
                 || sc->ext.client_cert_type_ctos)
@@ -1906,8 +1909,8 @@ static EXT_RETURN tls_construct_compress_certificate(SSL_CONNECTION *sc, WPACKET
             return EXT_RETURN_FAIL;
         }
 
-        for (i = 0; i < (int)OSSL_NELEM(chrome_cert_comp_algs); i++) {
-            if (!WPACKET_put_bytes_u16(pkt, chrome_cert_comp_algs[i])) {
+        for (i = 0; i < (int)fp->cert_comp_len; i++) {
+            if (!WPACKET_put_bytes_u16(pkt, fp->cert_comp[i])) {
                 SSLfatal(sc, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
                 return EXT_RETURN_FAIL;
             }

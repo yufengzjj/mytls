@@ -76,6 +76,8 @@ import hashlib
 import json
 import os
 import re
+import ssl
+import sys
 import typing
 import warnings
 from pathlib import Path
@@ -89,9 +91,16 @@ import httpcore._sync.http2 as _sync_mod
 import httpx
 import httpx._client
 
+# Sibling module, not a package - importing browser_fp from anywhere should not
+# also require putting its directory on the path by hand.
+if str(Path(__file__).resolve().parent) not in sys.path:
+    sys.path.append(str(Path(__file__).resolve().parent))
+import tls_profile  # noqa: E402
+
 __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
            "Transport", "AsyncTransport", "transport", "async_transport",
-           "profile", "brands", "brand_for", "reload", "describe", "catalog"]
+           "profile", "brands", "brand_for", "reload", "describe", "catalog",
+           "tls_profile"]
 
 _EXPECTED = {"httpx": "0.27.2", "httpcore": "1.0.9", "h2": "4.4.0"}
 
@@ -312,6 +321,13 @@ class Profile:
         self.browser, self.version = _product(self.user_agent)
         self.platform = _platform(self.header_map, self.user_agent)
         self.hpack = _hpack_engine(cap["meta"], self.browser)
+
+        #: Which OpenSSL fingerprint profile this brand's ClientHello wants.
+        #: Defaults to the brand, so a capture needs no extra field; override
+        #: with `{"meta": {"tls_profile": "..."}}` when several brands share one
+        #: TLS stack (every Chromium fork does) and only one profile exists for
+        #: them in ssl/ssl_fp_profile.c.
+        self.tls_profile: str = cap["meta"].get("tls_profile") or self.brand
         self.label: str = cap["meta"].get("label") or (
             f"{self.browser} {self.version.split('.')[0]} on {self.platform}")
 
@@ -1083,6 +1099,56 @@ def _retag_pool(transport: typing.Any, prof: Profile, is_async: bool) -> None:
     pool.__class__ = variant
 
 
+def _tls_state(prof: Profile) -> str:
+    """What the TLS layer would do for this brand, for `describe()`.
+
+    Says so plainly when OpenSSL has no matching profile, because that is the
+    case where the two layers disagree and nothing else on screen shows it.
+    """
+    try:
+        known = tls_profile.available()
+    except tls_profile.Unavailable as exc:
+        return f"{prof.tls_profile} - UNAVAILABLE ({exc.args[0].split('.')[0]})"
+    if prof.tls_profile not in known:
+        return (f"{prof.tls_profile} - NOT IN OpenSSL ({', '.join(known)}); "
+                f"the ClientHello will be the default one")
+    return prof.tls_profile
+
+
+def _apply_tls_profile(transport: typing.Any, prof: Profile) -> str | None:
+    """Point the transport's SSL_CTX at this brand's ClientHello.
+
+    Per transport rather than per process: the profile lives on the SSL_CTX,
+    httpx builds one per transport, and that is what lets one program hold a
+    Chrome client and a Safari client at the same time. A context passed in by
+    the caller and shared between two transports of different brands would be
+    set twice and the last one would win - so give each transport its own, or
+    accept that they agree.
+
+    A missing profile is a warning, not an error: the HTTP/2 half of a brand is
+    useful on its own, and several brands legitimately have no TLS profile yet.
+    But it is a loud warning, because a client whose two layers disagree is
+    more identifiable than one that never pretended at all.
+    """
+    context = getattr(getattr(transport, "_pool", None), "_ssl_context", None)
+    if not isinstance(context, ssl.SSLContext):
+        warnings.warn(
+            f"browser_fp: the transport has no ssl.SSLContext to configure, so "
+            f"its TLS layer is NOT {prof.brand}'s while its HTTP/2 layer is.",
+            RuntimeWarning, stacklevel=3)
+        return None
+
+    try:
+        tls_profile.set_profile(context, prof.tls_profile)
+    except tls_profile.Unavailable as exc:
+        warnings.warn(
+            f"browser_fp: the TLS layer is NOT {prof.brand}'s - {exc} The "
+            f"HTTP/2 layer still is, so the two halves disagree.",
+            RuntimeWarning, stacklevel=3)
+        return None
+    return prof.tls_profile
+
+
 class Transport(httpx.HTTPTransport):
     """An httpx transport whose HTTP/2 layer looks like a captured browser's.
 
@@ -1108,6 +1174,9 @@ class Transport(httpx.HTTPTransport):
         kwargs.setdefault("http2", True)
         super().__init__(**kwargs)
         _retag_pool(self, self.profile, self._ASYNC)
+        #: The OpenSSL profile actually in force, or None if it could not be
+        #: set - so a caller can check rather than trust the warning was seen.
+        self.tls_profile = _apply_tls_profile(self, self.profile)
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.profile.brand}>"
@@ -1124,6 +1193,9 @@ class AsyncTransport(httpx.AsyncHTTPTransport):
         kwargs.setdefault("http2", True)
         super().__init__(**kwargs)
         _retag_pool(self, self.profile, self._ASYNC)
+        #: The OpenSSL profile actually in force, or None if it could not be
+        #: set - so a caller can check rather than trust the warning was seen.
+        self.tls_profile = _apply_tls_profile(self, self.profile)
 
     def __repr__(self) -> str:
         return f"<{type(self).__name__} {self.profile.brand}>"
@@ -1197,6 +1269,7 @@ def describe(brand: str | None = None) -> str:
         f"{prof.header_map.get('sec-fetch-mode') or 'unknown'})",
         f"  header order   : {templates}",
         f"  hpack          : {prof.hpack}",
+        f"  tls profile    : {_tls_state(prof)}",
         f"  akamai         : {prof.akamai_fingerprint}",
         f"  akamai md5     : {prof.akamai_hash}",
         "  settings       : "

@@ -135,7 +135,15 @@ build_openssl() {
     # it stays correct if --libdir changes. Single-quoted on purpose: it has to
     # reach the makefile unexpanded.
     # shellcheck disable=SC2086 - OPENSSL_TARGET is intentionally word-split
-    ./Configure $OPENSSL_TARGET shared enable-brotli \
+    # enable-weak-ssl-ciphers builds the three 3DES suites. They are needed
+    # because Safari still offers them: without them its ClientHello carries 17
+    # cipher suites instead of 20 and its JA4 comes out t13d1714 instead of
+    # t13d2014, which is a fingerprint of its own. Only a profile that lists
+    # them can offer them - the chrome profile does not - but a server could
+    # then negotiate 3DES on a safari_ios connection, exactly as it could with
+    # the real browser.
+    # shellcheck disable=SC2086 - OPENSSL_TARGET is intentionally word-split
+    ./Configure $OPENSSL_TARGET shared enable-brotli enable-weak-ssl-ciphers \
         --prefix="$PREFIX" --libdir=lib --openssldir="$ssldir" \
         '-Wl,-rpath,$(LIBRPATH)'
 

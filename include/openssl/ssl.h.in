@@ -2272,6 +2272,22 @@ int SSL_CTX_set_block_padding(SSL_CTX *ctx, size_t block_size);
 int SSL_CTX_set_block_padding_ex(SSL_CTX *ctx, size_t app_block_size,
                                  size_t hs_block_size);
 
+/*
+ * Client fingerprint profiles. Selects which browser's ClientHello this
+ * library imitates: "chrome", "safari_ios", ... SSL_fp_profile_name() walks
+ * the built-in list, returning NULL once |idx| runs off the end, so a caller
+ * can discover the names rather than hardcode them.
+ *
+ * A profile set on an SSL overrides the one on its SSL_CTX, so a single
+ * process can hold connections imitating different browsers at once. Both must
+ * be set before the handshake starts; afterwards they have no effect.
+ */
+int SSL_CTX_set_fp_profile(SSL_CTX *ctx, const char *name);
+const char *SSL_CTX_get_fp_profile(const SSL_CTX *ctx);
+int SSL_set_fp_profile(SSL *s, const char *name);
+const char *SSL_get_fp_profile(const SSL *s);
+const char *SSL_fp_profile_name(size_t idx);
+
 int SSL_set_record_padding_callback(SSL *ssl,
                                     size_t (*cb) (SSL *ssl, int type,
                                                   size_t len, void *arg));

@@ -725,6 +725,54 @@ typedef enum ssl_grease_index_en {
     SSL_GREASE_LAST
 } SSL_GREASE_INDEX;
 
+/*
+ * A client fingerprint profile: the parts of a ClientHello that are chosen to
+ * imitate a particular browser rather than to negotiate well. See
+ * ssl/ssl_fp_profile.c, which owns the table and is the only place a profile
+ * is defined.
+ *
+ * Fields appear here as each hardcoded site is converted to read them.
+ * Anything not yet listed is still compiled in and therefore still applies to
+ * every profile - so a profile that is missing a conversion produces the
+ * Chrome behaviour for that one detail, not a broken ClientHello.
+ */
+/* Bits for SSL_FP_PROFILE.flags: things a browser either does or does not do. */
+# define SSL_FP_SHUFFLE_EXTS    0x0001  /* randomise ClientHello extension order */
+# define SSL_FP_ALPS            0x0002  /* offer application_settings */
+# define SSL_FP_ECH_GREASE      0x0004  /* offer a GREASE encrypted_client_hello */
+# define SSL_FP_EMPTY_TICKET    0x0008  /* offer an empty session_ticket */
+# define SSL_FP_PADDING         0x0010  /* pad the ClientHello out to 512 bytes */
+
+typedef struct ssl_fp_profile_st {
+    const char *name;
+    /* signature_algorithms, in the order they go on the wire */
+    const uint16_t *sigalgs;
+    size_t sigalgs_len;
+    /*
+     * supported_versions, in wire order, after the GREASE entry. Advertised
+     * only: a version listed here that is below the connection's minimum is
+     * still refused if a server picks it, so widening this list to match a
+     * browser does not widen what we will actually speak.
+     */
+    const uint16_t *versions;
+    size_t versions_len;
+    /* compress_certificate algorithms */
+    const uint16_t *cert_comp;
+    size_t cert_comp_len;
+    /* how many real key_share entries follow the GREASE one */
+    size_t key_shares;
+    /*
+     * supported_groups, TLSv1.3 suites and TLSv1.2-and-below suites, as the
+     * strings the public setters take. Strings rather than codepoint arrays so
+     * that a group or cipher the build does not have is dropped by the
+     * existing parser instead of reaching the wire and failing the handshake.
+     */
+    const char *groups;
+    const char *tls13_ciphers;
+    const char *ciphers;
+    unsigned int flags;
+} SSL_FP_PROFILE;
+
 DEFINE_LHASH_OF_EX(SSL_SESSION);
 /* Needed in ssl_cert.c */
 DEFINE_LHASH_OF_EX(X509_NAME);
@@ -1216,6 +1264,13 @@ struct ssl_ctx_st {
 # ifndef OPENSSL_NO_QLOG
     char *qlog_title; /* Session title for qlog */
 # endif
+
+    /*
+     * Which browser this context's ClientHellos imitate; NULL means the
+     * built-in default. Profiles are static const, so this is a borrowed
+     * pointer with nothing to free.
+     */
+    const SSL_FP_PROFILE *fp_profile;
 };
 
 typedef struct cert_pkey_st CERT_PKEY;
@@ -1867,6 +1922,13 @@ struct ssl_connection_st {
     int grease_seeded;
     unsigned char ext_permutation[TLSEXT_IDX_num_builtins];
     size_t ext_permutation_len;
+
+    /*
+     * Overrides the context's profile for this connection only; NULL means
+     * inherit. Read through ossl_ssl_fp(), never directly, so that the
+     * inheritance happens in one place.
+     */
+    const SSL_FP_PROFILE *fp_profile;
 };
 
 # define SSL_CONNECTION_FROM_SSL_ONLY_int(ssl, c) \
@@ -2562,6 +2624,13 @@ __owur int ossl_ssl_ciphers_pinned(const SSL_CTX *ctx);
 /* ssl_grease.c */
 __owur uint16_t ossl_ssl_grease_value(SSL_CONNECTION *s, int idx);
 __owur int ossl_ssl_ext_permutation(SSL_CONNECTION *s, size_t num);
+
+/* The profile in force for |s|: its own, else its context's, else the default. */
+__owur const SSL_FP_PROFILE *ossl_ssl_fp(const SSL_CONNECTION *s);
+__owur const SSL_FP_PROFILE *ossl_ssl_fp_profile_by_name(const char *name);
+__owur const SSL_FP_PROFILE *ossl_ssl_fp_default(void);
+/* Installs a profile's cipher and group lists; used at SSL_CTX_new_ex() too. */
+int ossl_ssl_fp_apply_ctx(SSL_CTX *ctx, const SSL_FP_PROFILE *prof);
 
 __owur int ssl_read_internal(SSL *s, void *buf, size_t num, size_t *readbytes);
 __owur int ssl_write_internal(SSL *s, const void *buf, size_t num,

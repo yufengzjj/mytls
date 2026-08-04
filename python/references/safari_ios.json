@@ -1,0 +1,230 @@
+{
+  "brand": "safari_ios",
+  "collected_at": "2026-08-04T06:56:24+00:00",
+  "peet": [
+    {
+      "donate": "Please consider donating to keep this API running. Visit https://tls.peet.ws",
+      "ip": "221.44.183.219:59092",
+      "http_version": "h2",
+      "method": "GET",
+      "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
+      "tls": {
+        "ciphers": [
+          "TLS_GREASE (0x3A3A)",
+          "TLS_AES_128_GCM_SHA256",
+          "TLS_AES_256_GCM_SHA384",
+          "TLS_CHACHA20_POLY1305_SHA256",
+          "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384",
+          "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256",
+          "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256",
+          "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384",
+          "TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256",
+          "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256",
+          "TLS_ECDHE_ECDSA_WITH_AES_256_CBC_SHA",
+          "TLS_ECDHE_ECDSA_WITH_AES_128_CBC_SHA",
+          "TLS_ECDHE_RSA_WITH_AES_256_CBC_SHA",
+          "TLS_ECDHE_RSA_WITH_AES_128_CBC_SHA",
+          "TLS_RSA_WITH_AES_256_GCM_SHA384",
+          "TLS_RSA_WITH_AES_128_GCM_SHA256",
+          "TLS_RSA_WITH_AES_256_CBC_SHA",
+          "TLS_RSA_WITH_AES_128_CBC_SHA",
+          "TLS_ECDHE_ECDSA_WITH_3DES_EDE_CBC_SHA",
+          "TLS_ECDHE_RSA_WITH_3DES_EDE_CBC_SHA",
+          "TLS_RSA_WITH_3DES_EDE_CBC_SHA"
+        ],
+        "extensions": [
+          {
+            "name": "TLS_GREASE (0x4a4a)"
+          },
+          {
+            "name": "server_name (0)",
+            "server_name": "tls.peet.ws"
+          },
+          {
+            "name": "extended_master_secret (23)",
+            "master_secret_data": "",
+            "extended_master_secret_data": ""
+          },
+          {
+            "name": "extensionRenegotiationInfo (boringssl) (65281)",
+            "data": "00"
+          },
+          {
+            "name": "supported_groups (10)",
+            "supported_groups": [
+              "TLS_GREASE (0x5a5a)",
+              "X25519 (29)",
+              "P-256 (23)",
+              "P-384 (24)",
+              "P-521 (25)"
+            ]
+          },
+          {
+            "name": "ec_point_formats (11)",
+            "elliptic_curves_point_formats": [
+              "0x00"
+            ]
+          },
+          {
+            "name": "application_layer_protocol_negotiation (16)",
+            "protocols": [
+              "h2",
+              "http/1.1"
+            ]
+          },
+          {
+            "name": "status_request (5)",
+            "status_request": {
+              "certificate_status_type": "OSCP (1)",
+              "responder_id_list_length": 0,
+              "request_extensions_length": 0
+            }
+          },
+          {
+            "name": "signature_algorithms (13)",
+            "signature_algorithms": [
+              "ecdsa_secp256r1_sha256",
+              "rsa_pss_rsae_sha256",
+              "rsa_pkcs1_sha256",
+              "ecdsa_secp384r1_sha384",
+              "rsa_pss_rsae_sha384",
+              "rsa_pss_rsae_sha384",
+              "rsa_pkcs1_sha384",
+              "rsa_pss_rsae_sha512",
+              "rsa_pkcs1_sha512",
+              "rsa_pkcs1_sha1"
+            ]
+          },
+          {
+            "name": "signed_certificate_timestamp (18)"
+          },
+          {
+            "name": "key_share (51)",
+            "shared_keys": [
+              {
+                "TLS_GREASE (0x5a5a)": "00"
+              },
+              {
+                "X25519 (29)": "8129fd3acf78e30b691d615c3add50be813673803b279ba276a473e0a16c8279"
+              }
+            ]
+          },
+          {
+            "name": "psk_key_exchange_modes (45)",
+            "PSK_Key_Exchange_Mode": "PSK with (EC)DHE key establishment (psk_dhe_ke) (1)"
+          },
+          {
+            "name": "supported_versions (43)",
+            "versions": [
+              "TLS_GREASE (0x4a4a)",
+              "TLS 1.3",
+              "TLS 1.2",
+              "TLS 1.1",
+              "TLS 1.0"
+            ]
+          },
+          {
+            "name": "compress_certificate (27)",
+            "algorithms": [
+              "zlib (1)"
+            ]
+          },
+          {
+            "name": "TLS_GREASE (0xaaaa)"
+          },
+          {
+            "name": "padding (21)",
+            "padding_data_length": 394
+          }
+        ],
+        "tls_version_record": "771",
+        "tls_version_negotiated": "772",
+        "ja3": "771,4865-4866-4867-49196-49195-52393-49200-49199-52392-49162-49161-49172-49171-157-156-53-47-49160-49170-10,0-23-65281-10-11-16-5-13-18-51-45-43-27-21,29-23-24-25,0",
+        "ja3_hash": "773906b0efdefa24a7f2b8eb6985bf37",
+        "ja4": "t13d2014h2_a09f3c656075_7f0f34a4126d",
+        "ja4_r": "t13d2014h2_000a,002f,0035,009c,009d,1301,1302,1303,c008,c009,c00a,c012,c013,c014,c02b,c02c,c02f,c030,cca8,cca9_0005,000a,000b,000d,0012,0017,001b,002b,002d,0033,ff01_0403,0804,0401,0503,0805,0805,0501,0806,0601,0201",
+        "peetprint": "GREASE-772-771-770-769|2-1.1|GREASE-29-23-24-25|1027-2052-1025-1283-2053-2053-1281-2054-1537-513|1|1|GREASE-4865-4866-4867-49196-49195-52393-49200-49199-52392-49162-49161-49172-49171-157-156-53-47-49160-49170-10|0-10-11-13-16-18-21-23-27-43-45-5-51-65281-GREASE-GREASE",
+        "peetprint_hash": "fdf2c64009327d63a456cbab56a7bdde",
+        "client_random": "3f7a21145d4cb7fc748fbbe44678bae5c9c64489e17ed1b8400d205bd402a2cc",
+        "session_id": "0f7a2303fb7124c0a89155effbc616f027b8359591ef9cd3e83a996d02a5be1d"
+      },
+      "http2": {
+        "akamai_fingerprint": "2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p",
+        "akamai_fingerprint_hash": "c52879e43202aeb92740be6e8c86ea96",
+        "sent_frames": [
+          {
+            "frame_type": "SETTINGS",
+            "length": 24,
+            "settings": [
+              "ENABLE_PUSH = 0",
+              "MAX_CONCURRENT_STREAMS = 100",
+              "INITIAL_WINDOW_SIZE = 2097152",
+              "NO_RFC7540_PRIORITIES = 1"
+            ]
+          },
+          {
+            "frame_type": "WINDOW_UPDATE",
+            "length": 4,
+            "increment": 10420225
+          },
+          {
+            "frame_type": "HEADERS",
+            "stream_id": 1,
+            "length": 302,
+            "headers": [
+              ":method: GET",
+              ":scheme: https",
+              ":authority: tls.peet.ws",
+              ":path: /api/all",
+              "sec-fetch-dest: document",
+              "user-agent: Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1",
+              "accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+              "referer: https://192.168.1.7:8443/",
+              "sec-fetch-site: none",
+              "sec-fetch-mode: navigate",
+              "accept-language: zh-CN,zh-Hans;q=0.9",
+              "priority: u=0, i",
+              "accept-encoding: gzip, deflate, br"
+            ],
+            "flags": [
+              "EndStream (0x1)",
+              "EndHeaders (0x4)",
+              "Priority (0x20)"
+            ],
+            "priority": {
+              "weight": 256,
+              "depends_on": 0,
+              "exclusive": 0
+            }
+          }
+        ]
+      },
+      "tcpip": {
+        "cap_length": 583,
+        "dst_port": 443,
+        "src_port": 59092,
+        "ip": {
+          "id": 18561,
+          "ttl": 53,
+          "ip_version": 4,
+          "dst_ip": "205.185.123.167",
+          "src_ip": "221.44.183.219"
+        },
+        "tcp": {
+          "ack": 1765333154,
+          "checksum": 57891,
+          "seq": 1699666979,
+          "window": 2061
+        }
+      }
+    }
+  ],
+  "ja3zone": {
+    "hash": "773906b0efdefa24a7f2b8eb6985bf37",
+    "fingerprint": "771,4865-4866-4867-49196-49195-52393-49200-49199-52392-49162-49161-49172-49171-157-156-53-47-49160-49170-10,0-23-65281-10-11-16-5-13-18-51-45-43-27-21,29-23-24-25,0",
+    "ciphers": "TLS_AES_128_GCM_SHA256,TLS_AES_256_GCM_SHA384,TLS_CHACHA20_POLY1305_SHA256,ECDHE-ECDSA-AES256-GCM-SHA384,ECDHE-ECDSA-AES128-GCM-SHA256,ECDHE-ECDSA-CHACHA20-POLY1305,ECDHE-RSA-AES256-GCM-SHA384,ECDHE-RSA-AES128-GCM-SHA256,ECDHE-RSA-CHACHA20-POLY1305,ECDHE-ECDSA-AES256-SHA,ECDHE-ECDSA-AES128-SHA,ECDHE-RSA-AES256-SHA,ECDHE-RSA-AES128-SHA,AES256-GCM-SHA384,AES128-GCM-SHA256,AES256-SHA,AES128-SHA,UNKNOWN(c008),UNKNOWN(c012),UNKNOWN(000a)",
+    "curves": "001D:0017:0018:0019",
+    "protocol": "TLSv1.3",
+    "user_agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1"
+  }
+}
