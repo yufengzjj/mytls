@@ -46,6 +46,16 @@ die()  { printf '\033[1;31m error:\033[0m %s\n' "$*" >&2; exit 1; }
 [ -f Configure ] && [ -d python ] \
     || die "run this from the repository root (Configure and python/ must be here)"
 
+# Which libssl a binary actually resolves at runtime, or "" if that cannot be
+# told. Empty is deliberately not an error here: it means no ldd (not Linux) or
+# no dynamic link, and every caller decides for itself what to make of that.
+# LD_LIBRARY_PATH is unset on purpose - what matters is what the binary finds on
+# its own, not what this shell happens to be pointing at.
+libssl_of() {
+    command -v ldd >/dev/null 2>&1 || return 0
+    env -u LD_LIBRARY_PATH ldd "$1" 2>/dev/null | awk '/libssl\.so/ {print $3}'
+}
+
 # --- privileges -------------------------------------------------------------
 SUDO=""
 if [ "$(id -u)" -ne 0 ]; then
@@ -172,6 +182,51 @@ build_python() {
     export PYENV_ROOT
     export PATH="$PYENV_ROOT/bin:$PATH"
 
+    # pyenv install --skip-existing returns 0 without building when the version
+    # is already there, and silently ignores every option below - so an
+    # interpreter pyenv installed the ordinary way, linked against the system
+    # OpenSSL, would sail through here and only be caught by the linkage check
+    # two steps later, where the error blames the OpenSSL rpath and sends the
+    # reader off in the wrong direction. Settle it here, where the cause is
+    # known, and say what it actually is.
+    local existing="$PYENV_ROOT/versions/$PYTHON_VERSION"
+    if [ -d "$existing" ]; then
+        local ssl_so linked
+        ssl_so="$("$existing/bin/python3" -c 'import _ssl; print(_ssl.__file__)' 2>/dev/null)"
+        linked="${ssl_so:+$(libssl_of "$ssl_so")}"
+        case "$linked" in
+            "$PREFIX"/*)
+                say "reusing CPython $PYTHON_VERSION, already built against $PREFIX"
+                return
+                ;;
+            "")
+                die "pyenv already has $PYTHON_VERSION at $existing, but its
+         _ssl module cannot be inspected - it may be broken, or built with
+         no OpenSSL at all. This script will not overwrite it. Either remove
+         it and re-run:
+             pyenv uninstall -f $PYTHON_VERSION
+         or build a different version instead:
+             PYTHON_VERSION=3.11.14 $0"
+                ;;
+            *)
+                die "pyenv already has $PYTHON_VERSION at $existing, and it is
+         linked against $linked - not the OpenSSL in this repository
+         ($PREFIX/lib). Without that link the TLS half of the fingerprint does
+         not exist: every ClientHello would be Python's own.
+
+         'pyenv install --skip-existing' will not rebuild it, and this script
+         will not delete an interpreter you may be using. Pick one:
+
+           - remove it and re-run this script:
+                 pyenv uninstall -f $PYTHON_VERSION
+           - build a patch version pyenv does not already have:
+                 PYTHON_VERSION=3.11.14 $0
+           - keep it as it is, knowing the TLS layer will not work:
+                 $0 --skip-python"
+                ;;
+        esac
+    fi
+
     say "building CPython $PYTHON_VERSION against $PREFIX (-j$JOBS)"
     # --with-openssl-rpath=auto bakes the library path into the binary, so the
     # result works without LD_LIBRARY_PATH.
@@ -206,8 +261,7 @@ check_links_to_prefix() {
     if ! command -v ldd >/dev/null 2>&1; then
         return 0    # not Linux, or no ldd; the runtime checks below still apply
     fi
-    resolved="$(env -u LD_LIBRARY_PATH ldd "$bin" 2>/dev/null \
-                | awk '/libssl\.so/ {print $3}')"
+    resolved="$(libssl_of "$bin")"
     case "$resolved" in
         "$PREFIX"/*) printf '  %-9s: %s\n' "$what" "$resolved" ;;
         "")          die "$what does not link libssl at all ($bin)" ;;

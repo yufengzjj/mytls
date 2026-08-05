@@ -93,6 +93,13 @@ PREFIX=/opt/mytls PYTHON_VERSION=3.11.15 JOBS=8 ./install-python.sh
 
 Defaults are `PREFIX=$HOME/openssl`, `PYTHON_VERSION=3.11.15`, `JOBS=$(nproc)`.
 
+**If pyenv already has that version**, the script checks what it is linked against before
+doing anything. Built by an earlier run of this script against the same prefix, it is
+reused. Installed the ordinary way — linked against the system OpenSSL — it stops and says
+so, because `pyenv install --skip-existing` would not rebuild it and the result would be a
+client whose TLS layer is Python's own. Either `pyenv uninstall -f 3.11.15` and re-run, or
+give `PYTHON_VERSION` a patch version pyenv does not already have.
+
 ### By hand
 
 ```bash
