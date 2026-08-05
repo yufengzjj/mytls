@@ -19,7 +19,7 @@ reference capture and gains a transport — nothing has to be named up front and
 changes. To see what is currently installed:
 
 ```bash
-python hpack_probe.py list
+mytls-probe list
 ```
 
 The changes in here are **not equally important** — some can be verified against public
@@ -30,14 +30,20 @@ fingerprint hashes, others are done because they were cheap. Read
 
 ## Files
 
+This directory is an installable package — `pip install ./python`, import name `mytls`.
+The captures ship inside it, so a project that depends on it does not need this repository.
+
 | File | Purpose |
 |---|---|
-| `browser_fp.py` | The main module. Provides a transport per brand; `catalog()` / `describe()` report what is installed and what each imitates |
-| `hpack_probe.py` | Runs an h2 server that records the **raw ClientHello + h2 frames + HPACK bytes**; `serve` captures a visiting browser, `selftest` captures ourselves and diffs byte for byte |
-| `verify_fp.py` | The online check: compares field by field against `references/<brand>.json` |
-| `tls_profile.py` | Selects the TLS-layer profile from Python (ctypes into libssl) |
-| `profiles/<brand>.json` | **One file per browser**; everything in `browser_fp` is derived from it |
-| `references/<brand>.json` | What **tls.peet.ws + check.ja3.zone** made of that browser, collected in the same visit (automatically). The baseline for `verify_fp.py`, and the source of the header order for `browser_fp` |
+| `pyproject.toml` | Package metadata. httpx is pinned exactly, and the captures are declared as package data |
+| `mytls/__init__.py` | What `import mytls` gives you, plus `check()` — one line saying whether **both** layers are actually live |
+| `mytls/browser_fp.py` | The main module. Provides a transport per brand; `catalog()` / `describe()` report what is installed and what each imitates |
+| `mytls/hpack_probe.py` | Runs an h2 server that records the **raw ClientHello + h2 frames + HPACK bytes**; `serve` captures a visiting browser, `selftest` captures ourselves and diffs byte for byte. Installed as `mytls-probe` |
+| `mytls/verify_fp.py` | The online check: compares field by field against `references/<brand>.json`. Installed as `mytls-verify` |
+| `mytls/tls_profile.py` | Selects the TLS-layer profile from Python (ctypes into libssl) |
+| `mytls/fingerprints.py` | ja3 / ja4 / ja4_r / peetprint computed from a ClientHello's bytes — no service involved |
+| `mytls/profiles/<brand>.json` | **One file per browser**; everything in `browser_fp` is derived from it |
+| `mytls/references/<brand>.json` | The fingerprints of that browser: ours always, **tls.peet.ws + check.ja3.zone**'s when `--peet` was used. The baseline for `verify_fp.py`, and the source of the header order for `browser_fp` |
 
 **A brand is a browser (+ platform), not a browser version.** There is only
 `chrome.json`, never `chrome150.json` — capturing again replaces it, and the version is
@@ -49,7 +55,7 @@ profile.
 ## Usage
 
 ```python
-import browser_fp as fp
+import mytls as fp
 import httpx
 
 with httpx.Client(transport=fp.transport("chrome")) as client:
@@ -111,9 +117,10 @@ httpx.Client(transport=..., verify=ctx, proxy=P) # silently ignored
 
 ```python
 >>> print(fp.catalog())
-2 profile(s) in .../python/profiles:
-  chrome      Chrome 150 on Windows    1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
-  safari_ios  Safari 604 on iOS        2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p
+3 profile(s) in .../mytls/profiles:
+  chrome          Chrome 150 on Windows    1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
+  chrome_android  Chrome 149 on Android    1:65536;2:0;4:6291456;6:262144|15663105|0|m,a,s,p
+  safari_ios      Safari 604 on iOS        2:0;3:100;4:2097152;9:1|10420225|0|m,s,a,p
 
 >>> print(fp.describe("chrome"))
 chrome  (Chrome 150 on Windows)
@@ -132,11 +139,11 @@ chrome  (Chrome 150 on Windows)
   settings       : 1=65536, 2=0, 4=6291456, 6=262144
   window update  : 15663105
   headers prio   : exclusive=True dep=0 weight=256
-  derived from   : .../python/profiles/chrome.json
+  derived from   : .../mytls/profiles/chrome.json
   captured at    : 2026-08-03T10:57:34+00:00
 ```
 
-Same from the command line: `python hpack_probe.py list`, `python browser_fp.py`.
+Same from the command line: `mytls-probe list`, `python -m mytls`.
 
 The same content is available as a dict in `fp.profile("chrome").meta` (`brand`, `label`,
 `browser`, `version`, `platform`, `user_agent`, `sec_ch_ua`, `akamai_fingerprint`,
@@ -184,9 +191,25 @@ LDFLAGS="-L$MYTLS/lib -Wl,-rpath,$MYTLS/lib" \
 MAKE_OPTS="-j4" \
 pyenv install 3.11.15
 
-# 3. packages
-pip install "httpx[http2,socks]==0.27.2" brotli zstandard
+# 3. this package, which pulls its own pinned dependencies
+pip install ./python
 ```
+
+**`pip install` alone is not enough, and the package says so.** Installed against any other
+Python it still sends the browser's frames, headers and HPACK bytes — and a ClientHello
+that looks like Python's, which is worse than not pretending at all, because the two layers
+then contradict each other. So check before trusting it:
+
+```bash
+python -m mytls
+# both layers ready - TLS profiles chrome, chrome_android, safari_ios (OpenSSL 3.4.0); ...
+# TLS layer: NOT ACTIVE - OpenSSL 3.5.7 has no fingerprint profiles, so every
+#            ClientHello will be Python's own. HTTP/2 layer: ready (...).
+```
+
+The same verdict is `mytls.check()`, and building a transport for a brand the C library has
+no profile for warns on the spot. It is deliberately **not** an ImportError: `fingerprints`,
+the capture tools and the whole h2 layer are genuinely useful on a stock Python.
 
 * `enable-brotli` is required — the chrome profile advertises brotli certificate
   compression, and without it a server that compresses its certificate chain (some
@@ -215,7 +238,7 @@ Start the server, visit it once with the browser you want, done. **Nothing has t
 up front and no Python code changes**:
 
 ```bash
-python hpack_probe.py serve
+mytls-probe serve
 ```
 
 ```
@@ -232,21 +255,39 @@ few more pitfalls; see [phones](#phones).
 
 ```
 listening on :8443 - waiting for any h2 client
-  captured from 192.168.1.7: Mozilla/5.0 (Linux; Android 14; Pixel 8) ... Chrome/150.0.0.0 Mobile Safari/537.36
+  captured from 192.168.1.19: Mozilla/5.0 (Linux; Android 10; K) ... Chrome/149.0.0.0 Mobile Safari/537.36
   stored as .../profiles/chrome_android.json
-  stored as .../references/chrome_android.json  (tls.peet.ws says ja4 t13d1516h2_...)
+  stored as .../references/chrome_android.json  (local ja4 t13d1516h2_8daaf6152771_d8a2da3f94cd)
   ...
-chrome_android  (Chrome 150 on Android)
+chrome_android  (Chrome 149 on Android)
   transport      : browser_fp.ChromeAndroidTransport() / transport('chrome_android')
 ```
 
-**One visit produces two files.** After the browser's request is captured we serve it a
-page whose javascript does `fetch('https://tls.peet.ws/api/all')` and POSTs the answer
-back — so `profiles/` (the raw bytes) and `references/` (an outside party's reading of the
-same browser) both arrive at once, and the baseline for the online check never has to be
-saved by hand.
+**One visit produces two files.** `profiles/` gets the raw bytes and `references/` gets the
+fingerprints of those same bytes — ja3, ja4, ja4_r, peetprint and the akamai fingerprint,
+all computed here by `fingerprints.py` from the ClientHello we already hold in full.
+Nothing has to be fetched, pasted or read; opening the page is the whole capture.
 
-The page hits two services, because only one of them is reachable from every browser:
+```json
+{"brand": "safari_ios", "collected_at": "...",
+ "local": {"tls": {"ja3": "...", "ja4": "...", "peetprint": "..."},
+           "http2": {"akamai_fingerprint": "..."}}}
+```
+
+Two ja4 values are stored, `ja4` and `ja4_padding_counted`, because implementations disagree
+about the padding extension — see
+[iOS Safari's ClientHello](#ios-safaris-clienthello-measured-ios-185--safari-6041).
+
+### Asking tls.peet.ws as well (`--peet`)
+
+What the local computation cannot be is *independent*: it is our parser checking our parser,
+so a misreading shared with our client would go unnoticed. `--peet` restores the old
+behaviour — the page's javascript does `fetch('https://tls.peet.ws/api/all')` and POSTs the
+answer back — and is worth doing when a profile is first captured or after a browser
+upgrade. `verify_fp.py` covers the same ground against a live server.
+
+It costs a manual copy-paste, which is why it is no longer the default. The page hits two
+services, because only one of them is reachable from every browser:
 
 | | CORS | Contents |
 |---|---|---|
@@ -280,7 +321,7 @@ The page's own fetch is always an **XHR**, while a pasted response comes from a
 half the templates guessed. Hence:
 
 ```bash
-python hpack_probe.py serve --both     # do not finish until both kinds are in
+mytls-probe serve --peet --both   # do not finish until both kinds are in
 ```
 
 One visit covers both: the automatic fetch gives the XHR one, the paste gives the
@@ -289,16 +330,19 @@ same kind, and a kind not captured this time is kept, **but only if the user-age
 exactly** (a browser upgrade discards it; falling back to a guess beats using a stale
 order).
 
-A reference looks like this; whatever is missing simply was not obtained:
+With `--peet` a reference looks like this; whatever is missing simply was not obtained,
+and `local` is always there:
 
 ```json
 {"brand": "chrome", "collected_at": "...",
  "peet": [ {...the cors one...}, {...the navigate one...} ],
- "ja3zone": {...}}
+ "ja3zone": {...},
+ "local": {...}}
 ```
 
-If the capture machine has no internet, add `--no-reference` (or let it time out; 25s by
-default, and the profile is unaffected). A `--out` capture never collects a reference.
+The peet and ja3zone halves are **carried over** from the previous capture of the same
+user-agent, so a later `serve` without `--peet` does not throw them away. A `--out` capture
+writes no reference at all.
 
 **The brand is whatever the client says it is**, read off the `user-agent` of the request
 that just arrived:
@@ -320,6 +364,15 @@ fp.transport("chrome_android")     # already works
 fp.ChromeAndroidTransport()        # already works
 ```
 
+**Where a capture lands depends on how the package was installed.** `serve` writes into
+`mytls/profiles/` *inside the installed package* — with `pip install ./python` that is
+site-packages, and the new brand is invisible to git. Work on this repository with an
+editable install so captures land in the tree:
+
+```bash
+pip install -e ./python
+```
+
 To try one out without committing it to the tree, point `BROWSER_FP_PROFILES` at another
 directory (`serve` honours it too, so the capture lands straight there; the reference half
 is `BROWSER_FP_REFERENCES`).
@@ -338,8 +391,21 @@ is `BROWSER_FP_REFERENCES`).
 | the HEADERS priority (absent → no PRIORITY flag) | the HEADERS frame's flags |
 | the pseudo-header order (the last akamai field) | the `:`-prefixed fields in the HPACK block |
 
-**It is done this way because hand-written constants rot.** Chromium permutes the brand
-list in `sec-ch-ua` every major release — Chrome 150 leads with `"Not;A=Brand";v="8"`,
+**What is *not* automatic: the TLS layer.** A new brand covers everything above without a
+code change, but the ClientHello comes from the C library, which only knows the profiles
+compiled into `ssl/ssl_fp_profile.c`. Capture a browser it has never heard of and
+`describe()` says so —
+
+```
+tls profile : chrome_android - NOT IN OpenSSL (chrome, safari_ios); the ClientHello will be the default one
+```
+
+— and the two layers then disagree, which is worse than not pretending at all. Adding the
+profile is usually small: `chrome_android` needed one signature-algorithm list and nothing
+else. See [the TLS-layer profile switch](#the-tls-layer-profile-switch).
+
+**The rest is done this way because hand-written constants rot.** Chromium permutes the
+brand list in `sec-ch-ua` every major release — Chrome 150 leads with `"Not;A=Brand";v="8"`,
 older versions had `"Not_A Brand";v="99"` at the end — and a mistyped akamai number is
 invisible. Neither mistake is possible any more.
 
@@ -383,10 +449,12 @@ sets the TLS profile as well, and `transport.tls_profile` reads back what actual
 effect. `tls_profile.py` is only needed when driving OpenSSL by hand:
 
 ```python
-import ssl, tls_profile
+import ssl
+from mytls import tls_profile
+
 ctx = ssl.create_default_context()
 tls_profile.set_profile(ctx, "safari_ios")
-print(tls_profile.available())        # ('chrome', 'safari_ios')
+print(tls_profile.available())        # ('chrome', 'chrome_android', 'safari_ios')
 ```
 
 CPython's `ssl` module has no SSL_CONF passthrough of any kind, so this is a direct ctypes
@@ -403,6 +471,32 @@ A profile carries **only the fields that have been converted**; anything not yet
 is still compiled in and therefore applies to every profile. So a new profile becomes true
 gradually, and the number of ClientHello differences in `selftest` is the progress bar.
 
+### Android Chrome's ClientHello (measured, Chrome 149 / Android)
+
+It differs from the desktop capture in **exactly one field**: the signature algorithms.
+
+```
+desktop  0904,0905,0906,0403,0804,0401,0503,0805,0501,0806,0601   (11)
+android               0403,0804,0401,0503,0805,0501,0806,0601   ( 8)
+```
+
+`0904`–`0906` are the ML-DSA codepoints. Everything else is the same list: fifteen cipher
+suites, sixteen extensions including ALPS `44cd` and a GREASE ECH `fe0d`, groups led by
+`X25519MLKEM768`, TLS 1.3 and 1.2 only, brotli certificate compression. The HTTP/2 layer is
+identical too, down to `akamai_fingerprint_hash = 52d84b11737d980aef856699f885ca86`. So
+`fp_profile_chrome_android` writes out its own signature algorithms and **references** the
+desktop profile's other lists rather than copying them.
+
+**Platform and version are confounded here**: the desktop capture is Chrome 140 and this
+one Chrome 149, so whether those three codepoints are missing because it is Android or
+because it is newer is not established. Reproducing the capture does not require knowing.
+
+Verified by computing both ClientHellos' fingerprints (`fingerprints.py`) and comparing:
+`ja4`, `ja4_r`, `peetprint` and `peetprint_hash` are identical to the phone's. `ja3_hash`
+is not, and cannot be — Chrome shuffles its extension order per connection, so the phone's
+own two visits disagree with each other as well. Field by field the ja3 differs only in
+extension order; the extension *set* matches.
+
 ### iOS Safari's ClientHello (measured, iOS 18.5 / Safari 604.1)
 
 Captured four times, varying the SNI length to isolate the rules, as the specification for
@@ -418,6 +512,34 @@ the C side:
 | compress_certificate | **zlib** (Chrome uses brotli) |
 | Never sent | `session_ticket`, ALPS, ECH |
 | Unique to it | `padding` (21) |
+
+**The profile is pinned to one iOS version.** Apple changes this list between releases:
+iOS 18.1.1 advertised 11 signature algorithms including `0203` (ecdsa_sha1), iOS 18.5
+advertises 10 without it. Everything else about the two ClientHellos is identical - same
+21 cipher suites in the same order, same five groups, same 16 extensions in the same
+order, both padded to 512 bytes. **JA3 cannot see the difference at all**, because it
+hashes the list of extension *types* and never looks at what is inside them; signature
+algorithms are not part of JA3 in any form. JA4's third field is a hash over the sorted
+extension list plus the signature algorithms in order, so it does change - see the table
+below. Two captures with an identical JA3 can therefore be different builds, which is the
+argument for capturing a profile rather than copying one out of a blog post, and for
+re-capturing after the phone updates.
+
+**Only ever compare JA4 against JA4 from the same tool.** `tls.peet.ws` leaves the padding
+extension out of the `ja4_r` extension list while still counting it in the `14` prefix;
+Wireshark includes it in both. That alone changes the third field, independently of
+anything the client did, and by more than a version bump does:
+
+| third field | iOS 18.1.1 (11 sigalgs) | iOS 18.5 (10 sigalgs) |
+|---|---|---|
+| `tls.peet.ws` (no `0015`) | `874d27d7ca63` | **`7f0f34a4126d`** |
+| Wireshark (`0015` included) | `14788d8d241b` | `e42f34c56612` |
+
+The bold value is the one `references/safari_ios.json` stores as `ja4`; the cell below it is
+stored as `ja4_padding_counted`, so whichever tool a capture came from, its answer is in the
+file. All four were reproduced from `sha256(sorted_extensions + "_" + sigalgs)[:12]` — the
+top row by hand, both 18.5 cells by `fingerprints.py` running on our own client's bytes — so
+a mismatch is worth resolving to one of these cells before concluding the profile is wrong.
 
 **The extension order is fixed, not shuffled** (Chrome has shuffled per connection since
 110). Four independent connections to two different servers produced the identical order,
@@ -459,7 +581,7 @@ A phone cannot reach `localhost`, so it needs a LAN address, and the certificate
 carry that address:
 
 ```bash
-python hpack_probe.py serve --host 192.168.1.7 --both
+mytls-probe serve --host 192.168.1.7 --both
 ```
 
 `--host` does two things: it goes into the certificate's SAN, and it is printed as the URL
@@ -490,8 +612,10 @@ Installing is optional: Safari offers "Show Details → visit this website". The
 connection sends no HEADERS, so what gets captured is the one after you confirm, and the
 fingerprint is unaffected.
 
-**On a phone the peet half can only be pasted** (iOS has nothing like
-`--disable-web-security`); the `check.ja3.zone` half arrives automatically as usual.
+**A phone needs no interaction beyond opening the page** — everything the capture stores is
+computed from its own bytes. Only `--peet` asks anything of the person holding it, and on
+iOS the peet half can only ever be pasted (there is nothing like `--disable-web-security`);
+the `check.ja3.zone` half arrives automatically as usual.
 
 **Note that the address used for the capture becomes part of the fingerprint.** The
 `:authority` goes into the HPACK block verbatim, and its host half decides whether an SNI
@@ -499,7 +623,7 @@ is sent at all — an IP address carries none, a name does. So a capture taken a
 `192.168.1.7:8443` can only be reproduced from `192.168.1.7:8443`:
 
 ```bash
-python hpack_probe.py where safari_ios     # → 192.168.1.7:8443
+mytls-probe where safari_ios     # → 192.168.1.7:8443
 ```
 
 `selftest` goes to that address by itself. If the address is no longer on this machine
@@ -517,7 +641,7 @@ ClientHello will differ by one extension. The HTTP/2 layer is still compared in 
 Run the self-test after capturing; it compares all three layers at once:
 
 ```bash
-python hpack_probe.py selftest --brand firefox
+mytls-probe selftest --brand firefox
 ```
 
 ```
@@ -570,11 +694,13 @@ announce a 6MB stream window in SETTINGS, and Chrome does not send that frame.
 Two templates, `navigate` (the default) and `xhr`, neither of whose order is written by
 hand:
 
-* **When a reference exists**, the order is taken straight from the real request to a real
-  site in it (the navigation frame for `navigate`, the `sec-fetch-mode: cors` frame for
-  `xhr`). **That is the only way to learn where `referer` and `cookie` go** — a capture
+* **When a peet reference exists**, the order is taken straight from the real request to a
+  real site in it (the navigation frame for `navigate`, the `sec-fetch-mode: cors` frame
+  for `xhr`). **That is the only way to learn where `referer` and `cookie` go** — a capture
   taken against localhost has neither a referrer nor cookies. Measured: real Chrome puts
-  `referer` after `sec-fetch-dest`, not after `accept` as originally guessed.
+  `referer` after `sec-fetch-dest`, not after `accept` as originally guessed. This is the
+  one thing `fingerprints.py` cannot replace, and the reason to capture a brand-new brand
+  with `--peet` at least once. It survives later captures without the flag.
 * **Without a reference** it falls back to inferring from the capture: the navigate order
   is real, and the xhr one is that rewritten by rule (`accept` → `*/*`, `sec-fetch-mode` →
   `cors`, `sec-fetch-dest` → `empty`, `priority` → `u=1, i`, dropping
@@ -709,8 +835,8 @@ needs a network**:
 The second one on its own:
 
 ```bash
-python hpack_probe.py selftest                  # every brand
-python hpack_probe.py selftest --brand chrome   # just one
+mytls-probe selftest                  # every brand
+mytls-probe selftest --brand chrome   # just one
 ```
 
 Server and client live in the same process (the server runs in a thread), so no second
@@ -729,7 +855,7 @@ the HPACK block verbatim, and the host half also decides whether an SNI is sent)
 address is read out of the reference capture and **cannot simply be changed**:
 
 ```bash
-python hpack_probe.py where chrome    # → localhost:8443
+mytls-probe where chrome    # → localhost:8443
 ```
 
 `--skip-selftest` skips it, but then nothing has checked the fingerprint at all.
@@ -768,10 +894,10 @@ server agrees.
 ### TLS + h2 frames + headers (online)
 
 ```bash
-python verify_fp.py                    # TLS (no PSK) + the whole h2 layer
-python verify_fp.py --resume           # TLS with a PSK, matching that reference scenario
-python verify_fp.py --brand chrome     # name the brand when several are installed
-python verify_fp.py --xhr              # check the xhr template instead
+mytls-verify                    # TLS (no PSK) + the whole h2 layer
+mytls-verify --resume           # TLS with a PSK, matching that reference scenario
+mytls-verify --brand chrome     # name the brand when several are installed
+mytls-verify --xhr              # check the xhr template instead
 ```
 
 The baseline is `references/<brand>.json`, saved automatically at capture time. Without the
@@ -840,8 +966,8 @@ as `group:keylen` pairs, since the public keys beside them are fresh every time.
 Only the first HEADERS frame of a connection is compared: the HPACK dynamic table is
 stateful, and only at the start of a connection are both sides guaranteed to be empty.
 
-Current result: both installed brands pass all three layers — 455 identical HPACK bytes for
-`chrome`, 290 for `safari_ios`.
+Current result: all three installed brands pass all three layers — 455 identical HPACK bytes
+for `chrome`, 472 for `chrome_android`, 290 for `safari_ios`.
 
 Extension **order** is compared as a set plus the first and last positions, not as a
 sequence, because Chrome (and we) shuffle it per connection. Safari does not shuffle, and
@@ -850,9 +976,9 @@ its fixed order is what makes its JA3 hash comparable in `verify_fp.py`.
 To compare two files by hand, `diff` takes paths as well as brand names:
 
 ```bash
-python hpack_probe.py serve --out /tmp/ours.json &   # --out: do not register a brand
-python hpack_probe.py client --brand chrome
-python hpack_probe.py diff chrome /tmp/ours.json
+mytls-probe serve --out /tmp/ours.json &   # --out: do not register a brand
+mytls-probe client --brand chrome
+mytls-probe diff chrome /tmp/ours.json
 ```
 
 The self-signed certificate and other generated files live in `~/.cache/hpack_probe/` and
@@ -878,10 +1004,14 @@ to be set by hand.
 
 ## Known non-goals / caveats
 
-* **The `xhr` template's order is only measured when a reference exists.** A brand without
-  one uses the order inferred from navigate; measurement shows a real XHR moves the client
-  hints to either side of `user-agent`, unlike the inference. Getting the peet half at
-  capture time avoids the problem entirely.
+* **The locally computed fingerprints are not an independent check.** They are our parser
+  reading bytes our client may also have produced, so a misconception shared by both would
+  be invisible. `--peet` and `verify_fp.py` are what falsify them; the default is for
+  everyday capture, not for validating a new brand.
+* **The `xhr` template's order needs the page's own `/xhr-sample`, or a peet reference.**
+  Both arrive by themselves now, but a brand captured with javascript disabled has neither
+  and falls back to the order inferred from navigate; measurement shows a real XHR moves
+  the client hints to either side of `user-agent`, unlike the inference.
 * **SETTINGS GREASE is not simulated.** Chrome can send a fifth, GREASE setting, but both
   its id and its value are random per connection, and `enable_http2_settings_grease`
   defaults to off. The "fixed value" circulating online is itself a tell — and if a client

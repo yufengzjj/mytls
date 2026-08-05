@@ -187,13 +187,13 @@ build_python() {
 PY="$PYENV_ROOT/versions/$PYTHON_VERSION/bin/python$(echo "$PYTHON_VERSION" | cut -d. -f1,2)"
 [ -x "$PY" ] || die "$PY is missing - the CPython build did not finish"
 
-# --- 5. Python packages -----------------------------------------------------
-# httpx is pinned: python/browser_fp.py subclasses httpcore internals, and
-# checks the version it got.
-say "installing Python packages"
+# --- 5. the Python package --------------------------------------------------
+# Installed rather than run from the tree, so that any project using this Python
+# can `import mytls` without knowing where the repository is. Its dependencies -
+# httpx pinned exactly, plus brotli and zstandard - come from python/pyproject.toml.
+say "installing the mytls Python package"
 "$PY" -m pip install --quiet --upgrade pip
-# socks: browser_fp's transports support socks5:// proxies, which need socksio.
-"$PY" -m pip install --quiet "httpx[http2,socks]==0.27.2" brotli zstandard
+"$PY" -m pip install --quiet "$ROOT/python"
 
 # --- 6. check ---------------------------------------------------------------
 # Linkage first, because getting this wrong is silent: a binary that resolves
@@ -227,7 +227,6 @@ say "checking"
 env -u LD_LIBRARY_PATH "$PY" - <<'EOF'
 import ssl
 import sys
-from pathlib import Path
 
 print(f"  python  : {sys.version.split()[0]}")
 print(f"  openssl : {ssl.OPENSSL_VERSION}")
@@ -242,8 +241,10 @@ for name in ("zlib", "_ctypes", "sqlite3", "lzma", "bz2"):
         missing.append(name)
 print(f"  modules : {'all present' if not missing else 'MISSING ' + ', '.join(missing)}")
 
-sys.path.insert(0, str(Path.cwd() / "python"))
-import browser_fp  # noqa: E402
+import mytls
+from mytls import browser_fp
+
+print(f"  layers  : {mytls.check()}")
 
 ctx = ssl.create_default_context()
 names = [c["name"] for c in ctx.get_ciphers()]
@@ -268,8 +269,8 @@ if [ "$SKIP_SELFTEST" -eq 1 ]; then
     warn "skipping the self-test; nothing has checked that the build still
          reproduces the captured browsers' bytes."
 else
-    say "self-test: our bytes vs every capture in python/profiles"
-    ( cd "$ROOT/python" && "$PY" hpack_probe.py selftest \
+    say "self-test: our bytes vs every capture shipped in the package"
+    ( "$PY" -m mytls.hpack_probe selftest \
         --openssl "$PREFIX/bin/openssl" ${PROBE_PORT:+--port "$PROBE_PORT"} ) \
         || die "this build does NOT reproduce the captured bytes - see the diff
          above. Every line should read OK and the HPACK block should be
@@ -288,10 +289,10 @@ $(say "done")
 
   the byte-level self-test above ran offline. the remaining check needs
   network, and is the only one that proves a real server agrees with us:
-    cd python && "$PY" verify_fp.py            # h2 layer + header values
-    cd python && "$PY" verify_fp.py --resume   # TLS layer incl. the PSK ext
+    "$PY" -m mytls.verify_fp            # h2 layer + header values
+    "$PY" -m mytls.verify_fp --resume   # TLS layer incl. the PSK ext
 
   what is installed, and how to add a browser:
-    cd python && "$PY" hpack_probe.py list
-    cd python && "$PY" hpack_probe.py serve   # then point any browser at it
+    "$PY" -m mytls                      # are both layers actually live?
+    "$PY" -m mytls.hpack_probe serve    # then point any browser at it
 EOF

@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mytls"
+version = "0.1.0"
+description = "Browser-accurate TLS and HTTP/2 fingerprints for httpx"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "Apache-2.0" }
+
+# httpx is pinned, not ranged, on purpose: browser_fp subclasses httpcore's
+# HTTP2Connection and rebinds module attributes inside it. That is only correct
+# against the exact versions it was written for, and the modules check their own
+# versions at import and warn. A range here would turn a loud warning into a
+# silent behaviour change on somebody else's `pip install -U`.
+dependencies = [
+    "httpx[http2,socks]==0.27.2",
+    # Chrome advertises `accept-encoding: gzip, deflate, br, zstd`. Advertising
+    # an encoding that cannot then be decoded is both a broken client and a
+    # fingerprint of its own, so these are required rather than optional.
+    "brotli",
+    "zstandard",
+]
+
+[project.scripts]
+mytls-probe = "mytls.hpack_probe:main"
+mytls-verify = "mytls.verify_fp:main"
+
+[tool.setuptools.packages.find]
+include = ["mytls"]
+
+[tool.setuptools.package-data]
+# The captures are the package. Every value browser_fp reproduces is read out of
+# these at import time, so a wheel without them installs a library that knows no
+# browsers at all.
+mytls = ["profiles/*.json", "references/*.json"]

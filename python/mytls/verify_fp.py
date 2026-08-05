@@ -10,9 +10,9 @@ the probe refuses to issue session tickets, so a capture-time reference is
 normally fresh, and then --resume legitimately shows one extra extension
 (0029 pre_shared_key). Compare the run that matches the reference.
 
-    python verify_fp.py                     # TLS + the whole h2 layer + JA3
-    python verify_fp.py --resume            # TLS from a session-resumed handshake
-    python verify_fp.py --brand chrome      # pick a brand explicitly
+    mytls-verify                     # TLS + the whole h2 layer + JA3
+    mytls-verify --resume            # TLS from a session-resumed handshake
+    mytls-verify --brand chrome      # pick a brand explicitly
 """
 
 import argparse
@@ -20,13 +20,11 @@ import json
 import socket
 import ssl
 import sys
-
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+import httpx
 
-import browser_fp as fp  # noqa: E402
-import httpx  # noqa: E402
+from . import browser_fp as fp
 
 HERE = Path(__file__).resolve().parent
 

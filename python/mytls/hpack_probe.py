@@ -6,7 +6,7 @@ verbatim, before anything decodes it. Point a browser at it to capture that
 browser, then point our own client at it and compare.
 
     # wait for any browser at all
-    python hpack_probe.py serve
+    mytls-probe serve
 
     # Windows, fresh profile so no cookies/extensions get in the way
     chrome.exe --user-data-dir=%TEMP%\\cfp --ignore-certificate-errors ^
@@ -14,8 +14,8 @@ browser, then point our own client at it and compare.
 
     # that is all - it stored profiles/chrome.json and browser_fp now has a
     # "chrome" transport
-    python hpack_probe.py list
-    python hpack_probe.py selftest
+    mytls-probe list
+    mytls-probe selftest
 
 Which browser it was is read off the request it just sent, so nothing has to be
 named up front - point Chrome, Firefox or a phone at the address and each lands
@@ -25,7 +25,7 @@ again replaces profiles/chrome.json, and the version stays inside the capture.
 A phone reaches this machine over the LAN, so it needs an address that is not
 localhost, and a certificate that says so:
 
-    python hpack_probe.py serve --host 192.168.1.5
+    mytls-probe serve --host 192.168.1.5
 
 --host goes into the certificate's SAN and is printed as the URL to open. iOS
 Safari will offer to continue past the untrusted certificate; trusting it
@@ -34,10 +34,12 @@ properly (README) avoids the extra tap. Note that the address ends up in
 reproducible from that same address - `where` prints it and selftest says so
 when it cannot get there.
 
-The page we serve back then has the browser fetch tls.peet.ws and post the
-answer here, so the same visit also writes references/<brand>.json - what an
-independent fingerprinter made of that browser, which is the one thing our own
-parsing cannot check about itself. --no-reference skips it.
+The same visit also writes references/<brand>.json - ja3, ja4, peetprint and the
+akamai fingerprint of what just arrived. Those are computed here, from the bytes
+(see fingerprints.py), so capturing needs nothing but the browser opening the
+page. --peet additionally asks the browser to fetch tls.peet.ws and post the
+answer back, which is worth doing occasionally as an outside opinion but costs a
+manual copy-paste on any browser that enforces CORS - which is all of them.
 
 `selftest` does the whole loop in one process - stand up the server, drive our
 own client at it, compare byte for byte - which is what proves a fresh build
@@ -52,6 +54,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import hashlib
 import ipaddress
 import json
 import os
@@ -66,12 +69,14 @@ import time
 import typing
 from pathlib import Path
 
+from . import fingerprints
+
 HERE = Path(__file__).resolve().parent
 #: Kept in step with browser_fp.PROFILES_DIR, but spelled out here so capturing
 #: does not depend on httpx being importable.
 PROFILES_DIR = Path(os.environ.get("BROWSER_FP_PROFILES") or HERE / "profiles")
-#: The other half: what tls.peet.ws made of the same browser. Only verify_fp.py
-#: reads these, and only when checking against a live server.
+#: The fingerprints of the same capture - ours always, tls.peet.ws's when it was
+#: asked for. Only verify_fp.py reads these, and only against a live server.
 REFERENCES_DIR = Path(os.environ.get("BROWSER_FP_REFERENCES") or HERE / "references")
 #: Generated artefacts live outside the tree so nothing lands in git.
 WORK = Path(os.environ.get("HPACK_PROBE_DIR", Path.home() / ".cache/hpack_probe"))
@@ -461,6 +466,15 @@ class _Session:
         return self.deadline is not None and time.monotonic() > self.deadline
 
 
+def shape_of(ch: dict) -> str:
+    """One line describing a ClientHello, for connections that go no further."""
+    ext = {e["hex"]: e["length"] for e in ch["extensions"]}
+    sigalgs = ext.get("0x000d")
+    return (f"{len(ch['cipher_suites'])} ciphers, {len(ch['extensions'])} ext, "
+            f"sigalgs {sigalgs}B ({(sigalgs - 2) // 2 if sigalgs else '?'} algs), "
+            f"{len(ch['raw']) // 2}B total")
+
+
 def _serve_connection(raw: socket.socket, peer: tuple, ctx: ssl.SSLContext,
                       state: _Session) -> None:
     # Peek first: wrap_socket() would consume the ClientHello.
@@ -468,7 +482,13 @@ def _serve_connection(raw: socket.socket, peer: tuple, ctx: ssl.SSLContext,
     try:
         sock = ctx.wrap_socket(raw, server_side=True)
     except ssl.SSLError as exc:
-        state.note(f"  {peer[0]}: TLS failed ({exc.reason})")
+        # The ClientHello goes out before any certificate is validated, so a
+        # client that refuses our self-signed one has still told us everything
+        # about itself. Report it rather than throwing it away: a client that
+        # cannot be clicked through (an in-app WebView) is otherwise impossible
+        # to measure at all.
+        state.note(f"  {peer[0]}: TLS failed ({exc.reason})"
+                   + (f" - {shape_of(client_hello)}" if client_hello else ""))
         raw.close()
         return
 
@@ -575,8 +595,7 @@ def headers_of(record: dict) -> dict[str, str]:
 
 def brand_of(record: dict) -> str:
     """Which brand this capture is, according to the client's own user-agent."""
-    sys.path.insert(0, str(HERE))
-    import browser_fp
+    from . import browser_fp
 
     return browser_fp.brand_for(headers_of(record))
 
@@ -597,7 +616,7 @@ def serve(args: argparse.Namespace) -> int:
 
     # A path capture has nowhere to file a reference, and our own client cannot
     # run the page's javascript, so asking for one would only waste the timeout.
-    want_reference = not args.out and not args.no_reference
+    want_reference = args.peet and not args.out
 
     hosts = [h.strip() for h in (args.host or "").split(",") if h.strip()]
     detected = local_ipv4()
@@ -625,6 +644,11 @@ def serve(args: argparse.Namespace) -> int:
 
     record = capture(srv, ctx, want_reference=want_reference,
                      timeout=args.reference_timeout,
+                     # The page fetches /xhr-sample by itself, but the run has
+                     # to be told to stay up for it - otherwise it ends on the
+                     # navigation and the xhr half is lost. It arrives in
+                     # milliseconds; the timeout is only the giving-up point.
+                     want_xhr=True,
                      want_kinds=frozenset({"navigate", "cors"}) if args.both
                      else frozenset())
     srv.close()
@@ -664,30 +688,33 @@ def serve(args: argparse.Namespace) -> int:
               "extension our client never sends. Re-capture from a fresh "
               "browser profile (a new --user-data-dir).", file=sys.stderr)
 
-    if brand and reference:
+    if brand:
         ref_out = REFERENCES_DIR / f"{brand}.json"
         REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
         was = ref_out.exists()
         previous = json.loads(ref_out.read_text()) if was else {}
         if "tls" in previous:                 # the pre-container format
             previous = {"peet": previous}
-        merged = merge_reference(previous, reference, ua)
+        # Ours is recomputed from this capture every time; peet's half, which
+        # costs a browser round trip to collect, is carried over when this run
+        # did not ask for one.
+        merged = merge_reference(previous, reference or {}, ua)
+        merged["local"] = local_reference(record)
         ref_out.write_text(json.dumps(
             {"brand": brand, "collected_at": record["captured_at"], **merged},
             indent=2))
-        detail = [f"peet {peet_kind(e) or '?'} "
-                  f"ja4 {e.get('tls', {}).get('ja4', '?')}"
-                  for e in _as_list(merged.get("peet"))]
+        detail = [f"local ja4 {merged['local'].get('tls', {}).get('ja4', '?')}"]
+        detail += [f"peet {peet_kind(e) or '?'} "
+                   f"ja4 {e.get('tls', {}).get('ja4', '?')}"
+                   for e in _as_list(merged.get("peet"))]
         if merged.get("ja3zone"):
             detail.append(f"ja3 {merged['ja3zone'].get('hash', '?')}")
         print(f"  {'replaced' if was else 'stored as'} {ref_out}"
-              f"  ({'; '.join(detail) or 'empty'})")
-        if not merged.get("peet"):
-            print("  (no tls.peet.ws half: the xhr header template cannot be "
-                  "derived without it, and verify_fp.py has less to compare)")
-    elif want_reference:
-        print("  no reference at all - the browser reached neither service. "
-              "Everything except `verify_fp.py` still works.")
+              f"  ({'; '.join(detail)})")
+        if want_reference and not reference:
+            print("  no tls.peet.ws half this time - the browser reached "
+                  "neither service. Everything except the xhr header template "
+                  "and part of verify_fp.py still works.")
 
     summarise(record)
     if brand:
@@ -702,9 +729,8 @@ def report_profile(brand: str) -> None:
     afterwards - so the capture step is where you get to see the transport it
     produced.
     """
-    sys.path.insert(0, str(HERE))
     try:
-        import browser_fp
+        from . import browser_fp
         browser_fp.reload()
         print()
         print(browser_fp.describe(brand))
@@ -807,6 +833,27 @@ document.getElementById("d").onclick = () =>
     .then(() => say("done - you can close this tab"));
 </script>
 """ % {"peet": PEET_URL, "ja3": JA3_URL}).encode()
+
+#: Served instead of the above when the fingerprints are being computed here,
+#: which is the default. It still has one job: fire the same-origin /xhr-sample,
+#: because how a browser words an XHR cannot be derived from its navigation and
+#: no third party can measure it for us. Then it says so and finishes the run,
+#: so a capture is one page load with nothing to read and nothing to press.
+PAGE_LOCAL = b"""<!doctype html>
+<meta charset="utf-8"><title>hpack_probe</title>
+<style>body{font:14px/1.6 system-ui;margin:3em;max-width:46em}</style>
+<body>
+<p id="s">captured. one moment...</p>
+<script>
+const say = t => document.getElementById("s").textContent = t;
+// Sequenced, not fired and forgotten: /reference/done ends the run, and if it
+// won the race the xhr sample would be missing from the capture.
+fetch("/xhr-sample").catch(() => null)
+  .then(() => fetch("/reference/done", {method: "POST"}))
+  .then(() => say("done - you can close this tab"))
+  .catch(() => say("done"));
+</script>
+"""
 
 MAX_REFERENCE = 1 << 20
 #: Extra time granted once the page has told us its fetch was blocked and put a
@@ -951,14 +998,17 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
                         datetime.timezone.utc).replace(microsecond=0).isoformat(),
                     "peer": peer,
                 }
-                if state.claim_record(record) and not state.want_reference:
-                    send_response(sock, encoder, stream, b"200", b"text/plain", b"hi")
-                    if not state.want_xhr:
-                        return
-                else:
-                    send_response(sock, encoder, stream, b"200", b"text/html", PAGE)
+                won = state.claim_record(record)
+                # The page goes back either way: even when nothing is being
+                # collected from a third party, it is what makes the browser
+                # send the /xhr-sample. Our own client ignores the body.
+                send_response(sock, encoder, stream, b"200", b"text/html",
+                              PAGE if state.want_reference else PAGE_LOCAL)
+                if won and state.want_reference:
                     state.note(f"  waiting up to {state.timeout:.0f}s for the "
                                f"browser to fetch tls.peet.ws (keep the tab open)")
+                elif won and not state.want_xhr:
+                    return
 
             elif method == "POST" and path.startswith("/reference/done"):
                 send_response(sock, encoder, stream, b"200", b"text/plain", b"ok")
@@ -975,7 +1025,8 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
             elif method == "GET" and not path.startswith("/favicon"):
                 # Any connection serves the page: after clicking through the
                 # certificate warning the browser may retry on a fresh one.
-                send_response(sock, encoder, stream, b"200", b"text/html", PAGE)
+                send_response(sock, encoder, stream, b"200", b"text/html",
+                              PAGE if state.want_reference else PAGE_LOCAL)
 
             else:
                 send_response(sock, encoder, stream, b"404", b"text/plain", b"")
@@ -1028,9 +1079,9 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
     this a capture taken any way but by typing the address into a fresh tab
     could never be reproduced, which says nothing about the fingerprint.
     """
-    sys.path.insert(0, str(HERE))
-    import browser_fp
     import httpx
+
+    from . import browser_fp
 
     headers: dict[str, str] = {}
     if like is not None:
@@ -1070,7 +1121,10 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
 
 
 def client(args: argparse.Namespace) -> int:
-    run_client(f"{args.host}:{args.port}", args.brand)
+    # Empty rather than absent: it sends the /xhr-sample the way a browser's
+    # page would, with nothing captured to imitate. `serve` waits for that
+    # request, so without it every manual run would sit out the timeout.
+    run_client(f"{args.host}:{args.port}", args.brand, xhr={})
     print("done - check the server's output file")
     return 0
 
@@ -1118,6 +1172,28 @@ def akamai_fingerprint(rec: dict) -> str:
                  if k.startswith(":")) if headers else "",
     ]
     return "|".join(fields)
+
+
+def local_reference(record: dict) -> dict:
+    """Every fingerprint of a capture, computed here rather than asked of a service.
+
+    Shaped like one tls.peet.ws entry so the two sit side by side in the same
+    file and can be read against each other. What it cannot supply is peet's
+    independence - it is our parser checking our parser - so `--peet` still
+    exists and `verify_fp.py` still goes over the network.
+    """
+    out: dict = {}
+    raw = (record.get("client_hello") or {}).get("raw")
+    if raw:
+        out["tls"] = fingerprints.of_client_hello(raw)
+    akamai = akamai_fingerprint(record)
+    out["http2"] = {
+        "akamai_fingerprint": akamai,
+        # md5 to match what every service reporting this value publishes.
+        "akamai_fingerprint_hash": hashlib.md5(
+            akamai.encode(), usedforsecurity=False).hexdigest(),
+    }
+    return out
 
 
 def diff_h2(a: dict, b: dict, na: str, nb: str) -> bool:
@@ -1510,8 +1586,7 @@ def selftest(args: argparse.Namespace) -> int:
 
 
 def list_profiles(_args: argparse.Namespace) -> int:
-    sys.path.insert(0, str(HERE))
-    import browser_fp
+    from . import browser_fp
     print(browser_fp.catalog())
     return 0
 
@@ -1528,9 +1603,11 @@ def main() -> int:
                                    "version in the name)")
     s.add_argument("--out", help="store at this path instead, without "
                                  "registering it as a brand")
-    s.add_argument("--no-reference", action="store_true",
-                   help="do not ask the browser to fetch tls.peet.ws; capture "
-                        "the raw bytes only (offline machines)")
+    s.add_argument("--peet", action="store_true",
+                   help="also ask the browser to fetch tls.peet.ws and post the "
+                        "answer back, as an outside opinion on what we compute "
+                        "ourselves. Costs a manual copy-paste (peet sends no "
+                        "CORS headers) and needs internet on the phone")
     s.add_argument("--both", action="store_true",
                    help="wait for both the XHR and the navigation variant of "
                         "the reference; the page's own fetch gives the first, "

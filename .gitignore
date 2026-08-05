@@ -8,7 +8,10 @@
 *.so
 *.ld
 *-test
-# python/ 下的抓包产物与自签证书（references/ 里的基准要保留）
+# python/ 下的抓包产物与自签证书（mytls/references/ 里的基准要保留）
 python/*.json
-python/__pycache__/
 python/*.pem
+__pycache__/
+python/build/
+python/dist/
+python/*.egg-info/

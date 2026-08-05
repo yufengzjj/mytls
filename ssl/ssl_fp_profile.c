@@ -46,6 +46,29 @@ static const uint16_t chrome_sigalgs[] = {
 };
 
 /*
+ * Chrome 149 on Android. It differs from the desktop capture in exactly one
+ * place - the three ML-DSA codepoints are absent - and in nothing else: same
+ * fifteen cipher suites, same sixteen extensions, same groups including the
+ * hybrid, same versions, same brotli. The HTTP/2 layer is identical too, down
+ * to the akamai hash.
+ *
+ * Whether that difference belongs to the platform or to the version is not
+ * established: the desktop capture is Chrome 140 and this one Chrome 149, so
+ * the two are confounded. Settling it would need a Chrome 149 desktop capture.
+ * What is written here is the capture, not a theory about its cause.
+ */
+static const uint16_t chrome_android_sigalgs[] = {
+    TLSEXT_SIGALG_ecdsa_secp256r1_sha256,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha256,
+    TLSEXT_SIGALG_rsa_pkcs1_sha256,
+    TLSEXT_SIGALG_ecdsa_secp384r1_sha384,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha384,
+    TLSEXT_SIGALG_rsa_pkcs1_sha384,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha512,
+    TLSEXT_SIGALG_rsa_pkcs1_sha512
+};
+
+/*
  * The same list from Safari 604.1 on iOS 18.5, read out of the raw
  * ClientHello. rsa_pss_rsae_sha384 genuinely appears twice - both the capture
  * and tls.peet.ws agree - so it is written twice here. Removing the duplicate
@@ -156,6 +179,22 @@ static const SSL_FP_PROFILE fp_profile_chrome = {
 };
 
 /*
+ * Everything but the signature algorithms is shared with the desktop profile,
+ * deliberately by reference rather than by copy: the two came from the same
+ * Chromium, and a later capture that changes one of these lists should not
+ * leave the other silently stale.
+ */
+static const SSL_FP_PROFILE fp_profile_chrome_android = {
+    "chrome_android",
+    chrome_android_sigalgs, OSSL_NELEM(chrome_android_sigalgs),
+    chrome_versions, OSSL_NELEM(chrome_versions),
+    chrome_cert_comp, OSSL_NELEM(chrome_cert_comp),
+    2,
+    chrome_groups, tls13_ciphers_common, chrome_ciphers,
+    SSL_FP_SHUFFLE_EXTS | SSL_FP_ALPS | SSL_FP_ECH_GREASE | SSL_FP_EMPTY_TICKET
+};
+
+/*
  * Safari 604.1 on iOS 18.5. It offers none of the four flags: no shuffling
  * (its extension order is fixed, so its JA3 is stable), no ALPS, no GREASE
  * ECH, and no empty session_ticket.
@@ -179,6 +218,7 @@ static const SSL_FP_PROFILE *const fp_profile_default = &fp_profile_chrome;
 
 static const SSL_FP_PROFILE *const fp_profiles[] = {
     &fp_profile_chrome,
+    &fp_profile_chrome_android,
     &fp_profile_safari_ios
 };
 

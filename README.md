@@ -14,8 +14,8 @@ algorithms, how many key_share entries to send, plus a few switches (whether to 
 the extension order, and whether to send ALPS, a GREASE ECH, an empty session_ticket, or
 padding).
 
-`ssl/ssl_fp_profile.c` is the only file that spells any of this out. Two are built in:
-`chrome` and `safari_ios`.
+`ssl/ssl_fp_profile.c` is the only file that spells any of this out. Three are built in:
+`chrome`, `chrome_android` and `safari_ios`.
 
 ```c
 int         SSL_CTX_set_fp_profile(SSL_CTX *ctx, const char *name);
@@ -50,16 +50,20 @@ An unknown name is an error, not a silent fallback.
 From Python:
 
 ```python
-import sys; sys.path.insert(0, "python")
-import browser_fp as fp
 import httpx
+import mytls
 
-with httpx.Client(transport=fp.Transport("safari_ios")) as client:
+with httpx.Client(transport=mytls.Transport("safari_ios")) as client:
     r = client.get("https://example.com/")
 ```
 
 That one line configures both the TLS layer and the HTTP/2 layer. To set only the TLS
-layer, use `python/tls_profile.py`.
+layer, use `mytls.tls_profile`.
+
+The Python side is a package — `pip install ./python` — so other projects can use it
+without carrying this repository around. **But it is only half the machine**: the
+HTTP/2 half is pure Python and works anywhere, the TLS half is built inside OpenSSL and
+needs a CPython linked against this fork. `python -m mytls` says which halves are live.
 
 **For the details, the tunables, and how to add a profile, see
 [python/README.md](python/README.md).**
@@ -109,8 +113,8 @@ LDFLAGS="-L$MYTLS/lib -Wl,-rpath,$MYTLS/lib" \
 MAKE_OPTS="-j$(nproc)" \
 pyenv install 3.11.15
 
-# 4. packages
-pip install "httpx[http2,socks]==0.27.2" brotli zstandard
+# 4. the Python side, which pulls its own pinned dependencies
+pip install ./python          # or -e ./python to work on it in place
 ```
 
 All three Configure options are required by the profiles:
@@ -122,16 +126,23 @@ All three Configure options are required by the profiles:
 * **`--openssldir=/etc/ssl`** — so `ssl.create_default_context()` finds the root
   certificates.
 
-**httpx is pinned to 0.27.2**: `browser_fp` subclasses httpcore internals, and a different
-version warns.
+**httpx is pinned to 0.27.2** in the package metadata: `browser_fp` subclasses httpcore
+internals, so a range there would turn a loud warning into a silent behaviour change on
+somebody else's `pip install -U`.
 
 Check the result:
 
 ```bash
-python -c "import ssl; print(ssl.OPENSSL_VERSION)"   # OpenSSL 3.4.0
-python python/tls_profile.py                         # tls profiles: chrome, safari_ios
-python python/hpack_probe.py list                    # which profiles are installed
+python -m mytls        # both halves, in one line, plus the installed profiles
 ```
+
+```
+both layers ready - TLS profiles chrome, chrome_android, safari_ios
+(OpenSSL 3.4.0); HTTP/2 profiles chrome, chrome_android, safari_ios.
+```
+
+Anything other than `both layers ready` means the Python being used is not linked against
+this fork, and every ClientHello it sends will be Python's own.
 
 ---
 
@@ -140,9 +151,8 @@ python python/hpack_probe.py list                    # which profiles are instal
 ### Offline self-test
 
 ```bash
-cd python
-python hpack_probe.py selftest                  # every profile
-python hpack_probe.py selftest --brand chrome   # just one
+mytls-probe selftest                  # every profile
+mytls-probe selftest --brand chrome   # just one
 ```
 
 Stands up a server and drives our own client at it inside one process, then compares the
@@ -153,14 +163,15 @@ worked".
 ```
 === summary ===
   chrome           PASS
+  chrome_android   PASS
   safari_ios       PASS
 ```
 
 ### Online check
 
 ```bash
-python verify_fp.py --brand safari_ios
-python verify_fp.py --brand chrome
+mytls-verify --brand safari_ios
+mytls-verify --brand chrome
 ```
 
 Compares against what a third-party service makes of us. The self-test only measures our
@@ -191,7 +202,7 @@ the profile work was checked that way and the failing set came out identical.
 |---|---|
 | `ssl/ssl_fp_profile.c` | the profile table — the only place a profile's parameters are written down |
 | `ssl/ssl_grease.c` | GREASE values and extension-order randomisation |
-| `python/` | the HTTP/2 layer, plus the capture and verification tools — see [python/README.md](python/README.md) |
+| `python/` | the `mytls` package: the HTTP/2 layer, the browser captures, and the capture and verification tools — see [python/README.md](python/README.md) |
 | `install-python.sh` | installs everything from scratch |
 
 ---

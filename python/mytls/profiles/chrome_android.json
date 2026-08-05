@@ -1,0 +1,263 @@
+{
+  "brand": "chrome_android",
+  "frames": [
+    {
+      "type": "SETTINGS",
+      "flags": 0,
+      "stream": 0,
+      "length": 24,
+      "settings": [
+        {
+          "id": 1,
+          "name": "HEADER_TABLE_SIZE",
+          "value": 65536
+        },
+        {
+          "id": 2,
+          "name": "ENABLE_PUSH",
+          "value": 0
+        },
+        {
+          "id": 4,
+          "name": "INITIAL_WINDOW_SIZE",
+          "value": 6291456
+        },
+        {
+          "id": 6,
+          "name": "MAX_HEADER_LIST_SIZE",
+          "value": 262144
+        }
+      ]
+    },
+    {
+      "type": "WINDOW_UPDATE",
+      "flags": 0,
+      "stream": 0,
+      "length": 4,
+      "increment": 15663105
+    },
+    {
+      "type": "HEADERS",
+      "flags": 37,
+      "stream": 1,
+      "length": 477,
+      "priority": {
+        "exclusive": true,
+        "depends_on": 0,
+        "weight": 256
+      },
+      "header_block": "8241910be2582e3cb056757a8d5ae63dc79a699f87048660759981d14740874148b1275ad1ffb9fe711cf350552f4f61e92ff3f7de0fe42d3ffcfd29fcde9ec3d26b69fe7efbc1fc85a7ff9fa53f9d274ff70fdddb07549fcfdf783f9135fcff408b4148b1275ad1ad49e33505023f31408d4148b1275ad1ad5d034ca7b29f88fe61aa4b0e693f9f4092b6b9ac1c8558d520a4b6c2ad617b5a54251f01317ad5d07f66a281b0dae053face6aadf3f6a4354961cd228107da99bfb521aeba0bc8b1e632586d975765c53facd8f7e8cff4a506ea5531149d4ffda97a7b0f49580b4fae05c0b814d078cd4154dc394761986d975765cf53e5497ca589d34d1f43aeba0c41a4c7a98f33a69a3fdf9a68fa1d75d0620d263d4c79a68fbed00177fe8d48e62b03ee697e8d48e62b1e0b1d7f46a4731581d754df5f2c7cfdf6800bbdf43aeba0c41a4c7a9841a6a8b22c5f249c754c5fbef046cfdf6800bbbf408a4148b4a549275906497f83a8f517408a4148b4a549275a93c85f86a87dcd30d25f408a4148b4a549275ad416cf023f31408a4148b4a549275a42a13f8690e4b692d49f50929bd9abfa5242cb40d25fa523b3e94f684c9f5193f73ad7b4fd7b9fefb4005dffa2d5f7da002ef74086aec31ec327d785b6007d286f"
+    }
+  ],
+  "client_hello": {
+    "record_version": "0x0301",
+    "legacy_version": "0x0303",
+    "session_id_len": 32,
+    "cipher_suites": [
+      "0x9a9a",
+      "0x1301",
+      "0x1302",
+      "0x1303",
+      "0xc02b",
+      "0xc02f",
+      "0xc02c",
+      "0xc030",
+      "0xcca9",
+      "0xcca8",
+      "0xc013",
+      "0xc014",
+      "0x009c",
+      "0x009d",
+      "0x002f",
+      "0x0035"
+    ],
+    "extensions": [
+      {
+        "type": 35466,
+        "hex": "0x8a8a",
+        "length": 0,
+        "grease": true,
+        "body": ""
+      },
+      {
+        "type": 65037,
+        "hex": "0xfe0d",
+        "length": 250,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 13,
+        "hex": "0x000d",
+        "length": 18,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 43,
+        "hex": "0x002b",
+        "length": 7,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 5,
+        "hex": "0x0005",
+        "length": 5,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 65281,
+        "hex": "0xff01",
+        "length": 1,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 17613,
+        "hex": "0x44cd",
+        "length": 5,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 51,
+        "hex": "0x0033",
+        "length": 1263,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 35,
+        "hex": "0x0023",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 27,
+        "hex": "0x001b",
+        "length": 3,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 45,
+        "hex": "0x002d",
+        "length": 2,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 11,
+        "hex": "0x000b",
+        "length": 2,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 0,
+        "hex": "0x0000",
+        "length": 23,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 16,
+        "hex": "0x0010",
+        "length": 14,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 23,
+        "hex": "0x0017",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 18,
+        "hex": "0x0012",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 10,
+        "hex": "0x000a",
+        "length": 12,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 14906,
+        "hex": "0x3a3a",
+        "length": 1,
+        "grease": true,
+        "body": "00"
+      }
+    ],
+    "raw": "16030106fb010006f70303e69b30a5e8ce56e95afb55322e74eefbd6009c3b72dc1b1c3ffe518bc180342a20d25b525968b3a862450e2a02ef13d7d741fbe44a2e048918fa3c5ac5e80b217800209a9a130113021303c02bc02fc02cc030cca9cca8c013c014009c009d002f00350100068e8a8a0000fe0d00fa000001000117002040842ed8cbbf6a2d981acfbc7fdfe036ee781d51f975d34b09bf6a5db79c355a00d0c63247d9a78bb641a0cdb3921b53bd8327fdd24e60d07e5c3cdad900f63d84a74f8fe76bd04205c491ace2cbdca20a60e388b1d3627629bacb0968e8c5396cba0531df2c18927f142048f45df93796a05ca0d6ae51371cb01f4039128b53511df63789c5348f2107759adf1cb8d82730d9eca47ee13edf8e92baafa1299a6106db65b539ee7676a622c2e00fd91605fe4169bc994f274c36538bf3e905c33d0dcbda7c30c6be7e086223fd5ca0736e313569c6794117c2555398512adca762d68738f398aed94691379a08e8186e1bbb000d0012001004030804040105030805050108060601002b000706eaea03040303000500050100000000ff0100010044cd00050003026832003304ef04ed3a3a00010011ec04c0f1a17e7a942e0039883aa2bf02c28b92f6c7e04707085158ff582f0361440ea94294a46165c55506e58112211ec4fc7474e423b19271c9045817773c377a2f6696bea53cb0dc81250d279703e9b64da373d827355fb5ca6147084a359848b86c0e136a52e341bd017f371411d5619a09aa3c1790ac4ea4a4d963cbaf8c786ba21a6ba72fa4102225d3879106b3949b0044124f6ed778333cafadf75b045aa811629af8950d5fc02ab2e2b72c9804e378936f37a67cb91a94b1cc9fdc0d1cd12a2e0697f0140956848f925a1206004746e45e9f32895eb84e9fa26dc9229bbae96102442385eab944469fa45702cbe451a341c6cb77c4547708264b9c777982aa70af7b3b59f5d3ca219446c7b39359e153a5c469bfb81a008856dfc29928661fb5a6853c383a5697b0c4423fc0fc61a5e8ab38483deb61b96cd82f292c07deeb9a4c2b1732d91540e03406866b4c239a6512b8cdc67c0e612fd5d57141d43a26830b15c21da87189f2d55451bbbc8e01bd9974c55b67c278972228bb855c0083e69304317aa07fd40e71705fe253a51ee14df44aa95e9b46da158e59f1c3aca56ad9778da5094ab3e71d1c4921d0d848f610b75dfc0ec77b1139a95d1949be4fbb4901c329ad31958d89b88b8180bb09576ac345bcfc935a676a310c2de281b319f7a84695317e116cba32ce2d36ac665baf48274173d84dfe8a2ad434bdd0fb6e5bbb81c1caa79b2b7e4fba57cc690c9f0b6ef72b2b45856f93fc84bba1b66fcc6fe4a17dbc5c7c1fa8419350b770bbc13f0c229d891e800932990456a6f38f299c366d175a3edc5dd32314638526232a5058a99b970266415b7a6f70ab8b97a17c1196fbc03acf326ace213ab387b621440d1eb8507f44c97fd6525dfcbdd8e7a2535b5dac9ca9c86acd798a9cccb280a20a7511023659296f7ad5ca719bcee537217ed7cd6e706f19b63c3c7176d349a6e2a349b1f68ccd6b6c18d048fecb4741b4b12bc3481235c040744de8098a2fc299e192a1309c2cb33876c1d51a66990c3955b5e159223f6acc796357e3f3bc4932372506315f5a844c72b09748c13a98530d532b5c73b6b6d7191cc9a2492b0cdbb366bec5268ae86aa0a46df0652df5110f9e240c11501ab6ec72eb0a1f0000051e9aa914e2c4acc77c1fc37b0cf9a6f11a74bb763eb9a5553d073191368b02f20d38056d63a33f22516254c7960d020821d3afecb5c7e940156dec12cde956c066ab7cb68a5a0109f7b4995cc446515974c5f38d4ea17091d43bb28a8c14f8ad3ea4364dd5c0bef146e676bdfd18a2df8050b9450934b79d2f7620e64796edc73c8ef5ad1cd37c16a8b89e616a35a4c98ce9ca84ca3211ebb541271a002b7c09f3ce0fb5b1c380711d714f57005c8fa52b277c3913b55961e94dea152542c34a23aa173e7bb4af41a64c81928203561ea3c936b5aec3528e33282d301281ed50ba730986403ca7d1f23e61e56851f56a87d11b56e0ba7709523db2b735b0a2aa3ac42edbad9127c89a16caf741c68f0948e45a7eaec53fce880d1f8304cd41868e7cccc4e1bb2dda3b83d80a7ec991c15c492a8532e0e29e5aeb440605a0aaa358a3179313809c6230885798b373ecb667d054b8b4383f260880e2f6018978d659549664b086aa9a718c7333b00b2364f0a82a69e2a8823ad99db75e051a3aae6f72b5b8319d47091993ccf57e001d0020f791098b00fecb79c3e2521b98d68e2dde863b70ca05ccc8b4b602f19564374700230000001b0003020002002d00020101000b000201000000001700150000123139322d3136382d312d372e6e69702e696f0010000e000c02683208687474702f312e310017000000120000000a000c000a3a3a11ec001d001700183a3a000100"
+  },
+  "captured_at": "2026-08-05T04:14:39+00:00",
+  "xhr": {
+    "header_block": "82cb87048863ccf62c81d35d05c8c6cac953032a2f2a7f068840e92ac7b0d31aaf7f068321ec477f05842d35a7d7739c9d29ad1718602f8960b8f2c159d5ea356b98f71e69a6581d66607451c5c47f0485b600fd286f",
+    "priority": {
+      "exclusive": true,
+      "depends_on": 0,
+      "weight": 220
+    },
+    "headers": [
+      [
+        "sec-ch-ua-platform",
+        "\"Android\""
+      ],
+      [
+        "user-agent",
+        "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Mobile Safari/537.36"
+      ],
+      [
+        "sec-ch-ua",
+        "\"Google Chrome\";v=\"149\", \"Chromium\";v=\"149\", \"Not)A;Brand\";v=\"24\""
+      ],
+      [
+        "sec-ch-ua-mobile",
+        "?1"
+      ],
+      [
+        "accept",
+        "*/*"
+      ],
+      [
+        "sec-fetch-site",
+        "same-origin"
+      ],
+      [
+        "sec-fetch-mode",
+        "cors"
+      ],
+      [
+        "sec-fetch-dest",
+        "empty"
+      ],
+      [
+        "referer",
+        "https://192-168-1-7.nip.io:8443/api/all"
+      ],
+      [
+        "accept-encoding",
+        "gzip, deflate, br, zstd"
+      ],
+      [
+        "accept-language",
+        "zh-CN,zh;q=0.9,en;q=0.8"
+      ],
+      [
+        "priority",
+        "u=1, i"
+      ]
+    ]
+  }
+}

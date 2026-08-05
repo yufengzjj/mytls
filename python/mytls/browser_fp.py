@@ -11,8 +11,8 @@ which is nothing like a browser and gives the game away.  This module provides
 transports that send a captured browser's values instead, and replace the
 request headers with that browser's set, in its order.
 
-    import browser_fp as fp
     import httpx
+    import mytls
 
     with httpx.Client(transport=fp.transport("chrome")) as client:
         client.get("https://example.com/")
@@ -26,7 +26,7 @@ Nothing here is hand-maintained and nothing here is written for a particular
 browser.  Every profile is a capture taken with hpack_probe.py and dropped into
 PROFILES_DIR:
 
-    python hpack_probe.py serve --brand firefox   # capture it
+    mytls-probe serve --brand firefox   # capture it
     fp.PROFILES                                   # it is already there
     fp.transport("firefox")                       # and already usable
     fp.FirefoxTransport()                         # same thing, by name
@@ -77,7 +77,6 @@ import json
 import os
 import re
 import ssl
-import sys
 import typing
 import warnings
 from pathlib import Path
@@ -91,11 +90,7 @@ import httpcore._sync.http2 as _sync_mod
 import httpx
 import httpx._client
 
-# Sibling module, not a package - importing browser_fp from anywhere should not
-# also require putting its directory on the path by hand.
-if str(Path(__file__).resolve().parent) not in sys.path:
-    sys.path.append(str(Path(__file__).resolve().parent))
-import tls_profile  # noqa: E402
+from . import tls_profile
 
 __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
            "Transport", "AsyncTransport", "transport", "async_transport",
@@ -105,7 +100,7 @@ __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
 _EXPECTED = {"httpx": "0.27.2", "httpcore": "1.0.9", "h2": "4.4.0"}
 
 #: One capture per brand, named `<brand>.json`. Written by
-#: `hpack_probe.py serve --brand <brand>`; set BROWSER_FP_PROFILES to try a
+#: `mytls-probe serve --brand <brand>`; set BROWSER_FP_PROFILES to try a
 #: directory of captures out before committing them.
 PROFILES_DIR = Path(
     os.environ.get("BROWSER_FP_PROFILES")
@@ -493,7 +488,7 @@ def reload() -> dict[str, Profile]:
         warnings.warn(
             f"browser_fp: {PROFILES_DIR} does not exist, so no browser profiles "
             f"are installed; capture one with "
-            f"`python hpack_probe.py serve --brand <name>`",
+            f"`mytls-probe serve --brand <name>`",
             RuntimeWarning, stacklevel=2)
         return PROFILES
 
@@ -532,7 +527,7 @@ def profile(brand: str | None = None) -> Profile:
             return next(iter(PROFILES.values()))
         if not PROFILES:
             msg = (f"no browser profiles in {PROFILES_DIR}; capture one with "
-                   f"`python hpack_probe.py serve --brand <name>`")
+                   f"`mytls-probe serve --brand <name>`")
             raise LookupError(msg)
         msg = (f"several profiles are installed ({', '.join(brands())}) and no "
                f"default is set, so the brand has to be named: "
@@ -1175,7 +1170,7 @@ def _apply_tls_profile(transport: typing.Any, prof: Profile) -> str | None:
 class Transport(httpx.HTTPTransport):
     """An httpx transport whose HTTP/2 layer looks like a captured browser's.
 
-        import browser_fp as fp, httpx
+        import httpx, mytls
 
         with httpx.Client(transport=fp.Transport("chrome")) as client:
             client.get("https://example.com/")
@@ -1312,7 +1307,7 @@ def catalog() -> str:
     """One line per installed profile."""
     if not PROFILES:
         return (f"no browser profiles in {PROFILES_DIR} - capture one with "
-                f"`python hpack_probe.py serve --brand <name>`")
+                f"`mytls-probe serve --brand <name>`")
     width = max(len(b) for b in PROFILES)
     lines = [f"{len(PROFILES)} profile(s) in {PROFILES_DIR}:"]
     for brand in brands():
