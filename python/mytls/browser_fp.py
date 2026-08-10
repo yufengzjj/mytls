@@ -8,14 +8,27 @@ order.  Out of the box httpcore sends
     1:4096;2:0;4:65535;5:16384;3:100;6:65536|16777216|0|m,a,s,p
 
 which is nothing like a browser and gives the game away.  This module provides
-transports that send a captured browser's values instead, and replace the
-request headers with that browser's set, in its order.
+transports that send a captured browser's values instead, and put the request
+headers in that browser's order.
+
+**The order, not the values.**  A transport sets nothing a caller could set
+themselves: no user-agent, no accept, no accept-language, no sec-ch-ua.  Those
+are the caller's to supply, and a header goes on the wire only if they did -
+`client.get(url)` with no headers sends the four pseudo-headers and nothing
+else.  What the transport does impose is everything httpx gives no way to
+reach: where each header sits, the pseudo-header order, the HPACK encoding,
+the SETTINGS, the WINDOW_UPDATE, the HEADERS priority and the TLS layer.
 
     import httpx
     import mytls
 
     with httpx.Client(transport=fp.transport("chrome")) as client:
-        client.get("https://example.com/")
+        client.get("https://example.com/", headers={"User-Agent": ...})
+
+To send what the captured browser sent, ask for it - `headers=` on the
+transport is the caller speaking, so it is applied to every request:
+
+    fp.Transport("chrome", headers=fp.profile("chrome").headers)
 
 Importing has no effect on its own: only clients given one of these transports
 behave differently, so a library can use this without changing how the rest of
@@ -72,6 +85,7 @@ exact versions it was written for, so it checks them and warns.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -99,20 +113,17 @@ __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
 
 _EXPECTED = {"httpx": "0.27.2", "httpcore": "1.0.9", "h2": "4.4.0"}
 
+#: Default for `priority_override` / `Transport(priority=...)`: whatever the
+#: capture did. A distinct sentinel rather than None, because None is a
+#: meaningful value there - "send no priority at all".
+FROM_CAPTURE = "capture"
+
 #: One capture per brand, named `<brand>.json`. Written by
 #: `mytls-probe serve --brand <brand>`; set BROWSER_FP_PROFILES to try a
 #: directory of captures out before committing them.
 PROFILES_DIR = Path(
     os.environ.get("BROWSER_FP_PROFILES")
     or Path(__file__).resolve().parent / "profiles")
-
-#: Optional second half of a capture: what independent fingerprinters made of
-#: the same browser, collected in the same visit. Used for two things a local
-#: probe cannot see - a request that carries a `referer` and one that is an
-#: XHR - so it is what the header templates' *order* is derived from.
-REFERENCES_DIR = Path(
-    os.environ.get("BROWSER_FP_REFERENCES")
-    or Path(__file__).resolve().parent / "references")
 
 #: Which brand the no-argument forms use. Falls back to the only installed
 #: profile; with several installed and no BROWSER_FP_BRAND set, the brand has to
@@ -166,9 +177,22 @@ def _read_capture(path: Path) -> dict:
         "priority": headers_frame.get("priority"),
         "priority_frames": sum(1 for f in frames if f["type"] == "PRIORITY"),
         "captured_at": data.get("captured_at"),
+        # Whether the captured ClientHello offered a session_ticket extension.
+        # The only TLS detail read here, because it is the only one the caller
+        # can override - see Profile.session_ticket_override. None means the
+        # capture has no ClientHello to read it from.
+        "session_ticket": _captured_session_ticket(data.get("client_hello")),
         # Present only when the probe caught the page's own fetch; see Profile.
         **({"xhr": data["xhr"]} if "xhr" in data else {}),
     }
+
+
+def _captured_session_ticket(client_hello: dict | None) -> bool | None:
+    """Did this ClientHello carry extension 0x0023, empty or otherwise?"""
+    if not client_hello or "extensions" not in client_hello:
+        return None
+    return any(ext.get("type") == 0x0023
+               for ext in client_hello["extensions"])
 
 
 _PSEUDO_DEFAULT = (":method", ":authority", ":scheme", ":path")
@@ -176,37 +200,6 @@ _PSEUDO_DEFAULT = (":method", ":authority", ":scheme", ":path")
 #: sec-fetch-mode as the browser reports it -> which of our templates it is.
 _MODE_TO_KIND = {"navigate": "navigate", "cors": "xhr"}
 
-
-def _read_reference(path: Path) -> dict:
-    """Header order and HEADERS priority per kind, read out of a reference.
-
-    A capture taken against our own probe can only ever be a first-party
-    navigation with no cookies and no referer, so it cannot say where those go -
-    and a request whose `sec-fetch-mode` is `cors` never reaches it at all. The
-    reference is a request the same browser made to a real site, so it answers
-    both. Only the *order* and the priority are taken from here; the values
-    still come from the capture, because they belong to that other site.
-    """
-    data = json.loads(path.read_text())
-    # One entry per kind of request, oldest formats first: a bare tls.peet.ws
-    # response, then a single one under "peet", now a list of them.
-    entries = data if "tls" in data else data.get("peet")
-    if isinstance(entries, dict) or entries is None:
-        entries = [entries] if entries else []
-
-    out: dict[str, dict] = {}
-    for entry in entries:
-        for frame in (entry or {}).get("http2", {}).get("sent_frames", []):
-            if frame.get("frame_type") != "HEADERS":
-                continue
-            pairs = [tuple(h.split(": ", 1)) for h in frame.get("headers", [])
-                     if ": " in h]
-            headers = [(k, v) for k, v in pairs if not k.startswith(":")]
-            kind = _MODE_TO_KIND.get(dict(headers).get("sec-fetch-mode", ""))
-            if kind is None or kind in out:
-                continue
-            out[kind] = {"headers": headers, "priority": frame.get("priority")}
-    return out
 
 #: Product tokens in the order they have to be tested: every Chromium fork keeps
 #: `Chrome/x` in its user-agent and adds its own token, and everything with a
@@ -276,12 +269,18 @@ def _platform(headers: dict[str, str], user_agent: str) -> str:
 #: guessed from the user-agent and overridable per capture with
 #: `{"meta": {"hpack": "..."}}`.  A wrong guess costs nothing but a failing
 #: byte-level self-test, which is exactly where it should show up.
-_HPACK_ENGINES = ("quiche", "stock")
+_HPACK_ENGINES = ("quiche", "cfnetwork", "stock")
 
 
-def _hpack_engine(meta: dict, browser: str) -> str:
+def _hpack_engine(meta: dict, browser: str, platform: str = "") -> str:
     engine = meta.get("hpack")
     if engine is None:
+        # Apple's stack first: it is decided by the OS and not by the client,
+        # so the user-agent is no guide at all - a WhatsApp capture and a
+        # Safari capture off one iPhone encode identically and share nothing
+        # in their product tokens.
+        if platform == "iOS":
+            return "cfnetwork"
         # Every Chromium fork ships quiche; nothing else does.
         return "quiche" if browser not in ("Firefox", "unknown") else "stock"
     if engine not in _HPACK_ENGINES:
@@ -293,35 +292,28 @@ def _hpack_engine(meta: dict, browser: str) -> str:
 class Profile:
     """One captured browser: its wire behaviour and the metadata that goes with it.
 
-    Read-only as far as the capture goes.  The three attributes that are *not*
-    part of the capture - `header_profile`, `accept_language` and
-    `send_cache_control` - are knobs, because they depend on what the user is
+    Read-only as far as the capture goes.  The two attributes that are *not*
+    part of the capture - `header_profile` and `default_headers` - are knobs,
+    because they depend on what the user is
     doing rather than on which browser they are pretending to be.  Changing one
     affects every transport built from this profile, live connections included.
     """
 
-    def __init__(self, cap: dict, source: str, reference: dict | None = None) -> None:
+    def __init__(self, cap: dict, source: str) -> None:
         self.brand: str = cap["brand"]
         self.source = source
         self.captured_at: str | None = cap["captured_at"]
 
-        #: {kind: {"headers": [...], "priority": {...}}} from REFERENCES_DIR, or
-        #: {} when this brand has no reference - then the templates fall back to
-        #: what can be worked out from the capture alone.
-        self.reference: dict[str, dict] = dict(reference or {})
-
-        #: The capture's own /xhr-sample request, if the probe caught one. A
-        #: same-origin GET the probe's page issued, so unlike the peet half it
-        #: needs no third party and no CORS - which is the only way to measure
-        #: the xhr template on a browser that cannot be told to allow it (any
-        #: iOS Safari). A peet entry still wins: it is a request to somebody
-        #: else's site, which is what the template is for.
-        if "xhr" in cap and "xhr" not in self.reference:
-            self.reference["xhr"] = {
-                "headers": [tuple(h) for h in cap["xhr"]["headers"]],
-                "priority": cap["xhr"].get("priority"),
-                "from": "capture",
-            }
+        #: {kind: the HEADERS-frame priority that request carried, or None}.
+        #: Read straight out of the capture - `navigate` from its first HEADERS
+        #: frame, `xhr` from the page's own /xhr-sample if the probe caught
+        #: one. Nothing else is stored per brand any more; what an outside
+        #: service made of the same browser is asked live, by verify_fp.
+        self.captured_priorities: dict[str, dict | None] = {
+            "navigate": dict(cap["priority"]) if cap["priority"] else None,
+            "xhr": (dict(cap["xhr"]["priority"])
+                    if cap.get("xhr") and cap["xhr"].get("priority") else None),
+        }
 
         #: Request headers as captured, pseudo-headers excluded, in wire order.
         self.headers: list[tuple[str, str]] = list(cap["headers"])
@@ -330,7 +322,13 @@ class Profile:
         self.user_agent = self.header_map.get("user-agent", "")
         self.browser, self.version = _product(self.user_agent)
         self.platform = _platform(self.header_map, self.user_agent)
-        self.hpack = _hpack_engine(cap["meta"], self.browser)
+        self.hpack = _hpack_engine(cap["meta"], self.browser, self.platform)
+
+        #: Whether the captured ClientHello offered a session_ticket extension,
+        #: or None if the capture had no ClientHello. Reference data, like
+        #: `captured_priority()` - what the transport actually sends is
+        #: `session_ticket_override` and the OpenSSL profile behind it.
+        self.captured_session_ticket: bool | None = cap.get("session_ticket")
 
         #: Which OpenSSL fingerprint profile this brand's ClientHello wants.
         #: Defaults to the brand, so a capture needs no extra field; override
@@ -392,53 +390,96 @@ class Profile:
 
         # --- knobs ---
 
-        #: "navigate" reproduces a top-level page load, which is what the
-        #: capture is. "xhr" is what a page's own fetch()/XHR looks like: the
-        #: header *set* is well known, but the exact order is derived from the
-        #: navigate capture rather than confirmed first-hand, so treat it as
-        #: best-effort.
+        #: Which captured request `captured_priority()` and `describe()`
+        #: report by default. It no longer changes what goes on the wire -
+        #: headers and priority are the caller's - so it is a lookup key, not
+        #: a mode.
         self.header_profile = "navigate"
 
-        #: Follows the captured browser's UI language. Overridable.
-        self.accept_language = self.header_map.get("accept-language", "")
+        #: Whether the HEADERS frame carries an RFC 7540 priority, overriding
+        #: what the capture did. Three states, because "send none" and "no
+        #: measurement" are different things:
+        #:
+        #:   FROM_CAPTURE  reproduce the capture, per kind (the default)
+        #:   None          never set the PRIORITY flag
+        #:   {"exclusive": bool, "depends_on": int, "weight": int}
+        #:
+        #: This is not a header and no caller can reach it through httpx, so
+        #: unlike header values it stays the library's to set - the override is
+        #: for measuring, and for a request kind the capture never covered.
+        self.priority_override: typing.Any = FROM_CAPTURE
 
-        #: `sec-fetch-site` is worked out per request by the browser, so there
-        #: is no right constant; None means the default for the current kind.
-        self.sec_fetch_site: str | None = None
+        #: Headers the caller wants on every request through this transport,
+        #: as `Transport(brand, headers=...)`. Empty by default, because the
+        #: library sets no values of its own - see `_build_headers`. Set it to
+        #: `self.headers` to send exactly what the capture contained, which is
+        #: what selftest does and the only way the HPACK bytes can match it.
+        self.default_headers: list[tuple[bytes, bytes]] = []
 
-        #: Browsers send `cache-control: max-age=0` on a reload or a re-entered
-        #: URL but not on a plain navigation to a new address - both confirmed
-        #: against live captures. Defaults to whatever the capture did.
-        self.send_cache_control = "cache-control" in self.header_map
+        #: Whether the ClientHello offers an empty session_ticket extension,
+        #: overriding the OpenSSL profile. `FROM_CAPTURE` leaves the profile's
+        #: own answer alone; True and False pin it.
+        #:
+        #: Here rather than in the profile data because it is not the network
+        #: stack's to decide, which is unusual for a TLS extension and was
+        #: measured rather than assumed: on one iOS 16.7.12 device the App
+        #: Store's amp-api and xp.apple.com connections offer it and the same
+        #: device's mzstatic, fpinit and weather-edge connections do not. Same
+        #: OS, same ciphers, same groups, same HTTP/2 fingerprint - and a JA4
+        #: extension count of 15 against 14, with a different extension hash.
+        self.session_ticket_override: typing.Any = FROM_CAPTURE
 
         self._classes: dict[typing.Any, type] = {}
+
+    def __copy__(self) -> Profile:
+        """A copy with its own class cache, which is the whole point of it.
+
+        Every transport copies its profile so that `headers=`, `priority=` and
+        `header_profile` stay local to it. But the generated pool and
+        connection classes hold `_PROFILE` on the class, and they are cached in
+        `_classes` - share that dict and the first transport's profile is baked
+        into classes every later one reuses, so its overrides silently win.
+        Sharing the attributes and not the cache is worse than not copying at
+        all, because the copy looks isolated when inspected.
+        """
+        clone = object.__new__(type(self))
+        clone.__dict__.update(self.__dict__)
+        clone._classes = {}
+        return clone
 
     def __repr__(self) -> str:
         return f"<Profile {self.brand}: {self.label}>"
 
-    def priority_for(self, kind: str | None = None) -> dict:
-        """HEADERS-frame priority for this kind of request.
+    def captured_priority(self, kind: str = "navigate") -> dict | None:
+        """The HEADERS-frame priority the capture carried, or None for none.
 
-        Chrome does not give an XHR the same stream priority as a navigation -
-        weight 220 against 256, measured - so this is per kind, and the XHR one
-        is only known when a measurement supplied it.
+        Reference data, not a default. Measured on one iPhone: Safari puts a
+        priority on its navigation and none on its XHRs, WhatsApp puts none on
+        any of seven requests - same iOS, same network stack. So this belongs
+        to the client and the request, not to the stack the profile describes,
+        and reproducing it is the caller's to ask for:
 
-        A measured kind is used *verbatim*, and that includes measuring no
-        priority at all: Safari puts one on its navigation and none on its
-        XHRs, so falling back to the navigation's would add a PRIORITY flag the
-        browser does not send. The fallback is only for a kind never measured.
+            fp.Transport("ios18",
+                         headers=prof.headers,
+                         priority=prof.captured_priority())
         """
-        kind = kind or self.header_profile
-        entry = self.reference.get(kind)
-        if entry is None:
-            return self.headers_priority
-        prio = entry.get("priority")
-        if not prio:
+        prio = self.captured_priorities.get(kind)
+        return dict(prio) if prio else None
+
+    def priority_for(self) -> dict:
+        """What to pass send_headers(), which is nothing unless asked.
+
+        An empty dict leaves the PRIORITY flag off the HEADERS frame - the
+        default, because a priority is a property of the client and of the
+        request rather than of the network stack. `captured_priority()` says
+        what the capture did; `Transport(priority=...)` is how to send it.
+        """
+        if self.priority_override is None or self.priority_override == FROM_CAPTURE:
             return {}
         return {
-            "priority_exclusive": bool(prio["exclusive"]),
-            "priority_depends_on": prio["depends_on"],
-            "priority_weight": prio["weight"],
+            "priority_exclusive": bool(self.priority_override["exclusive"]),
+            "priority_depends_on": self.priority_override["depends_on"],
+            "priority_weight": self.priority_override["weight"],
         }
 
     @property
@@ -494,9 +535,7 @@ def reload() -> dict[str, Profile]:
 
     for path in sorted(PROFILES_DIR.glob("*.json")):
         try:
-            ref_path = REFERENCES_DIR / path.name
-            reference = _read_reference(ref_path) if ref_path.is_file() else None
-            prof = Profile(_read_capture(path), str(path), reference)
+            prof = Profile(_read_capture(path), str(path))
         except Exception as exc:  # noqa: BLE001 - one bad file must not hide the rest
             warnings.warn(f"browser_fp: ignoring {path} ({type(exc).__name__}: {exc})",
                           RuntimeWarning, stacklevel=2)
@@ -546,117 +585,6 @@ def profile(brand: str | None = None) -> Profile:
 
 #: Marks where headers the caller supplied get spliced in.  Browsers put cookie
 #: and referer here, between `accept` and the sec-fetch block.
-_EXTRA = "\x00extra\x00"
-
-#: What an XHR/fetch changes relative to a navigation. Applied to the captured
-#: header list so the *order* still comes from the capture and this generalises
-#: to browsers that send a different set.
-_XHR_VALUES = {
-    "accept": "*/*",
-    "sec-fetch-site": "same-origin",
-    "sec-fetch-mode": "cors",
-    "sec-fetch-dest": "empty",
-    "priority": "u=1, i",
-}
-_XHR_DROP = frozenset(["upgrade-insecure-requests", "sec-fetch-user"])
-
-
-#: Headers whose value belongs to the individual request rather than to the
-#: browser. A reference tells us where in the order they go; it must never tell
-#: us what they say, because there they describe a request to somewhere else.
-_PER_REQUEST = frozenset([
-    "referer", "cookie", "origin", "authorization", "content-type",
-    "content-length", "range", "if-none-match", "if-modified-since",
-])
-
-#: `sec-fetch-site` is computed per request too, but leaving it out would be
-#: unlike the browser, so each kind gets its commonest value as a default.
-_SITE_DEFAULT = {"navigate": "none", "xhr": "same-origin"}
-
-
-def _template(prof: Profile) -> list[tuple[str, str | None]]:
-    """Ordered (name, value) pairs; None means 'only if the caller supplied it'."""
-    kind = prof.header_profile
-    if kind not in ("navigate", "xhr"):
-        msg = f"unknown header_profile {kind!r}, expected 'navigate' or 'xhr'"
-        raise ValueError(msg)
-    ref = prof.reference.get(kind)
-    if ref is None:
-        return _derived_template(prof)
-    return _reference_template(prof, ref["headers"], kind)
-
-
-def _reference_template(prof: Profile, headers: list[tuple[str, str]],
-                        kind: str) -> list[tuple[str, str | None]]:
-    """Order from the reference, values from the capture.
-
-    This is the only way to learn where `referer` and `cookie` sit: a capture
-    taken against localhost has neither. Measured against real Chrome, `referer`
-    goes after `sec-fetch-dest` rather than after `accept`, which is where the
-    generic slot used to put everything.
-    """
-    out: list[tuple[str, str | None]] = []
-    last_caller = -1
-    for name, ref_value in headers:
-        if name in _PER_REQUEST:
-            last_caller = len(out)
-            out.append((name, None))
-            continue
-        if name == "cache-control":
-            if prof.send_cache_control:
-                out.append((name, ref_value))
-            continue
-        if name == "accept-language":
-            value: str | None = prof.accept_language
-        elif name == "sec-fetch-site":
-            value = prof.sec_fetch_site or _SITE_DEFAULT[kind]
-        elif kind == "navigate":
-            # Both are navigations by the same browser, so they agree - but the
-            # capture is this profile's own, so it wins.
-            value = prof.header_map.get(name, ref_value)
-        else:
-            value = ref_value
-        out.append((name, value))
-
-    if prof.send_cache_control and not any(n == "cache-control" for n, _ in out):
-        out.insert(0, ("cache-control", "max-age=0"))
-    # Headers we have never seen a browser send go next to the ones we have.
-    out.insert(last_caller + 1 if last_caller >= 0 else len(out), (_EXTRA, None))
-    return out
-
-
-def _derived_template(prof: Profile) -> list[tuple[str, str | None]]:
-    """Fallback for a brand with no reference: everything from the capture.
-
-    The navigate order is real; the xhr one is the navigate order with the
-    known substitutions applied, which is an inference - a reference replaces
-    it with the real thing.
-    """
-    xhr = prof.header_profile == "xhr"
-    out: list[tuple[str, str | None]] = []
-    for name, value in prof.headers:
-        if name == "cache-control":
-            if prof.send_cache_control and not xhr:
-                out.append((name, value))
-            continue
-        if xhr and name in _XHR_DROP:
-            continue
-        if name == "accept-language":
-            value = prof.accept_language
-        elif name == "sec-fetch-site" and prof.sec_fetch_site:
-            value = prof.sec_fetch_site
-        elif xhr and name in _XHR_VALUES:
-            value = _XHR_VALUES[name]
-        out.append((name, value))
-        if name == "accept":
-            out.append((_EXTRA, None))
-
-    if prof.send_cache_control and not xhr and "cache-control" not in prof.header_map:
-        out.insert(0, ("cache-control", "max-age=0"))
-    if not any(n == _EXTRA for n, _ in out):
-        out.append((_EXTRA, None))
-    return out
-
 
 def _httpx_default_headers() -> set[tuple[bytes, bytes]]:
     """The four headers httpx injects into every request.
@@ -674,6 +602,60 @@ def _httpx_default_headers() -> set[tuple[bytes, bytes]]:
     }
 
 
+def _check_priority(value: typing.Any) -> typing.Any:
+    """Validate `Transport(priority=...)` at construction rather than on send.
+
+    Getting this wrong is silent otherwise - a stray key would just fall
+    through to a KeyError inside the connection, on the first request, in
+    whichever thread happened to make it.
+    """
+    if value is None or value is FROM_CAPTURE or value == FROM_CAPTURE:
+        return value
+    wanted = {"exclusive", "depends_on", "weight"}
+    if not isinstance(value, dict) or set(value) != wanted:
+        msg = (f"priority must be {FROM_CAPTURE!r} (reproduce the capture), "
+               f"None (never send a PRIORITY flag), or a dict with exactly "
+               f"{sorted(wanted)}; got {value!r}")
+        raise ValueError(msg)
+    if not 1 <= value["weight"] <= 256:
+        msg = (f"priority weight is 1..256 as RFC 7540 counts it - the wire "
+               f"carries it minus one - got {value['weight']!r}")
+        raise ValueError(msg)
+    return value
+
+
+def _check_session_ticket(value: typing.Any) -> typing.Any:
+    """Validate `Transport(session_ticket=...)`, for the same reason.
+
+    Deliberately strict about 0 and 1 not being accepted as booleans: this is a
+    three-state setting and `session_ticket=0` reads like "off" while meaning
+    it only by accident.
+    """
+    if value is FROM_CAPTURE or value == FROM_CAPTURE or isinstance(value, bool):
+        return value
+    msg = (f"session_ticket must be {FROM_CAPTURE!r} (leave the OpenSSL profile "
+           f"alone), True (always offer an empty session_ticket) or False "
+           f"(never offer one); got {value!r}")
+    raise ValueError(msg)
+
+
+def _as_header_pairs(headers: typing.Any) -> list[tuple[bytes, bytes]]:
+    """Normalise `Transport(headers=...)` into lowercase byte pairs.
+
+    Accepts what httpx accepts - a mapping or a sequence of pairs, str or
+    bytes - because that is what a caller will reach for. Order is kept: two
+    values for one name stay in the order given, which `cookie` and
+    `set-cookie` both depend on.
+    """
+    items = headers.items() if hasattr(headers, "items") else headers
+    out: list[tuple[bytes, bytes]] = []
+    for key, value in items:
+        k = key.encode("ascii") if isinstance(key, str) else bytes(key)
+        v = value.encode("utf-8") if isinstance(value, str) else bytes(value)
+        out.append((k.lower(), v))
+    return out
+
+
 #: Never forwarded: `host` becomes :authority, the rest are HTTP/1-only hop
 #: headers that h2 would strip anyway.
 _DROP = frozenset(
@@ -682,7 +664,26 @@ _DROP = frozenset(
 
 
 def _build_headers(prof: Profile, request: typing.Any) -> list[tuple[bytes, bytes]]:
-    """The profile's header list for this request, pseudo-headers first."""
+    """This request's headers: the caller's, in the caller's order.
+
+    A profile carries only what belongs to the *network stack* - the thing
+    that changes with the OS or browser version and that no caller can reach
+    through httpx: the pseudo-header order, the HPACK encoding, the SETTINGS,
+    the WINDOW_UPDATE and the TLS layer.
+
+    Request headers are not that.  Measured on one iPhone, one iOS version and
+    one network stack, Safari and WhatsApp sent different header sets in
+    different orders - and WhatsApp's own GET and POST disagreed with each
+    other too.  So neither the set, the order nor the values are a property of
+    the stack, and imposing any of them would stop the caller reproducing a
+    request that is not the one we happened to capture.
+
+    Order therefore comes from the caller, who controls it by the order they
+    pass headers in - httpx preserves it, for a dict as for a list of pairs.
+    `Transport(headers=...)` comes first, then the request's own, matching how
+    httpx layers client-level and request-level headers.  To reproduce the
+    captured client exactly, pass `profile.headers`, which is that order.
+    """
     authority = [v for k, v in request.headers if k.lower() == b"host"][0]
 
     defaults = _httpx_default_headers()
@@ -693,18 +694,21 @@ def _build_headers(prof: Profile, request: typing.Any) -> list[tuple[bytes, byte
             continue
         supplied.append((key, value))
 
-    template = _template(prof)
-    known = {name.encode("ascii") for name, _ in template if name != _EXTRA}
-
-    # Caller values win over the template; anything not in the template is
-    # spliced in at the _EXTRA slot, keeping the caller's relative order.
-    overrides: dict[bytes, list[bytes]] = {}
-    extras: list[tuple[bytes, bytes]] = []
-    for key, value in supplied:
-        if key in known:
-            overrides.setdefault(key, []).append(value)
-        else:
-            extras.append((key, value))
+    # Transport(headers=...) is the caller speaking too, and it has to be kept
+    # apart from httpx's own defaults above: the captured `accept-encoding` is
+    # byte-identical to httpx's, so passing it on the request would be mistaken
+    # for httpx having put it there and dropped.  A name the request sets again
+    # keeps the transport's position and takes the request's value, which is
+    # what overriding one header out of a set is normally meant to do.
+    if prof.default_headers:
+        override = {k: v for k, v in supplied}
+        seen: set[bytes] = set()
+        merged = []
+        for key, value in prof.default_headers:
+            merged.append((key, override.get(key, value)))
+            seen.add(key)
+        merged += [(k, v) for k, v in supplied if k not in seen]
+        supplied = merged
 
     pseudo = {
         ":method": request.method,
@@ -715,17 +719,15 @@ def _build_headers(prof: Profile, request: typing.Any) -> list[tuple[bytes, byte
     headers: list[tuple[bytes, bytes]] = [
         (name.encode("ascii"), pseudo[name]) for name in prof.pseudo_order
     ]
-    for name, default in template:
-        if name == _EXTRA:
-            headers.extend(extras)
-            continue
-        key = name.encode("ascii")
-        if key in overrides:
-            headers.extend((key, v) for v in overrides[key])
-        elif default is not None:
-            headers.append((key, default.encode("ascii")))
+    headers += supplied
 
-    if prof.hpack == "quiche":
+    # cfnetwork is in here on weaker evidence than quiche is: App Store
+    # captures taken on an iOS 16.7.12 device carried ten and eleven *separate*
+    # `cookie` fields in one HEADERS block, which is a crumbled cookie and
+    # nothing else. Those dumps are no longer in the tree and the current
+    # capture set has no cookies at all, so it cannot be re-derived from what
+    # is here - re-capture a request with cookies before trusting it.
+    if prof.hpack in ("quiche", "cfnetwork"):
         headers = _crumble_cookies(headers)
     return headers
 
@@ -884,7 +886,91 @@ class _QuicheEncoder(hpack.Encoder):
 #: Only quiche's rules are implemented; "stock" is hpack's own encoder, which is
 #: what a non-Chromium capture gets until someone works out its real rules. The
 #: byte-level self-test is what tells you whether that is good enough.
-_ENCODERS = {"quiche": _QuicheEncoder, "stock": hpack.Encoder}
+class _CFNetworkEncoder(_QuicheEncoder):
+    """quiche's rules, plus two names that are treated differently.
+
+    Apple's stack and Chrome's agree on everything else measured here -
+    conditional Huffman, pseudo-headers other than `:authority` kept out of the
+    dynamic table - which is why this subclasses rather than repeats. The two
+    differences are `content-length` (kept out of the table) and
+    `authorization` (emitted with the never-indexed opcode, which quiche never
+    emits at all).
+
+    Measured against 37 requests over 34 connections captured from WhatsApp on
+    one iOS 16.7.12 device:
+
+        stock hpack     0/37
+        quiche          3/37    the three GETs, which carry no content-length
+        this           36/37
+
+    Neither rule is cosmetic. `content-length` decides most blocks outright.
+    `authorization` decides more than its own field: indexing it adds a dynamic
+    entry the real client never adds, so every index in every later request on
+    that connection comes out one too high - one connection here carries four
+    requests and the first mistake corrupts the other three.
+
+    The rules generalise past the app that revealed them: the same encoder
+    reproduces the stored Safari capture, navigation and xhr alike, so this
+    belongs to iOS and not to WhatsApp - which is what every other measurement
+    on this device also found.
+
+    Chrome is deliberately left on quiche. Every Chrome capture in the tree is
+    a GET without an `authorization`, so none of them says what quiche does
+    with either name, and quiche's own source is the better authority where no
+    measurement exists.
+
+    The one remaining miss is not an encoding rule. On the second request of
+    that four-request connection the client opens the block with a dynamic
+    table size update to 4096 - the value the server had just advertised, and
+    also the default, so hpack considers it unchanged and emits nothing. Strip
+    those three bytes and the remaining 135 are identical. It is an
+    acknowledgement of the peer's SETTINGS rather than a choice about how to
+    encode, and in a live connection h2 owns that decision, so nothing is done
+    about it here.
+    """
+
+    #: Kept out of the dynamic table with an ordinary non-indexed literal. Its
+    #: value is different on every request that has one, so an entry made for
+    #: it can never be hit again - it would only push something reusable out of
+    #: a 4KB table.
+    _NOT_INDEXED = frozenset({b"content-length"})
+
+    #: Emitted with the *never-indexed* opcode, which additionally forbids any
+    #: proxy along the way from indexing it. quiche never emits this opcode at
+    #: all; Apple's stack does, for exactly one name in everything measured
+    #: here. Getting it wrong is not a one-field mistake: indexing
+    #: `authorization` adds a dynamic entry the real client never adds, so
+    #: every index in every later request on that connection is off by one.
+    _NEVER_INDEXED = frozenset({b"authorization"})
+
+    @classmethod
+    def _chrome_should_index(cls, name: bytes) -> bool:
+        if name in cls._NOT_INDEXED:
+            return False
+        return _QuicheEncoder._chrome_should_index(name)
+
+    def add(
+        self,
+        to_add: tuple[bytes, bytes],
+        sensitive: bool,
+        huffman: bool = False,
+    ) -> bytes:
+        name, value = to_add
+        if name not in self._NEVER_INDEXED:
+            return super().add(to_add, sensitive, huffman)
+        # Never-indexed is always a literal: a match in the table would be
+        # emitted as an index, which is the thing this opcode exists to avoid.
+        match = self.header_table.search(name, value)
+        if match is None:
+            return self._encode_literal(name, value,
+                                        hpack.hpack.INDEX_NEVER, huffman)
+        position, name, _perfect = match
+        return self._encode_indexed_literal(position, value,
+                                            hpack.hpack.INDEX_NEVER, huffman)
+
+
+_ENCODERS = {"quiche": _QuicheEncoder, "cfnetwork": _CFNetworkEncoder,
+             "stock": hpack.Encoder}
 
 
 def _apply_settings(prof: Profile, state: typing.Any) -> None:
@@ -1133,6 +1219,24 @@ def _tls_state(prof: Profile) -> str:
     return prof.tls_profile
 
 
+def _ticket_state(prof: Profile) -> str:
+    """Whether an empty session_ticket goes out, for `describe()`.
+
+    The capture is reported alongside the setting, because the two answer
+    different questions: what this transport will send, and what the device
+    that was recorded sent. A brand whose capture is not in the reference at
+    all says so rather than guessing.
+    """
+    seen = prof.captured_session_ticket
+    measured = ("not recorded" if seen is None else
+                "the capture offered one" if seen else
+                "the capture offered none")
+    if prof.session_ticket_override is FROM_CAPTURE:
+        return f"whatever the OpenSSL profile does ({measured})"
+    return (f"{'always offered' if prof.session_ticket_override else 'never offered'}"
+            f" - set on the transport ({measured})")
+
+
 def _apply_tls_profile(transport: typing.Any, prof: Profile) -> str | None:
     """Point the transport's SSL_CTX at this brand's ClientHello.
 
@@ -1158,6 +1262,11 @@ def _apply_tls_profile(transport: typing.Any, prof: Profile) -> str | None:
 
     try:
         tls_profile.set_profile(context, prof.tls_profile)
+        # After the profile, never before: setting a profile does not clear
+        # this override, but reading it back would report the old profile's
+        # answer if the two were the other way round.
+        if prof.session_ticket_override is not FROM_CAPTURE:
+            tls_profile.set_empty_ticket(context, prof.session_ticket_override)
     except tls_profile.Unavailable as exc:
         warnings.warn(
             f"browser_fp: the TLS layer is NOT {prof.brand}'s - {exc} The "
@@ -1187,8 +1296,21 @@ class Transport(httpx.HTTPTransport):
     _BRAND: typing.ClassVar[str | None] = None
     _ASYNC: typing.ClassVar[bool] = False
 
-    def __init__(self, brand: str | None = None, **kwargs: typing.Any) -> None:
-        self.profile = profile(brand if brand is not None else self._BRAND)
+    def __init__(self, brand: str | None = None, *,
+                 headers: typing.Any = None,
+                 priority: typing.Any = FROM_CAPTURE,
+                 session_ticket: typing.Any = FROM_CAPTURE,
+                 **kwargs: typing.Any) -> None:
+        # A copy, not the shared Profile: `headers=`, `priority=`,
+        # `session_ticket=` and `header_profile` are per-transport, and
+        # mutating the one profile() hands out would leak them into every
+        # transport of the same brand.
+        self.profile = copy.copy(profile(brand if brand is not None
+                                         else self._BRAND))
+        if headers is not None:
+            self.profile.default_headers = _as_header_pairs(headers)
+        self.profile.priority_override = _check_priority(priority)
+        self.profile.session_ticket_override = _check_session_ticket(session_ticket)
         kwargs.setdefault("http2", True)
         super().__init__(**kwargs)
         _retag_pool(self, self.profile, self._ASYNC)
@@ -1206,8 +1328,21 @@ class AsyncTransport(httpx.AsyncHTTPTransport):
     _BRAND: typing.ClassVar[str | None] = None
     _ASYNC: typing.ClassVar[bool] = True
 
-    def __init__(self, brand: str | None = None, **kwargs: typing.Any) -> None:
-        self.profile = profile(brand if brand is not None else self._BRAND)
+    def __init__(self, brand: str | None = None, *,
+                 headers: typing.Any = None,
+                 priority: typing.Any = FROM_CAPTURE,
+                 session_ticket: typing.Any = FROM_CAPTURE,
+                 **kwargs: typing.Any) -> None:
+        # A copy, not the shared Profile: `headers=`, `priority=`,
+        # `session_ticket=` and `header_profile` are per-transport, and
+        # mutating the one profile() hands out would leak them into every
+        # transport of the same brand.
+        self.profile = copy.copy(profile(brand if brand is not None
+                                         else self._BRAND))
+        if headers is not None:
+            self.profile.default_headers = _as_header_pairs(headers)
+        self.profile.priority_override = _check_priority(priority)
+        self.profile.session_ticket_override = _check_session_ticket(session_ticket)
         kwargs.setdefault("http2", True)
         super().__init__(**kwargs)
         _retag_pool(self, self.profile, self._ASYNC)
@@ -1268,28 +1403,35 @@ def describe(brand: str | None = None) -> str:
     prio = (f"exclusive={live['priority_exclusive']} "
             f"dep={live['priority_depends_on']} weight={live['priority_weight']}"
             if live else "none (no PRIORITY flag on HEADERS)")
-    def origin(kind: str) -> str:
-        entry = prof.reference.get(kind)
-        return entry.get("from", "reference") if entry else "derived"
+    def shown(kind: str) -> str:
+        """What `captured_priority(kind)` would return, spelled out."""
+        got = prof.captured_priority(kind)
+        return (f"{kind}=w{got['weight']}"
+                f"{'/excl' if got['exclusive'] else ''}" if got else f"{kind}=none")
 
-    templates = ", ".join(f"{kind}={origin(kind)}" for kind in ("navigate", "xhr"))
-    captured_lang = prof.header_map.get("accept-language", "")
+    templates = ", ".join(shown(kind) for kind in ("navigate", "xhr"))
+    sends = "the caller's, none of its own" if not prof.default_headers else (
+        f"{len(prof.default_headers)} set on the transport")
     lines = [
         f"{prof.brand}  ({prof.label})",
         f"  transport      : browser_fp.{prof.class_name}Transport()"
         f" / transport({prof.brand!r})",
+        # Everything under "capture" is what the browser sent, not what this
+        # transport will send: header values are the caller's to supply. Say so
+        # once here rather than let each line be read as a setting.
+        f"  header values  : {sends}",
+        f"  ---- the capture, for reference / headers= ----",
         f"  user-agent     : {prof.user_agent}",
-        f"  sec-ch-ua      : {prof.header_map.get('sec-ch-ua', '(not sent)')}",
+        f"  sec-ch-ua      : {prof.header_map.get('sec-ch-ua', '(none)')}",
         f"  platform       : {prof.platform}",
-        f"  accept-language: {prof.accept_language}"
-        + ("" if prof.accept_language == captured_lang
-           else f"  (capture had {captured_lang})"),
-        f"  cache-control  : {'sent' if prof.send_cache_control else 'not sent'}",
-        f"  header profile : {prof.header_profile} (capture was sec-fetch-mode: "
-        f"{prof.header_map.get('sec-fetch-mode') or 'unknown'})",
-        f"  header order   : {templates}",
+        f"  accept-language: {prof.header_map.get('accept-language', '(none)')}",
+        f"  request kind   : {prof.header_map.get('sec-fetch-mode') or 'unlabelled'}"
+        f" (captured_priority() reports {prof.header_profile!r})",
+        f"  captured prio  : {templates}",
+        f"  ---- what this transport imposes ----",
         f"  hpack          : {prof.hpack}",
         f"  tls profile    : {_tls_state(prof)}",
+        f"  session_ticket : {_ticket_state(prof)}",
         f"  akamai         : {prof.akamai_fingerprint}",
         f"  akamai md5     : {prof.akamai_hash}",
         "  settings       : "

@@ -219,6 +219,31 @@ static int cmd_FingerprintProfile(SSL_CONF_CTX *cctx, const char *value)
     return ossl_ssl_fp_profile_by_name(value) != NULL;
 }
 
+/*
+ * "on", "off" or "profile" - the profile's own answer being the third real
+ * option here, not just the absence of the other two.
+ */
+static int cmd_FingerprintEmptyTicket(SSL_CONF_CTX *cctx, const char *value)
+{
+    int mode;
+
+    if (OPENSSL_strcasecmp(value, "on") == 0)
+        mode = SSL_FP_TICKET_ON;
+    else if (OPENSSL_strcasecmp(value, "off") == 0)
+        mode = SSL_FP_TICKET_OFF;
+    else if (OPENSSL_strcasecmp(value, "profile") == 0)
+        mode = SSL_FP_TICKET_PROFILE;
+    else
+        return 0;
+
+    if (cctx->ssl != NULL)
+        return SSL_set_fp_empty_ticket(cctx->ssl, mode);
+    if (cctx->ctx != NULL)
+        return SSL_CTX_set_fp_empty_ticket(cctx->ctx, mode);
+    /* NB: ctx == NULL performs syntax checking only */
+    return 1;
+}
+
 static int cmd_Groups(SSL_CONF_CTX *cctx, const char *value)
 {
     int rv;
@@ -776,6 +801,7 @@ static const ssl_conf_cmd_tbl ssl_conf_cmds[] = {
     SSL_CONF_CMD_STRING(Curves, "curves", 0),
     SSL_CONF_CMD_STRING(Groups, "groups", 0),
     SSL_CONF_CMD_STRING(FingerprintProfile, "fp_profile", 0),
+    SSL_CONF_CMD_STRING(FingerprintEmptyTicket, "fp_empty_ticket", 0),
     SSL_CONF_CMD_STRING(ECDHParameters, "named_curve", SSL_CONF_FLAG_SERVER),
     SSL_CONF_CMD_STRING(CipherString, "cipher", 0),
     SSL_CONF_CMD_STRING(Ciphersuites, "ciphersuites", 0),

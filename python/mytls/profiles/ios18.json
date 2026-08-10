@@ -1,5 +1,5 @@
 {
-  "brand": "safari_ios",
+  "brand": "ios18",
   "frames": [
     {
       "type": "SETTINGS",
@@ -234,5 +234,8 @@
         "gzip, deflate, br"
       ]
     ]
+  },
+  "meta": {
+    "label": "iOS 18.5 network stack"
   }
 }

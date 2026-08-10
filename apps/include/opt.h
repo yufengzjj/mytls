@@ -169,6 +169,7 @@
         OPT_S_NO_TX_CERT_COMP, \
         OPT_S_NO_RX_CERT_COMP, \
         OPT_S_FP_PROFILE, \
+        OPT_S_FP_EMPTY_TICKET, \
         OPT_S__LAST
 
 # define OPT_S_OPTIONS \
@@ -232,7 +233,9 @@
         {"no_ems", OPT_S_NO_EMS, '-', \
             "Disable Extended master secret extension"}, \
         {"fp_profile", OPT_S_FP_PROFILE, 's', \
-            "Client fingerprint profile to imitate (chrome, safari_ios, ...)"}
+            "Client fingerprint profile to imitate (chrome, ios18, ...)"}, \
+        {"fp_empty_ticket", OPT_S_FP_EMPTY_TICKET, 's', \
+            "Offer an empty session_ticket: on, off, or profile"}
 
 # define OPT_S_CASES \
         OPT_S__FIRST: case OPT_S__LAST: break; \
@@ -272,6 +275,7 @@
         case OPT_S_NO_MIDDLEBOX: \
         case OPT_S_NO_ETM: \
         case OPT_S_FP_PROFILE: \
+        case OPT_S_FP_EMPTY_TICKET: \
         case OPT_S_NO_EMS
 
 #define IS_NO_PROT_FLAG(o) \

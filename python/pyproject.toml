@@ -35,4 +35,4 @@ include = ["mytls"]
 # The captures are the package. Every value browser_fp reproduces is read out of
 # these at import time, so a wheel without them installs a library that knows no
 # browsers at all.
-mytls = ["profiles/*.json", "references/*.json"]
+mytls = ["profiles/*.json"]

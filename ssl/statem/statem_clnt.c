@@ -1212,7 +1212,22 @@ CON_FUNC_RETURN tls_construct_client_hello(SSL_CONNECTION *s, WPACKET *pkt)
 
     if (sess == NULL
             || !ssl_version_supported(s, sess->ssl_version, NULL)
-            || !SSL_SESSION_is_resumable(sess)) {
+            || !SSL_SESSION_is_resumable(sess)
+            /*
+             * Unless the profile allows resumption, start a new session even
+             * when a usable one was loaded. This is the single place that
+             * decides it, so it covers all three ways a ClientHello can offer
+             * to resume at once: TLSv1.3 pre_shared_key, a TLSv1.2 ticket in
+             * session_ticket, and a TLSv1.2 session id.
+             *
+             * It also lands on the behaviour the profiles were measured with
+             * rather than beside it: with no ticket to offer, session_ticket
+             * falls to the ticklen == 0 case, which is exactly where
+             * SSL_FP_EMPTY_TICKET decides whether the browser sends an empty
+             * one. Suppressing tickets through tls_use_ticket() instead would
+             * drop the extension entirely and change the fingerprint.
+             */
+            || (ossl_ssl_fp(s)->flags & SSL_FP_ALLOW_RESUME) == 0) {
         if (s->hello_retry_request == SSL_HRR_NONE
                 && !ssl_get_new_session(s, 0)) {
             /* SSLfatal() already called */

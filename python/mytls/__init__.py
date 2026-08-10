@@ -3,12 +3,25 @@
     import httpx
     import mytls
 
-    with httpx.Client(transport=mytls.Transport("safari_ios")) as client:
+    with httpx.Client(transport=mytls.Transport("ios18")) as client:
         client.get("https://example.com/")
 
 One transport sets both halves: the TLS layer (which ClientHello OpenSSL emits)
 and the HTTP/2 layer (SETTINGS, WINDOW_UPDATE, HEADERS priority, HPACK encoding
 and the request headers in the browser's own order).
+
+It sets the header *order*, never their values - anything you could set
+yourself is yours to set, so a request with no headers sends none.  For the
+captured browser's own values, pass them:
+
+    mytls.Transport("chrome", headers=mytls.profile("chrome").headers)
+
+Two more things turned out not to belong to the network stack either, because
+two apps on one device and one OS build were measured disagreeing about them -
+the HEADERS frame's priority and whether the ClientHello offers an empty
+session_ticket.  Both default to reproducing the capture and both are yours:
+
+    mytls.Transport("ios18", priority=None, session_ticket=True)
 
 **This package is only half of the machine.**  The HTTP/2 half is pure Python
 and works anywhere; the TLS half is not, and cannot be - a ClientHello is built
@@ -31,7 +44,6 @@ from .browser_fp import (
     DEFAULT_BRAND,
     PROFILES,
     PROFILES_DIR,
-    REFERENCES_DIR,
     AsyncTransport,
     Profile,
     Transport,
@@ -48,10 +60,11 @@ from .browser_fp import (
 __version__ = "0.1.0"
 
 __all__ = [
-    "DEFAULT_BRAND", "PROFILES", "PROFILES_DIR", "REFERENCES_DIR",
+    "DEFAULT_BRAND", "PROFILES", "PROFILES_DIR",
     "AsyncTransport", "Profile", "Transport", "async_transport", "brand_for",
     "brands", "catalog", "describe", "profile", "reload", "transport",
-    "fingerprints", "tls_profile", "check", "tls_profiles", "__version__",
+    "fingerprints", "tls_profile", "check", "tls_profiles", "addon_path",
+    "__version__",
 ]
 
 
@@ -71,6 +84,18 @@ def __dir__() -> list[str]:
     from . import browser_fp
 
     return sorted(set(globals()) | set(dir(browser_fp)))
+
+
+def addon_path() -> str:
+    """Where the mitmproxy addon lives, for `mitmdump -s`.
+
+    Returned as a path rather than imported, because that module runs inside
+    mitmproxy's interpreter - 3.12 or newer, possibly the one bundled in a
+    standalone build - and not this one. Nothing here imports it.
+    """
+    from pathlib import Path
+
+    return str(Path(__file__).resolve().parent / "mitm_addon.py")
 
 
 def tls_profiles() -> tuple[str, ...]:

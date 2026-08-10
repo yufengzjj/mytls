@@ -742,6 +742,30 @@ typedef enum ssl_grease_index_en {
 # define SSL_FP_ECH_GREASE      0x0004  /* offer a GREASE encrypted_client_hello */
 # define SSL_FP_EMPTY_TICKET    0x0008  /* offer an empty session_ticket */
 # define SSL_FP_PADDING         0x0010  /* pad the ClientHello out to 512 bytes */
+/*
+ * Resumption is off unless a profile asks for it, which is the one flag here
+ * that is not "what a browser does" - every browser resumes. It is a deviation
+ * we choose, because a resumed ClientHello is a *different* fingerprint: it
+ * carries pre_shared_key, so the extension count moves and the JA4, JA3 and
+ * peetprint hashes all change. No capture in this tree is of a resumed
+ * handshake, so nothing here has a reference to check that shape against.
+ *
+ * Set it on a profile only once such a capture exists. Until then, leaving it
+ * clear is what makes every connection produce the one ClientHello the
+ * profile was actually measured from.
+ */
+# define SSL_FP_ALLOW_RESUME    0x0020  /* may offer session resumption */
+
+/*
+ * SSL_FP_EMPTY_TICKET is the one bit above with a public override, because it
+ * is the one measured to vary between apps on a single device and OS build.
+ * Two iOS 16.7.12 captures taken minutes apart differ in nothing but this
+ * extension: some hosts get an empty session_ticket and some do not, which
+ * moves the JA4 extension count from 14 to 15 and changes its hash. Since the
+ * caller is the only one who knows which app is being imitated, the caller has
+ * to be able to say - see SSL_CTX_set_fp_empty_ticket() and the
+ * SSL_FP_TICKET_* values in <openssl/ssl.h>.
+ */
 
 typedef struct ssl_fp_profile_st {
     const char *name;
@@ -1271,6 +1295,12 @@ struct ssl_ctx_st {
      * pointer with nothing to free.
      */
     const SSL_FP_PROFILE *fp_profile;
+    /*
+     * Overrides the profile's SSL_FP_EMPTY_TICKET bit for this context.
+     * SSL_FP_TICKET_PROFILE means it does not. Read through
+     * ossl_ssl_fp_empty_ticket().
+     */
+    int fp_empty_ticket;
 };
 
 typedef struct cert_pkey_st CERT_PKEY;
@@ -1929,6 +1959,12 @@ struct ssl_connection_st {
      * inheritance happens in one place.
      */
     const SSL_FP_PROFILE *fp_profile;
+    /*
+     * Overrides the context's empty-session_ticket setting for this
+     * connection only; SSL_FP_TICKET_PROFILE means inherit. Read through
+     * ossl_ssl_fp_empty_ticket(), for the same reason.
+     */
+    int fp_empty_ticket;
 };
 
 # define SSL_CONNECTION_FROM_SSL_ONLY_int(ssl, c) \
@@ -2629,6 +2665,8 @@ __owur int ossl_ssl_ext_permutation(SSL_CONNECTION *s, size_t num);
 __owur const SSL_FP_PROFILE *ossl_ssl_fp(const SSL_CONNECTION *s);
 __owur const SSL_FP_PROFILE *ossl_ssl_fp_profile_by_name(const char *name);
 __owur const SSL_FP_PROFILE *ossl_ssl_fp_default(void);
+/* The effective answer, 0 or 1, after connection, context and profile. */
+__owur int ossl_ssl_fp_empty_ticket(const SSL_CONNECTION *s);
 /* Installs a profile's cipher and group lists; used at SSL_CTX_new_ex() too. */
 int ossl_ssl_fp_apply_ctx(SSL_CTX *ctx, const SSL_FP_PROFILE *prof);
 

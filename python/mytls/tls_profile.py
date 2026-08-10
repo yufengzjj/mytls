@@ -8,7 +8,7 @@ method that would carry a profile name down.  This module calls
 
     import ssl, tls_profile
     ctx = ssl.create_default_context()
-    tls_profile.set_profile(ctx, "safari_ios")
+    tls_profile.set_profile(ctx, "ios18")
 
 `browser_fp.Transport` does this for you; use this module directly only when
 driving OpenSSL through something other than browser_fp.
@@ -56,6 +56,10 @@ def library() -> ctypes.CDLL:
         lib.SSL_fp_profile_name.restype = ctypes.c_char_p
         lib.SSL_CTX_get_options.argtypes = [ctypes.c_void_p]
         lib.SSL_CTX_get_options.restype = ctypes.c_uint64
+        lib.SSL_CTX_set_fp_empty_ticket.argtypes = [ctypes.c_void_p, ctypes.c_int]
+        lib.SSL_CTX_set_fp_empty_ticket.restype = ctypes.c_int
+        lib.SSL_CTX_get_fp_empty_ticket.argtypes = [ctypes.c_void_p]
+        lib.SSL_CTX_get_fp_empty_ticket.restype = ctypes.c_int
     except AttributeError as exc:
         msg = (f"{ssl.OPENSSL_VERSION} has no fingerprint profiles ({exc}). "
                f"This needs the OpenSSL fork in this repository; a stock build "
@@ -116,6 +120,40 @@ def set_profile(context: ssl.SSLContext, name: str) -> None:
 def get_profile(context: ssl.SSLContext) -> str:
     """Which profile `context` is set to, read back out of OpenSSL."""
     return library().SSL_CTX_get_fp_profile(_ssl_ctx(context)).decode()
+
+
+#: Argument to `set_empty_ticket` meaning "whatever the profile says".
+PROFILE_DEFAULT = -1
+
+
+def set_empty_ticket(context: ssl.SSLContext, mode: bool | int) -> None:
+    """Offer an empty session_ticket extension, or not, overriding the profile.
+
+    `True`, `False`, or `PROFILE_DEFAULT` to stop overriding.
+
+    A profile describes a network stack, and this extension is not the stack's
+    to decide.  Measured on one iOS 16.7.12 device: the App Store's amp-api and
+    xp.apple.com connections offer it, while mzstatic, fpinit and weather-edge
+    on the same device and the same OS do not - same ciphers, same groups, same
+    HTTP/2 fingerprint, one extension apart.  That one extension is worth a JA4
+    extension count of 14 against 15 and a different extension hash, so which
+    app is being imitated has to be the caller's to say.
+    """
+    lib = library()
+    value = PROFILE_DEFAULT if mode == PROFILE_DEFAULT else int(bool(mode))
+    if lib.SSL_CTX_set_fp_empty_ticket(_ssl_ctx(context), value) != 1:
+        msg = (f"OpenSSL rejected session_ticket mode {mode!r}; expected True, "
+               f"False or PROFILE_DEFAULT. The setting has NOT been applied.")
+        raise Unavailable(msg)
+
+
+def get_empty_ticket(context: ssl.SSLContext) -> bool:
+    """Whether `context`'s next ClientHello will carry an empty session_ticket.
+
+    The effective answer, not the override: with nothing set this reports what
+    the profile does.
+    """
+    return library().SSL_CTX_get_fp_empty_ticket(_ssl_ctx(context)) == 1
 
 
 def describe() -> str:

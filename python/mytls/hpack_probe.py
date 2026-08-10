@@ -34,12 +34,10 @@ properly (README) avoids the extra tap. Note that the address ends up in
 reproducible from that same address - `where` prints it and selftest says so
 when it cannot get there.
 
-The same visit also writes references/<brand>.json - ja3, ja4, peetprint and the
-akamai fingerprint of what just arrived. Those are computed here, from the bytes
-(see fingerprints.py), so capturing needs nothing but the browser opening the
-page. --peet additionally asks the browser to fetch tls.peet.ws and post the
-answer back, which is worth doing occasionally as an outside opinion but costs a
-manual copy-paste on any browser that enforces CORS - which is all of them.
+A capture is one page load with nothing to read and nothing to press. What an
+outside service makes of the same client is not stored beside it: `mytls-verify`
+asks tls.peet.ws and check.ja3.zone live, about our own client, and compares
+their answers against fingerprints computed from this capture's raw bytes.
 
 `selftest` does the whole loop in one process - stand up the server, drive our
 own client at it, compare byte for byte - which is what proves a fresh build
@@ -59,6 +57,7 @@ import ipaddress
 import json
 import os
 import re
+import shutil
 import socket
 import ssl
 import struct
@@ -75,9 +74,6 @@ HERE = Path(__file__).resolve().parent
 #: Kept in step with browser_fp.PROFILES_DIR, but spelled out here so capturing
 #: does not depend on httpx being importable.
 PROFILES_DIR = Path(os.environ.get("BROWSER_FP_PROFILES") or HERE / "profiles")
-#: The fingerprints of the same capture - ours always, tls.peet.ws's when it was
-#: asked for. Only verify_fp.py reads these, and only against a live server.
-REFERENCES_DIR = Path(os.environ.get("BROWSER_FP_REFERENCES") or HERE / "references")
 #: Generated artefacts live outside the tree so nothing lands in git.
 WORK = Path(os.environ.get("HPACK_PROBE_DIR", Path.home() / ".cache/hpack_probe"))
 CERT = WORK / "cert.pem"
@@ -106,11 +102,13 @@ def profile_path(brand: str) -> Path:
                f"underscores, starting with a letter (chrome, chrome_android, "
                f"edge)")
         raise SystemExit(msg)
-    if re.search(r"\d{2,}$", brand):
-        print(f"note: {brand!r} looks like it carries a version. A brand is a "
-              f"browser, not a browser version - the version is read off the "
-              f"capture's user-agent, and one capture per brand means nothing "
-              f"stays pinned to an old one.", file=sys.stderr)
+    # A trailing number used to be warned about here - a brand is a browser,
+    # not a browser version, and `chrome150` would pin callers to a stale
+    # capture. It is not a mistake when the number is an *OS* version: iOS
+    # changes its ClientHello between releases while every app on the device
+    # shares it, so `ios16` and `ios18` are two stacks, not one browser twice.
+    # The warning fired on exactly the profiles that are named correctly, so
+    # it is gone; naming is reviewed when a capture is added, not at runtime.
     return PROFILES_DIR / f"{brand}.json"
 
 
@@ -341,6 +339,40 @@ def describe(ftype: int, flags: int, stream: int, payload: bytes) -> dict:
     return out
 
 
+def frames_from_stream(buf: bytes) -> typing.Iterator[tuple[int, int, int, bytes]]:
+    """Slice a recorded HTTP/2 byte stream into frames.
+
+    `read_frame` does the same off a live socket; this is for bytes that were
+    captured elsewhere - by mitm_addon.py - and arrive all at once. Both feed
+    `describe()`, so a capture taken either way is parsed by the same code.
+
+    A trailing partial frame is dropped rather than raised on: a dump written
+    while the connection was still open ends wherever the last TCP segment did,
+    and everything before that point is still good.
+    """
+    if buf.startswith(PREFACE):
+        buf = buf[len(PREFACE):]
+    o = 0
+    while o + 9 <= len(buf):
+        length = int.from_bytes(buf[o:o + 3], "big")
+        if o + 9 + length > len(buf):
+            return
+        ftype, flags = buf[o + 3], buf[o + 4]
+        stream = struct.unpack_from("!I", buf, o + 5)[0] & 0x7FFFFFFF
+        yield ftype, flags, stream, buf[o + 9:o + 9 + length]
+        o += 9 + length
+
+
+def carries_psk(ch: dict | None) -> bool:
+    """True if this ClientHello resumed a session.
+
+    A resumed handshake carries pre_shared_key, which our client never sends,
+    so a capture that resumed is not a usable reference no matter how it was
+    taken.
+    """
+    return any(e["hex"] == "0x0029" for e in (ch or {}).get("extensions", []))
+
+
 # --- capturing --------------------------------------------------------------
 
 def listen(port: int) -> socket.socket:
@@ -374,19 +406,15 @@ class _Session:
     and the page's fetch back to us may well arrive on another - Chrome is free
     to open a second connection to the same origin, and does. So connections are
     served concurrently and the results land here; the first HEADERS frame to
-    arrive anywhere is the profile, and any /reference POST finishes the run.
+    arrive anywhere is the profile.
     """
 
-    def __init__(self, *, want_reference: bool, timeout: float, quiet: bool,
-                 want_kinds: frozenset = frozenset(),
+    def __init__(self, *, timeout: float, quiet: bool,
                  want_xhr: bool = False) -> None:
-        self.want_reference = want_reference
         #: Hold the connection open past the first request to also catch the
         #: page's own /xhr-sample. The browser sends one by itself; our own
         #: client has to be told to, which is what selftest does.
         self.want_xhr = want_xhr
-        #: Kinds of peet response to hold out for; empty means the first will do.
-        self.want_kinds = want_kinds
         self.timeout = timeout
         self.quiet = quiet
         self.lock = threading.Lock()
@@ -394,9 +422,8 @@ class _Session:
         #: The page's own GET, decoded and kept raw: the only measurement of
         #: what this browser's XHRs look like that does not need a third party.
         self.xhr: dict | None = None
-        self.reference: dict | None = None
         #: Set once the profile is captured: from then on we are only waiting
-        #: for the reference, and only for so long.
+        #: for the page's own fetch, and only for so long.
         self.deadline: float | None = None
         self.done = threading.Event()
 
@@ -410,8 +437,7 @@ class _Session:
                 "priority": info.get("priority"),
                 "headers": [[k, v] for k, v in decoded if not k.startswith(":")],
             }
-        if not self.want_reference:
-            self.done.set()
+        self.done.set()
 
     def note(self, msg: str) -> None:
         if not self.quiet:
@@ -424,43 +450,9 @@ class _Session:
                 return False
             self.record = record
             self.deadline = time.monotonic() + self.timeout
-        if not self.want_reference and not self.want_xhr:
+        if not self.want_xhr:
             self.done.set()
         return True
-
-    def add_reference(self, part: dict) -> bool:
-        """Merge in what one source answered; True once peet's half is in.
-
-        The two sources arrive together when the browser can reach both, and
-        separately when peet had to be pasted, so this accumulates rather than
-        replaces. Only peet completes the run: check.ja3.zone alone is worth
-        keeping but not worth stopping for, since the paste box is still up.
-        """
-        with self.lock:
-            merged = {**(self.reference or {})}
-            for name, value in part.items():
-                if name == "peet":
-                    merged["peet"] = _as_list(merged.get("peet")) + [value]
-                else:
-                    merged[name] = value
-            self.reference = merged
-            have = {peet_kind(e) for e in _as_list(merged.get("peet"))}
-            complete = bool(have) and self.want_kinds <= have
-        if complete:
-            self.done.set()
-        return complete
-
-    def extend(self, seconds: float) -> None:
-        """Keep waiting - the page failed automatically and offered a paste box."""
-        with self.lock:
-            if self.deadline is not None:
-                self.deadline = max(self.deadline, time.monotonic() + seconds)
-
-    def missing(self) -> list[str]:
-        """Which kinds of peet response the run is still holding out for."""
-        with self.lock:
-            have = {peet_kind(e) for e in _as_list((self.reference or {}).get("peet"))}
-        return sorted((self.want_kinds or {"any"}) - have)
 
     def expired(self) -> bool:
         return self.deadline is not None and time.monotonic() > self.deadline
@@ -525,17 +517,13 @@ def _graceful_close(sock: ssl.SSLSocket) -> None:
 
 
 def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
-            want_reference: bool = False, timeout: float = 25.0,
-            want_kinds: frozenset = frozenset(),
-            want_xhr: bool = False) -> dict | None:
-    """Serve until the profile is captured (and the reference, if asked for).
+            timeout: float = 25.0, want_xhr: bool = False) -> dict | None:
+    """Serve until the profile is captured, and the page's own fetch with it.
 
     Returns None if the listening socket is closed from under us, which is how
     selftest stops a capture that never arrived.
     """
-    state = _Session(want_reference=want_reference, timeout=timeout, quiet=quiet,
-                     want_xhr=want_xhr,
-                     want_kinds=want_kinds)
+    state = _Session(timeout=timeout, quiet=quiet, want_xhr=want_xhr)
     threads: list[threading.Thread] = []
     srv.settimeout(0.5)
 
@@ -558,8 +546,6 @@ def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
     for t in threads:
         t.join(timeout=2)
 
-    if state.record is not None and state.reference is not None:
-        state.record["reference"] = state.reference
     if state.record is not None and state.xhr is not None:
         # Attached after the fact rather than into the frozen frame list: the
         # profile is the first request, and this is a second, separate one.
@@ -614,10 +600,6 @@ def serve(args: argparse.Namespace) -> int:
     if args.brand:
         profile_path(args.brand)          # reject a bad name before we listen
 
-    # A path capture has nowhere to file a reference, and our own client cannot
-    # run the page's javascript, so asking for one would only waste the timeout.
-    want_reference = args.peet and not args.out
-
     hosts = [h.strip() for h in (args.host or "").split(",") if h.strip()]
     detected = local_ipv4()
     if detected:
@@ -642,21 +624,17 @@ def serve(args: argparse.Namespace) -> int:
               f"    netsh advfirewall firewall add rule name=hpack_probe "
               f"dir=in action=allow protocol=TCP localport={args.port}")
 
-    record = capture(srv, ctx, want_reference=want_reference,
-                     timeout=args.reference_timeout,
+    record = capture(srv, ctx, timeout=args.xhr_timeout,
                      # The page fetches /xhr-sample by itself, but the run has
                      # to be told to stay up for it - otherwise it ends on the
                      # navigation and the xhr half is lost. It arrives in
                      # milliseconds; the timeout is only the giving-up point.
-                     want_xhr=True,
-                     want_kinds=frozenset({"navigate", "cors"}) if args.both
-                     else frozenset())
+                     want_xhr=True)
     srv.close()
     if record is None:
         return 1
 
     peer = record.pop("peer", "?")
-    reference = record.pop("reference", None)
     if args.out:
         out, brand = Path(args.out), None
     else:
@@ -681,40 +659,11 @@ def serve(args: argparse.Namespace) -> int:
 
     # We refuse to issue tickets, but a browser that collected one before that
     # was true still offers it, and the capture is then a resumed handshake.
-    ch = record.get("client_hello") or {}
-    if any(e["hex"] == "0x0029" for e in ch.get("extensions", [])):
+    if carries_psk(record.get("client_hello")):
         print("  !! this ClientHello carries pre_shared_key: the browser resumed "
               "a session it had from an earlier visit, so the capture has one "
               "extension our client never sends. Re-capture from a fresh "
               "browser profile (a new --user-data-dir).", file=sys.stderr)
-
-    if brand:
-        ref_out = REFERENCES_DIR / f"{brand}.json"
-        REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
-        was = ref_out.exists()
-        previous = json.loads(ref_out.read_text()) if was else {}
-        if "tls" in previous:                 # the pre-container format
-            previous = {"peet": previous}
-        # Ours is recomputed from this capture every time; peet's half, which
-        # costs a browser round trip to collect, is carried over when this run
-        # did not ask for one.
-        merged = merge_reference(previous, reference or {}, ua)
-        merged["local"] = local_reference(record)
-        ref_out.write_text(json.dumps(
-            {"brand": brand, "collected_at": record["captured_at"], **merged},
-            indent=2))
-        detail = [f"local ja4 {merged['local'].get('tls', {}).get('ja4', '?')}"]
-        detail += [f"peet {peet_kind(e) or '?'} "
-                   f"ja4 {e.get('tls', {}).get('ja4', '?')}"
-                   for e in _as_list(merged.get("peet"))]
-        if merged.get("ja3zone"):
-            detail.append(f"ja3 {merged['ja3zone'].get('hash', '?')}")
-        print(f"  {'replaced' if was else 'stored as'} {ref_out}"
-              f"  ({'; '.join(detail)})")
-        if want_reference and not reference:
-            print("  no tls.peet.ws half this time - the browser reached "
-                  "neither service. Everything except the xhr header template "
-                  "and part of verify_fp.py still works.")
 
     summarise(record)
     if brand:
@@ -739,194 +688,31 @@ def report_profile(brand: str) -> None:
               f"{type(exc).__name__}: {exc})", file=sys.stderr)
 
 
-#: Served to the browser once its request has been captured, to collect the
-#: other half of the picture. tls.peet.ws reports the fingerprint of whoever
-#: asks, so the only way to learn what the *real* browser looks like there is to
-#: have the real browser ask - which is what this page does, before posting the
-#: answer back to us.
+#: Served to the browser once its request has been captured. It has one job:
+#: fire the same-origin /xhr-sample, because how a browser words an XHR cannot
+#: be derived from its navigation and no third party can measure it for us - a
+#: cross-origin service is blocked by CORS on every iOS Safari there is.
 #:
-#: Two sources, because only one of them can be reached from a plain browser:
-#:
-#: * check.ja3.zone answers `access-control-allow-origin: *` on the response
-#:   itself, so every browser can fetch it - a phone included, with no flags. It
-#:   only reports JA3, but JA3 *is* the thing our own parsing cannot check about
-#:   itself, since a ClientHello can never be compared byte for byte.
-#: * tls.peet.ws reports far more (ja4, peetprint, the whole h2 layer) but only
-#:   sends CORS headers on the OPTIONS preflight, never on the GET, so a plain
-#:   browser blocks it. Two ways round that, both offered by the page: start the
-#:   browser with --disable-web-security (renderer-side only, it does not touch
-#:   the network stack, so the capture is unaffected), or open peet in a tab and
-#:   paste the JSON back.
-PEET_URL = "https://tls.peet.ws/api/all"
-JA3_URL = "https://check.ja3.zone/"
-
-PAGE = ("""<!doctype html>
-<meta charset="utf-8"><title>hpack_probe</title>
-<style>body{font:14px/1.6 system-ui;margin:3em;max-width:46em}
-code{background:#eee;padding:2px 4px}textarea{width:100%%;font:12px monospace}
-#f{margin-top:2em;padding:1em;border:1px solid #ccc;border-radius:6px}</style>
-<body>
-<p id="s">captured. collecting the reference...</p>
-<div id="f">
-  <p id="w"></p>
-  <p>The fetch above is an <b>XHR</b>, and a browser does not send the same
-  headers for one of those as for a <b>navigation</b>. To record the navigation
-  variant too, <a href="%(peet)s" target="_blank" rel="noopener">open %(peet)s</a>
-  in a tab and bring the JSON back here. On a phone, do not drag out a
-  selection: <b>long-press the text &rarr; Select All &rarr; Copy</b>, come back
-  and press the button.</p>
-  <p><button id="c" hidden>read the clipboard</button></p>
-  <textarea id="t" rows="6" placeholder="...or paste the JSON in here"></textarea>
-  <p><button id="b">save it</button> <button id="d">skip</button></p>
-</div>
-<script>
-const say = t => document.getElementById("s").textContent = t;
-const post = b => fetch("/reference", {method: "POST", body: b});
-// Cache-busted through the URL, not {cache:"no-store"} - that option makes
-// Chrome add `pragma: no-cache` and `cache-control: no-cache`, which would
-// then be in the reference as if the browser always sent them.
-const grab = u => fetch(u + (u.indexOf("?") < 0 ? "?" : "&") + "_=" + Date.now())
-                    .then(r => r.json()).catch(() => null);
-const warn = t => document.getElementById("w").innerHTML = t;
-// A plain same-origin GET whose only purpose is to be an XHR: its HEADERS frame
-// is what the xhr template is measured from. Cross-origin services cannot give
-// us this - a browser that blocks the fetch (every iOS Safari) would leave the
-// xhr half guessed forever.
-fetch("/xhr-sample");
-Promise.all([grab("%(peet)s"), grab("%(ja3)s")]).then(([peet, ja3zone]) => {
-  post(JSON.stringify({peet: peet, ja3zone: ja3zone})).then(() => {
-    say(peet ? "captured, and the tls.peet.ws reference with it"
-             : (ja3zone ? "captured; check.ja3.zone answered but tls.peet.ws did not"
-                        : "captured; no reference could be collected"));
-    if (!peet) {
-      warn("<b>The browser blocked the tls.peet.ws fetch</b> - it sends no CORS "
-         + "header on the response itself. Starting the browser with "
-         + "<code>--user-data-dir=&lt;temp&gt; --disable-web-security</code> "
-         + "lets it through; otherwise paste it below.");
-    }
-  });
-});
-const ta = document.getElementById("t");
-// Checked here rather than server-side: a half-selected copy is the likely
-// mistake, and the person who can fix it is looking at this page.
-const send = text => {
-  try { JSON.parse(text); } catch (e) {
-    say("that is not whole JSON - copy all of %(peet)s, not part of it");
-    return;
-  }
-  post(text).then(() => fetch("/reference/done", {method: "POST"}))
-            .then(() => say("done - saved the pasted navigation as well"));
-};
-document.getElementById("b").onclick = () => send(ta.value);
-// One tap instead of long-pressing the box and hunting for Paste. Safari shows
-// its own confirmation before handing the clipboard over, so this cannot read
-// anything behind the user's back; where it is unavailable the box still is.
-if (navigator.clipboard && navigator.clipboard.readText) {
-  const c = document.getElementById("c");
-  c.hidden = false;
-  c.onclick = () => navigator.clipboard.readText()
-    .then(t => { ta.value = t; send(t); })
-    .catch(() => say("the browser kept the clipboard to itself - use the box"));
-}
-document.getElementById("d").onclick = () =>
-  fetch("/reference/done", {method: "POST"})
-    .then(() => say("done - you can close this tab"));
-</script>
-""" % {"peet": PEET_URL, "ja3": JA3_URL}).encode()
-
-#: Served instead of the above when the fingerprints are being computed here,
-#: which is the default. It still has one job: fire the same-origin /xhr-sample,
-#: because how a browser words an XHR cannot be derived from its navigation and
-#: no third party can measure it for us. Then it says so and finishes the run,
-#: so a capture is one page load with nothing to read and nothing to press.
-PAGE_LOCAL = b"""<!doctype html>
+#: There used to be a second page here that asked the browser to fetch
+#: tls.peet.ws and post the answer back, so that a `references/<brand>.json`
+#: could be stored next to the capture. That whole apparatus is gone. What an
+#: outside service makes of a browser is now asked *live* by verify_fp, of our
+#: own client, and compared against fingerprints computed from this capture's
+#: raw bytes - which needs nothing stored, works for a brand captured through
+#: mitmproxy (where a third party would only ever see mitmproxy's TLS), and
+#: costs no paste-box UI on a phone.
+PAGE = b"""<!doctype html>
 <meta charset="utf-8"><title>hpack_probe</title>
 <style>body{font:14px/1.6 system-ui;margin:3em;max-width:46em}</style>
 <body>
 <p id="s">captured. one moment...</p>
 <script>
 const say = t => document.getElementById("s").textContent = t;
-// Sequenced, not fired and forgotten: /reference/done ends the run, and if it
-// won the race the xhr sample would be missing from the capture.
 fetch("/xhr-sample").catch(() => null)
-  .then(() => fetch("/reference/done", {method: "POST"}))
   .then(() => say("done - you can close this tab"))
   .catch(() => say("done"));
 </script>
 """
-
-MAX_REFERENCE = 1 << 20
-#: Extra time granted once the page has told us its fetch was blocked and put a
-#: paste box on screen. Long enough to open a tab, copy and paste.
-PASTE_GRACE = 180.0
-
-
-def reference_part(body: bytes) -> dict | None:
-    """What one POST to /reference carries, or None if it carries nothing.
-
-    Either the page's own `{"peet": ..., "ja3zone": ...}` - with nulls for
-    whatever it could not reach - or a bare tls.peet.ws response pasted in by
-    hand, which is recognisable by its "tls" key.
-    """
-    try:
-        data = json.loads(body)
-    except ValueError:
-        return None
-    if not isinstance(data, dict):
-        return None
-    if "tls" in data:
-        return {"peet": data}
-    part = {k: v for k, v in data.items() if k in ("peet", "ja3zone") and v}
-    return part or None
-
-
-def peet_kind(entry: dict) -> str | None:
-    """`navigate` or `cors` - which kind of request this peet response describes."""
-    for frame in (entry or {}).get("http2", {}).get("sent_frames", []):
-        if frame.get("frame_type") != "HEADERS":
-            continue
-        sent = dict(h.split(": ", 1) for h in frame.get("headers", []) if ": " in h)
-        return sent.get("sec-fetch-mode")
-    return None
-
-
-def _as_list(value: typing.Any) -> list:
-    if not value:
-        return []
-    return value if isinstance(value, list) else [value]
-
-
-def merge_reference(previous: dict, fresh: dict, user_agent: str) -> dict:
-    """Keep the kinds this visit could not produce, if it is the same browser.
-
-    One visit yields one kind: the page's own fetch is always `cors`, and the
-    `navigate` variant only arrives when the JSON is pasted in from a real
-    navigation. Both are worth having - navigate is where the default header
-    template's `referer` position comes from - so they accumulate rather than
-    replace. A capture from a different browser build drops the old entries
-    instead, since a stale order is worse than a derived one.
-    """
-    entries = [e for e in _as_list(fresh.get("peet")) if e]
-    kinds = {peet_kind(e) for e in entries}
-    for old in _as_list(previous.get("peet")):
-        if not old or old.get("user_agent") != user_agent:
-            continue
-        if peet_kind(old) in kinds:
-            continue
-        entries.append(old)
-        kinds.add(peet_kind(old))
-
-    ja3zone = fresh.get("ja3zone")
-    if not ja3zone:
-        old = previous.get("ja3zone")
-        ja3zone = old if old and old.get("user_agent") == user_agent else None
-
-    out: dict = {}
-    if entries:
-        out["peet"] = entries
-    if ja3zone:
-        out["ja3zone"] = ja3zone
-    return out
 
 
 def send_response(sock: ssl.SSLSocket, encoder, stream: int, status: bytes,
@@ -1002,21 +788,9 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
                 # The page goes back either way: even when nothing is being
                 # collected from a third party, it is what makes the browser
                 # send the /xhr-sample. Our own client ignores the body.
-                send_response(sock, encoder, stream, b"200", b"text/html",
-                              PAGE if state.want_reference else PAGE_LOCAL)
-                if won and state.want_reference:
-                    state.note(f"  waiting up to {state.timeout:.0f}s for the "
-                               f"browser to fetch tls.peet.ws (keep the tab open)")
-                elif won and not state.want_xhr:
+                send_response(sock, encoder, stream, b"200", b"text/html", PAGE)
+                if won and not state.want_xhr:
                     return
-
-            elif method == "POST" and path.startswith("/reference/done"):
-                send_response(sock, encoder, stream, b"200", b"text/plain", b"ok")
-                state.done.set()
-                return
-
-            elif method == "POST" and path.startswith("/reference"):
-                bodies[stream] = bytearray()
 
             elif method == "GET" and path.startswith("/xhr-sample"):
                 state.claim_xhr(info, decoded)
@@ -1025,39 +799,10 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
             elif method == "GET" and not path.startswith("/favicon"):
                 # Any connection serves the page: after clicking through the
                 # certificate warning the browser may retry on a fresh one.
-                send_response(sock, encoder, stream, b"200", b"text/html",
-                              PAGE if state.want_reference else PAGE_LOCAL)
+                send_response(sock, encoder, stream, b"200", b"text/html", PAGE)
 
             else:
                 send_response(sock, encoder, stream, b"404", b"text/plain", b"")
-
-        elif ftype == 0 and stream in bodies:  # DATA for the reference POST
-            bodies[stream] += payload
-            if len(bodies[stream]) > MAX_REFERENCE:
-                del bodies[stream]
-                send_response(sock, encoder, stream, b"413", b"text/plain", b"")
-            elif flags & 0x01:  # END_STREAM
-                send_response(sock, encoder, stream, b"200", b"text/plain", b"ok")
-                body = bytes(bodies.pop(stream))
-                part = reference_part(body)
-                if part is None:
-                    state.note(f"  unusable reply from the page "
-                               f"({body[:120].decode('utf-8', 'replace') or 'empty'})")
-                    state.extend(PASTE_GRACE)
-                    continue
-                state.note(f"  reference: {', '.join(sorted(part))} "
-                           f"({len(body)} bytes)")
-                if state.add_reference(part):
-                    return
-                # Still short of what was asked for; the paste box is up.
-                missing = state.missing()
-                state.note(
-                    f"  still missing the {' and '.join(missing)} variant of "
-                    f"tls.peet.ws - paste it into the page or press skip"
-                    if missing != ["any"] else
-                    f"  tls.peet.ws is still missing - paste its JSON into the "
-                    f"page or press skip")
-                state.extend(PASTE_GRACE)
 
 
 # --- driving our own client -------------------------------------------------
@@ -1083,21 +828,39 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
 
     from . import browser_fp
 
+    # The library supplies the header *order* and never the values, so the
+    # values have to come from here for the comparison to mean anything: these
+    # are the ones the captured browser sent, handed back to it verbatim. A
+    # difference in the resulting bytes is then a difference in ordering or in
+    # HPACK encoding, which is exactly what is under test.
+    # A profile now carries only what belongs to the network stack, so the
+    # things that belong to the captured *client* - its header set, their
+    # order, and whether it put a priority on the HEADERS frame - have to be
+    # handed back explicitly for this to reproduce anything. That is the point
+    # of the comparison: what remains under test is the stack's half.
+    captured = browser_fp.profile(brand)
+    defaults = list(captured.headers)
     headers: dict[str, str] = {}
-    if like is not None:
-        prof = browser_fp.profile(brand)
-        if like.get("sec-fetch-mode") == "cors":
-            prof.header_profile = "xhr"
-        prof.sec_fetch_site = like.get("sec-fetch-site")
-        prof.send_cache_control = "cache-control" in like
-        if "referer" in like:
-            headers["Referer"] = like["referer"]
 
     ctx = ssl.create_default_context()
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
     # verify goes on the transport: httpx ignores its own when given one.
-    transport = browser_fp.Transport(brand, verify=ctx)
+    transport = browser_fp.Transport(
+        brand, verify=ctx, headers=defaults,
+        priority=captured.captured_priority("navigate") or None)
+    # The transport holds its own copy, so this is the one to adjust - the
+    # shared Profile that profile() hands out no longer reaches it.
+    prof = transport.profile
+    if like is not None:
+        if like.get("sec-fetch-mode") == "cors":
+            prof.header_profile = "xhr"
+        # A capture taken by following a link or reloading carries headers the
+        # navigate template has no value for. Pass them through as the caller
+        # would, rather than teaching the profile to invent them.
+        for name in ("sec-fetch-site", "cache-control", "referer"):
+            if name in like:
+                headers[name] = like[name]
     with httpx.Client(transport=transport, timeout=15) as c:
         try:
             c.get(f"https://{authority}/api/all", headers=headers)
@@ -1106,15 +869,19 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
                 # own fetch arrived. Its HPACK block only comes out right if the
                 # first one did too - the dynamic table carries over - so this
                 # tests the encoder far harder than one frame in isolation.
-                prof = browser_fp.profile(brand)
-                was, prof.header_profile = prof.header_profile, "xhr"
-                sent = dict(xhr.get("headers") or [])
-                prof.sec_fetch_site = sent.get("sec-fetch-site")
-                extra = {"Referer": sent["referer"]} if "referer" in sent else {}
+                # Swap the whole set, not add to it: an xhr's headers are a
+                # different set from a navigation's, so the navigation values
+                # standing on this transport have to step aside or they would
+                # be spliced in as caller extras.
+                was_hdrs, was_prio = prof.default_headers, prof.priority_override
+                prof.default_headers = browser_fp._as_header_pairs(
+                    xhr.get("headers") or [])
+                prof.priority_override = captured.captured_priority("xhr") or None
                 try:
-                    c.get(f"https://{authority}/xhr-sample", headers=extra)
+                    c.get(f"https://{authority}/xhr-sample")
                 finally:
-                    prof.header_profile = was
+                    prof.default_headers = was_hdrs
+                    prof.priority_override = was_prio
         except Exception as exc:  # noqa: BLE001 - server closes early by design
             if not quiet:
                 print(f"(request ended with {type(exc).__name__}: {exc})")
@@ -1131,14 +898,26 @@ def client(args: argparse.Namespace) -> int:
 
 # --- comparing --------------------------------------------------------------
 
-def _decode(block: bytes) -> list[tuple[str, str]]:
-    """Decode for display only - hpack returns str or bytes by version."""
-    import hpack
+def _decode_with(decoder, block: bytes) -> list[tuple[str, str]]:
+    """Decode one block against a decoder that carries the connection's state.
 
+    Every block on a connection has to go through one decoder, in order: HPACK
+    indexes into a table the earlier blocks built, so the second request on a
+    connection cannot be decoded on its own at all.
+    """
     def text(x: bytes | str) -> str:
         return x if isinstance(x, str) else x.decode("utf-8", "replace")
 
-    return [(text(k), text(v)) for k, v in hpack.Decoder().decode(block)]
+    return [(text(k), text(v)) for k, v in decoder.decode(block)]
+
+
+def _decode(block: bytes) -> list[tuple[str, str]]:
+    """Decode a block that is the first on its connection, so the table is
+    empty. Anything later needs `_decode_with` and the decoder that saw the
+    blocks before it."""
+    import hpack
+
+    return _decode_with(hpack.Decoder(), block)
 
 
 def akamai_fingerprint(rec: dict) -> str:
@@ -1172,28 +951,6 @@ def akamai_fingerprint(rec: dict) -> str:
                  if k.startswith(":")) if headers else "",
     ]
     return "|".join(fields)
-
-
-def local_reference(record: dict) -> dict:
-    """Every fingerprint of a capture, computed here rather than asked of a service.
-
-    Shaped like one tls.peet.ws entry so the two sit side by side in the same
-    file and can be read against each other. What it cannot supply is peet's
-    independence - it is our parser checking our parser - so `--peet` still
-    exists and `verify_fp.py` still goes over the network.
-    """
-    out: dict = {}
-    raw = (record.get("client_hello") or {}).get("raw")
-    if raw:
-        out["tls"] = fingerprints.of_client_hello(raw)
-    akamai = akamai_fingerprint(record)
-    out["http2"] = {
-        "akamai_fingerprint": akamai,
-        # md5 to match what every service reporting this value publishes.
-        "akamai_fingerprint_hash": hashlib.md5(
-            akamai.encode(), usedforsecurity=False).hexdigest(),
-    }
-    return out
 
 
 def diff_h2(a: dict, b: dict, na: str, nb: str) -> bool:
@@ -1253,144 +1010,300 @@ def port_of(rec: dict) -> int:
     return split_authority(authority_of(rec))[1]
 
 
-#: Extensions whose body length is not constant even for one real browser, so
-#: comparing it would fail at random. Only ECH so far: BoringSSL's GREASE ECH
-#: carries a random payload and two Chrome 150 captures of the same URL came out
-#: 218 and 250 bytes. The lengths are still printed, because a client that
-#: always sends exactly one of them is its own kind of tell.
-VARIABLE_LENGTH = {"0xfe0d"}
-
-#: Extensions whose *body* carries per-connection randomness, so only their
-#: shape can be compared. key_share is not in here: its bodies are handled
-#: specially below, because the group ids in it are fingerprint material even
-#: though the public keys beside them are fresh every time.
+#: Extensions whose *body* is fresh on every connection, so it is blanked
+#: rather than compared. The body *length* is still compared, because it comes
+#: from the length bytes in front of it, which are not blanked - and a client
+#: whose GREASE ECH is always exactly one size is its own kind of tell.
+#:
+#: key_share is deliberately not in here: its group ids are fingerprint
+#: material even though the public keys beside them are fresh every time, so
+#: `canonical_client_hello` blanks the keys and keeps the groups.
 RANDOM_BODY = {"0xfe0d", "0x0029"}
 
 
-def ext_bodies(ch: dict) -> dict[str, str]:
-    """Extension bodies, re-parsed out of the stored raw ClientHello.
+class Malformed(ValueError):
+    """A ClientHello whose declared lengths do not add up."""
 
-    The capture only keeps GREASE bodies inline, but it keeps the whole record,
-    so the bodies are still there - and they have to be compared. Extension
-    *lengths* alone hide real differences: Chrome and Safari both send a 12-byte
-    supported_groups, listing entirely different groups.
 
-    Values are rendered rather than returned raw, so that the parts which are
-    meant to differ per connection do not show up as failures.
+def canonical_client_hello(raw: bytes, *, keep_record_version: bool = True
+                           ) -> tuple[bytes, list[tuple[str, int]], list[str]]:
+    """Zero out only what genuinely varies per connection.
+
+    This is what the self-test compares, and it is deliberately not a list of
+    parsed fields. Two ClientHellos that agree everywhere outside the regions
+    named below *are the same message*, and every fingerprint anyone computes
+    from them - ja3, ja4, peetprint, or one nobody has published - is therefore
+    equal by construction. Comparing hashes was only ever a way of asking that
+    question indirectly, and a worse one: it can only find what the hash
+    happens to cover.
+
+    A field-by-field comparison has the opposite failure: it silently ignores
+    anything nobody thought to list. `compression_methods` was never compared
+    by the old one. Here nothing is skipped unless it appears in the returned
+    blank list, which the caller prints.
+
+    This also checks itself. Locating the variable regions means walking the
+    message, and walking it wrongly blanks the wrong bytes - which makes the
+    comparison *fail*, loudly, rather than pass. That is the opposite of a
+    parser bug in a field comparison, which makes a difference invisible.
+
+    Returns (canonical bytes, [(what, how many bytes)], [problems]).
+    `problems` holds the assertions that did not hold - regions whose contents
+    are supposed to be fixed, so they are checked rather than blanked:
+
+      * `padding` must be all zeroes (RFC 7685)
+      * a GREASE extension's body must be empty or a single zero byte
+
+    Blanking those instead would hide 190 bytes of an iOS ClientHello.
     """
-    raw = bytes.fromhex(ch["raw"])
-    o = 5 + 4 + 2 + 32
-    o += 1 + raw[o]                                   # session_id
-    o += 2 + int.from_bytes(raw[o:o + 2], "big")      # cipher_suites
-    o += 1 + raw[o]                                   # compression methods
-    o += 2                                            # extensions length
-    out: dict[str, str] = {}
-    while o + 4 <= len(raw):
-        etype = int.from_bytes(raw[o:o + 2], "big")
-        elen = int.from_bytes(raw[o + 2:o + 4], "big")
-        body = raw[o + 4:o + 4 + elen]
-        o += 4 + elen
-        name = "GREASE" if etype in GREASE else f"0x{etype:04x}"
+    b = bytearray(raw)
+    blanked: list[tuple[str, int]] = []
+    problems: list[str] = []
+
+    def wipe(lo: int, hi: int, why: str) -> None:
+        if hi > lo:
+            b[lo:hi] = b"\x00" * (hi - lo)
+            blanked.append((why, hi - lo))
+
+    def need(o: int, n: int, what: str) -> None:
+        if o + n > len(b):
+            msg = f"{what} runs {o + n - len(b)} bytes past the end of the record"
+            raise Malformed(msg)
+
+    need(0, 43, "the record and handshake headers")
+    if not keep_record_version:
+        # An imported capture whose ClientHello mitmproxy had to synthesise
+        # carries a fabricated 0x0303 here. Comparing it would report a
+        # difference that the browser never made.
+        wipe(1, 3, "record_version (unmeasured)")
+    wipe(3, 5, "record_length")
+    wipe(6, 9, "handshake_length")
+    wipe(11, 43, "client_random")
+
+    o = 43
+    need(o, 1, "the session id length")
+    sid = b[o]
+    o += 1
+    need(o, sid, "the session id")
+    wipe(o, o + sid, "session_id")
+    o += sid
+
+    need(o, 2, "the cipher list length")
+    n = int.from_bytes(b[o:o + 2], "big")
+    o += 2
+    need(o, n, "the cipher list")
+    for i in range(o, o + n - 1, 2):
+        if int.from_bytes(b[i:i + 2], "big") in GREASE:
+            wipe(i, i + 2, "GREASE cipher")
+    o += n
+
+    need(o, 1, "the compression method length")
+    o += 1 + b[o]                                  # compared, never blanked
+    need(o, 2, "the extension block length")
+    o += 2
+
+    while o + 4 <= len(b):
+        etype = int.from_bytes(b[o:o + 2], "big")
+        elen = int.from_bytes(b[o + 2:o + 4], "big")
+        body = o + 4
+        need(body, elen, f"extension 0x{etype:04x}")
         if etype in GREASE:
-            continue
-        if name in RANDOM_BODY:
-            out[name] = "(random)"
-        elif etype == 51:                             # key_share
-            out[name] = " ".join(_key_share_shape(body))
-        elif etype in U16_LIST:
-            out[name] = " ".join(_u16_list(body, U16_LIST[etype]))
-        else:
-            out[name] = body.hex()
+            wipe(o, o + 2, "GREASE extension id")
+            if bytes(b[body:body + elen]) not in (b"", b"\x00"):
+                problems.append(f"GREASE extension body is "
+                                f"{bytes(b[body:body + elen]).hex()}, "
+                                f"expected empty or 00")
+        elif etype == 0x0000:                      # server_name
+            wipe(body, body + elen, "server_name")
+        elif etype == 0x0015:                      # padding
+            if set(b[body:body + elen]) - {0}:
+                problems.append(f"padding is not all zeroes ({elen}B)")
+        elif f"0x{etype:04x}" in RANDOM_BODY:      # GREASE ECH, pre_shared_key
+            wipe(body, body + elen, f"0x{etype:04x} body")
+        elif etype == 0x0033:                      # key_share
+            p = body + 2
+            while p + 4 <= body + elen:
+                group = int.from_bytes(b[p:p + 2], "big")
+                klen = int.from_bytes(b[p + 2:p + 4], "big")
+                if group in GREASE:
+                    wipe(p, p + 2, "GREASE key_share group")
+                wipe(p + 4, p + 4 + klen, "key_share key")
+                p += 4 + klen
+        elif etype in (0x000a, 0x002b):            # groups, supported_versions
+            p = body + (2 if etype == 0x000a else 1)
+            while p + 2 <= body + elen:
+                if int.from_bytes(b[p:p + 2], "big") in GREASE:
+                    wipe(p, p + 2, "GREASE codepoint")
+                p += 2
+        o = body + elen
+
+    if o != len(b):
+        msg = f"{len(b) - o} trailing bytes after the last extension"
+        raise Malformed(msg)
+    return bytes(b), blanked, problems
+
+
+def extension_sequence(canon: bytes, raw: bytes) -> list[tuple[str, bytes]]:
+    """(id, canonical body) in wire order, for placing a difference.
+
+    Takes both records because neither alone is enough: the bodies must come
+    from the canonical bytes, which are free of per-connection noise, but the
+    *ids* must come from the original - blanking a GREASE id turns it into
+    0x0000, which is `server_name`, and a Chrome ClientHello carrying two
+    GREASE extensions would then appear to send `server_name` three times.
+    Blanking never changes a length, so the two walk in lockstep.
+    """
+    o = 43
+    o += 1 + canon[o]
+    o += 2 + int.from_bytes(canon[o:o + 2], "big")
+    o += 1 + canon[o]
+    o += 2
+    out: list[tuple[str, bytes]] = []
+    while o + 4 <= len(canon):
+        etype = int.from_bytes(raw[o:o + 2], "big")
+        elen = int.from_bytes(canon[o + 2:o + 4], "big")
+        out.append(("GREASE" if etype in GREASE else f"0x{etype:04x}",
+                    canon[o + 4:o + 4 + elen]))
+        o += 4 + elen
     return out
 
 
-#: Extensions carrying a list of 2-byte codepoints, and the width of the length
-#: prefix in front of it. Rendered element by element rather than as raw hex
-#: for two reasons: the GREASE entry inside has to be wildcarded like any other
-#: GREASE, and a difference is far easier to place when the elements are split.
-U16_LIST = {10: 2, 43: 1, 13: 2}   # supported_groups, supported_versions, sigalgs
-
-
-def _u16_list(body: bytes, prefix: int) -> list[str]:
-    return [("GREASE" if int.from_bytes(body[o:o + 2], "big") in GREASE
-             else f"0x{int.from_bytes(body[o:o + 2], 'big'):04x}")
-            for o in range(prefix, len(body) - 1, 2)]
-
-
-def _key_share_shape(body: bytes) -> list[str]:
-    """`group:keylen` per entry, GREASE wildcarded, the keys themselves dropped."""
-    entries, o = [], 2
-    while o + 4 <= len(body):
-        group = int.from_bytes(body[o:o + 2], "big")
-        n = int.from_bytes(body[o + 2:o + 4], "big")
-        entries.append(f"{'GREASE' if group in GREASE else f'0x{group:04x}'}:{n}")
-        o += 4 + n
-    return entries
+def _prefix_regions(raw: bytes) -> list[tuple[str, int, int]]:
+    """Everything before the extensions, named, so a difference has a place."""
+    o = 43
+    out = [("record_header", 0, 5), ("handshake_header", 5, 9),
+           ("legacy_version", 9, 11), ("client_random", 11, 43)]
+    out.append(("session_id", o, o + 1 + raw[o]))
+    o += 1 + raw[o]
+    n = int.from_bytes(raw[o:o + 2], "big")
+    out.append(("cipher_suites", o, o + 2 + n))
+    o += 2 + n
+    out.append(("compression_methods", o, o + 1 + raw[o]))
+    o += 1 + raw[o]
+    out.append(("extensions_length", o, o + 2))
+    return out
 
 
 def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
-    """Compare the TLS side. GREASE values are wildcarded - they are meant to
-    differ per connection - but their body *lengths* are not, except for
-    VARIABLE_LENGTH."""
+    """Compare two ClientHellos byte for byte, outside what varies per connection.
+
+    Not a list of fields. See `canonical_client_hello` for why: if these bytes
+    match, the two messages are the same message, and no fingerprint - named or
+    unnamed - can tell them apart.
+
+    Extension *order* is reported separately rather than folded in, because one
+    profile is meant to shuffle it (Chrome, since 110) and the others are meant
+    not to. A shuffle with an identical extension set is not a failure, but it
+    is printed every time so that an iOS profile quietly starting to shuffle is
+    visible rather than absorbed by a sort.
+    """
+    print("=== ClientHello ===")
     if a is None or b is None:
-        print("=== ClientHello ===\n  (missing on one side, skipped)")
+        print("  (missing on one side, skipped)")
+        return True
+    if not a.get("raw") or not b.get("raw"):
+        print("  (one side has no raw record - nothing to compare byte by byte)")
         return True
 
-    def shape(ch):
-        return {
-            "record_version": ch["record_version"],
-            "legacy_version": ch["legacy_version"],
-            "session_id_len": ch["session_id_len"],
-            "ciphers": ["GREASE" if int(c, 16) in GREASE else c
-                        for c in ch["cipher_suites"]],
-            # Sorted: both browsers and we shuffle extension order on purpose,
-            # so only the set and each body's length are comparable.
-            "extensions": sorted(
-                ("GREASE" if e["grease"] else e["hex"],
-                 "varies" if e["hex"] in VARIABLE_LENGTH else e["length"])
-                for e in ch["extensions"]),
-            # These positions are not shuffled and are part of the shape.
-            "first_ext": ("GREASE" if ch["extensions"][0]["grease"]
-                          else ch["extensions"][0]["hex"]),
-            "last_ext": ("GREASE" if ch["extensions"][-1]["grease"]
-                         else ch["extensions"][-1]["hex"]),
-        }
+    # mitmproxy hands us a synthetic record whose version is always 0x0303, so
+    # an imported capture records None rather than that artefact. Comparing it
+    # against a measured 0x0301 would report a difference that is not one.
+    keep_version = (a["record_version"] is not None
+                    and b["record_version"] is not None)
+    try:
+        ca, wa, pa = canonical_client_hello(bytes.fromhex(a["raw"]),
+                                            keep_record_version=keep_version)
+        cb, wb, pb = canonical_client_hello(bytes.fromhex(b["raw"]),
+                                            keep_record_version=keep_version)
+    except Malformed as exc:
+        print(f"  MALFORMED: {exc}")
+        return False
 
-    sa, sb = shape(a), shape(b)
-    print("=== ClientHello ===")
-    for hexid in sorted(VARIABLE_LENGTH):
-        la, lb = (next((e["length"] for e in ch["extensions"] if e["hex"] == hexid), None)
-                  for ch in (a, b))
-        if la is not None or lb is not None:
-            print(f"  {hexid:<16} {na}={la}B {nb}={lb}B"
-                  + ("" if la == lb else "  (length varies per connection, not compared)"))
+    print(f"  {na} {len(ca)}B, {nb} {len(cb)}B")
+    for who, blanks in ((na, wa), (nb, wb)):
+        merged: dict[str, int] = {}
+        for why, size in blanks:
+            merged[why] = merged.get(why, 0) + size
+        total = sum(merged.values())
+        print(f"  not compared ({who}, {total}B of {len(ca) if who == na else len(cb)}): "
+              + ", ".join(f"{k} {v}B" for k, v in sorted(merged.items())))
+
     same = True
-    for key in sa:
-        if sa[key] == sb[key]:
-            print(f"  {key:<16} OK")
-            continue
-        same = False
-        print(f"  {key:<16} DIFFER")
-        if key == "extensions":
-            seta, setb = dict(sa[key]), dict(sb[key])
-            for name in sorted(set(seta) | set(setb)):
-                if seta.get(name) != setb.get(name):
-                    print(f"      {name}: {na}={seta.get(name, '-')} "
-                          f"{nb}={setb.get(name, '-')}")
-        else:
-            print(f"      {na}: {sa[key]}")
-            print(f"      {nb}: {sb[key]}")
+    for who, problems in ((na, pa), (nb, pb)):
+        for text in problems:
+            same = False
+            print(f"  ASSERTION FAILED ({who}): {text}")
 
-    ba, bb = ext_bodies(a), ext_bodies(b)
-    differing = [k for k in sorted(set(ba) | set(bb)) if ba.get(k) != bb.get(k)]
-    if differing:
-        same = False
-        print("  ext bodies       DIFFER")
-        for k in differing:
-            print(f"      {k}: {na}={_short(ba.get(k))}")
-            print(f"      {' ' * len(k)}  {nb}={_short(bb.get(k))}")
+    ea = extension_sequence(ca, bytes.fromhex(a["raw"]))
+    eb = extension_sequence(cb, bytes.fromhex(b["raw"]))
+    order_a, order_b = [t for t, _ in ea], [t for t, _ in eb]
+    if order_a == order_b:
+        print("  extension order  identical")
+    elif sorted(order_a) == sorted(order_b):
+        print(f"  extension order  SHUFFLED - same {len(order_a)} extensions, "
+              f"different order. Correct only for a profile that sets "
+              f"SSL_FP_SHUFFLE_EXTS (Chrome does; iOS does not)")
+        print(f"      {na}: {' '.join(order_a)}")
+        print(f"      {nb}: {' '.join(order_b)}")
     else:
-        print("  ext bodies       OK")
+        same = False
+        print("  extension order  DIFFER - not a shuffle, the sets differ")
+        print(f"      {na}: {' '.join(order_a)}")
+        print(f"      {nb}: {' '.join(order_b)}")
+
+    if ca == cb:
+        print("  bytes            IDENTICAL outside the regions above")
+        return same
+
+    # Same set in a different order is the shuffle already reported; compare
+    # the extensions as a multiset so the shuffle does not drown the real
+    # answer. A multiset and not a dict: Chrome sends two GREASE extensions,
+    # and a dict would silently keep one of them.
+    if sorted(order_a) == sorted(order_b) and order_a != order_b:
+        prefix_bad = False
+        pre_b = {n: bytes(cb[lo:hi]) for n, lo, hi in _prefix_regions(cb)}
+        for name, lo, hi in _prefix_regions(ca):
+            if pre_b.get(name) != bytes(ca[lo:hi]):
+                prefix_bad = same = False
+                print(f"  {name:<16} DIFFER")
+                print(f"      {na}: {bytes(ca[lo:hi]).hex()}")
+                print(f"      {nb}: {pre_b.get(name, b'').hex()}")
+        if sorted(ea) == sorted(eb):
+            if not prefix_bad:
+                print("  bytes            IDENTICAL as a multiset "
+                      "(order shuffled, see above)")
+            return same
+        same = False
+        print("  extension bodies DIFFER")
+        left, right = list(ea), list(eb)
+        for item in list(left):
+            if item in right:
+                left.remove(item)
+                right.remove(item)
+        for tag, items in ((na, left), (nb, right)):
+            for k, v in items:
+                print(f"      only in {tag}: {k} = {_short(v.hex())}")
+        return same
+
+    same = False
+    print("  bytes            DIFFER")
+    where: dict[str, int] = {}
+    for i in range(min(len(ca), len(cb))):
+        if ca[i] != cb[i]:
+            for name, lo, hi in _prefix_regions(ca):
+                if lo <= i < hi:
+                    where[name] = where.get(name, 0) + 1
+                    break
+            else:
+                where["extensions"] = where.get("extensions", 0) + 1
+    if len(ca) != len(cb):
+        where["(length)"] = abs(len(ca) - len(cb))
+    for name, count in where.items():
+        print(f"      {name}: {count} byte(s)")
+    for i, (x, y) in enumerate(zip(ea, eb)):
+        if x != y:
+            print(f"      extension {i}: {na}={x[0]} {_short(x[1].hex())}")
+            print(f"      {' ' * (11 + len(str(i)))}{nb}={y[0]} {_short(y[1].hex())}")
     return same
 
 
@@ -1476,6 +1389,370 @@ def diff_records(a: dict, b: dict, na: str, nb: str) -> int:
     return 1
 
 
+# --- importing a mitmproxy capture ------------------------------------------
+
+#: The dump layout mitm_addon.py writes. Bumped together with it, so a dump
+#: from an older addon is refused instead of misread.
+MITM_FORMAT = 2
+
+#: selftest_one's return for "this capture cannot be replayed on this machine",
+#: as distinct from 0 (matched) and 1 (differed).
+SKIPPED = 2
+
+
+def capture_mitm(args: argparse.Namespace) -> int:
+    """Run mitmproxy with our addon loaded, then import what it recorded.
+
+    mitmproxy has to be a separate process, not an import: it needs Python 3.12
+    or newer and this one is the 3.11 built against the fork. That is also why
+    the addon is passed by path rather than by module name - it is read by the
+    other interpreter, and a standalone mitmproxy build has its own.
+    """
+    from . import addon_path
+
+    mitmdump = args.mitmdump or shutil.which("mitmdump")
+    if not mitmdump:
+        print("mitmdump is not on PATH.\n\n"
+              "  pipx install mitmproxy        # keeps it off this interpreter\n"
+              "  pip install mitmproxy         # needs its own Python >= 3.12\n\n"
+              "or point at one with --mitmdump. It does not have to be the "
+              "Python this package is installed in, and normally should not be "
+              "- this one is 3.11, built against the OpenSSL fork.",
+              file=sys.stderr)
+        return 2
+
+    out = Path(args.out).resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    argv = [mitmdump, "-s", addon_path(),
+            "--set", f"fp_out={out}",
+            "--mode", args.mode]
+    # Several --host become one alternation: the addon takes a single regex,
+    # and asking a caller to write the `|` themselves is asking them to quote
+    # it past a shell as well.
+    hosts = "|".join(f"(?:{h})" for h in args.host) if args.host else ""
+    if hosts:
+        argv += ["--set", f"fp_hosts={hosts}"]
+    for pattern in args.ignore_hosts or ():
+        argv += ["--ignore-hosts", pattern]
+    if args.port is not None:
+        argv += ["--listen-port", str(args.port)]
+    # argparse.REMAINDER hands back the "--" that separated our options from
+    # mitmdump's, which mitmdump should not see.
+    extra = args.extra[1:] if args.extra[:1] == ["--"] else args.extra
+    argv += extra
+
+    ca = Path(os.environ.get("MITMPROXY_CONFDIR", Path.home() / ".mitmproxy"))
+    print(f"  addon    {addon_path()}")
+    print(f"  dumps    {out}")
+    print(f"  hosts    {hosts or 'every TLS connection (consider --host)'}")
+    if args.ignore_hosts:
+        print(f"  ignored  {', '.join(args.ignore_hosts)}   "
+              f"(passed through untouched, never decrypted)")
+    print(f"  CA cert  {ca}/mitmproxy-ca-cert.pem   (http://mitm.it from the "
+          f"device once it is proxied)")
+    print("\nBrowse the site, then stop with Ctrl-C.\n")
+    # mitmdump writes straight to the terminal; without this our own preamble
+    # sits in a buffer and surfaces underneath its output.
+    sys.stdout.flush()
+
+    proc = subprocess.Popen(argv)
+    # Ctrl-C goes to the whole foreground group, so mitmdump gets it too and
+    # starts shutting down. Wait for it rather than racing it: its `done` hook
+    # is where connections still open get written out.
+    #
+    # Every interrupt has to be swallowed, not just the first. Shutting down
+    # takes a moment, a second Ctrl-C is the natural reaction to that, and if
+    # it escaped here it would kill this process while mitmdump was still
+    # flushing - which loses the import, and looks exactly like the capture
+    # silently doing nothing. mitmdump still receives each one through the
+    # group, so its own force-quit path is unaffected.
+    interrupted = False
+    while True:
+        try:
+            proc.wait(timeout=None if not interrupted else 20)
+            break
+        except KeyboardInterrupt:
+            if not interrupted:
+                print("\nstopping mitmproxy, waiting for it to write out what "
+                      "it has...", flush=True)
+            interrupted = True
+        except subprocess.TimeoutExpired:
+            print("mitmproxy has not stopped; terminating it.", flush=True)
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except (subprocess.TimeoutExpired, KeyboardInterrupt):
+                proc.kill()
+            break
+
+    if proc.returncode not in (0, None) and not interrupted:
+        print(f"\nmitmdump exited with {proc.returncode} - see its output "
+              f"above.", file=sys.stderr)
+
+    dumps = sorted(p for p in out.iterdir() if p.suffix == ".json")
+    print(f"\n{len(dumps)} dump(s) in {out}")
+    if not dumps:
+        print("  nothing was captured. Check that the device really went "
+              "through the proxy, that it trusts the CA, and that --host "
+              "matches the SNI you were after.", file=sys.stderr)
+        return 1
+    if not args.brand:
+        print(f"  import them with:\n"
+              f"    mytls-probe import-mitm {out} --brand <name>")
+        return 0
+
+    print(f"\n=== importing into {args.brand} ===")
+    rc = import_mitm(argparse.Namespace(
+        source=str(out), brand=args.brand, out=None,
+        allow_resumed=args.allow_resumed))
+    if rc:
+        # The dumps are the expensive part - they took a browsing session to
+        # collect. Say plainly that nothing was written and that they survive,
+        # rather than leaving a non-zero exit to be inferred from.
+        print(f"\nno profile was written. The dumps are still in {out} - fix "
+              f"whatever is reported above and re-run:\n"
+              f"    mytls-probe import-mitm {out} --brand {args.brand}",
+              file=sys.stderr)
+    return rc
+
+
+def read_mitm_dump(path: Path) -> dict | None:
+    """Turn one raw mitmproxy dump into the same shape `serve` produces.
+
+    The dump is a whole connection, not one request. The profile takes the part
+    that matches what `serve` records: everything up to and including the
+    *first* HEADERS, whose HPACK block is encoded against an empty table.
+
+    The xhr template is taken from the same connection, never another one, and
+    this matters more than it looks. An xhr block is encoded against a table
+    the navigation already filled - all three stored profiles fail to decode
+    with a fresh decoder and decode cleanly after their navigation - so its
+    bytes are only meaningful in that sequence. Our own client is driven the
+    same way, navigation then xhr on one connection, so its encoder reaches the
+    same state and the two are comparable. Lifting a cors request off a
+    different connection would give a cold-table encoding that matches nothing.
+
+    Returns None for a connection with no usable request in it, which is
+    ordinary - browsers open connections they never use.
+    """
+    import hpack
+
+    dump = json.loads(path.read_text())
+    if dump.get("format") != MITM_FORMAT:
+        print(f"  {path.name}: format {dump.get('format')!r}, expected "
+              f"{MITM_FORMAT} - written by a different mitm_addon.py, skipped",
+              file=sys.stderr)
+        return None
+
+    ch = parse_client_hello(bytes.fromhex(dump["client_hello"]))
+    if ch is not None and not dump.get("client_hello_exact"):
+        # The addon could not catch the ClientHello on the wire and had to let
+        # mitmproxy synthesise a record header, which is always stamped 0x0303
+        # whatever the browser sent. None says "not measured here" rather than
+        # recording that artefact; no fingerprint reads this field anyway.
+        ch["record_version"] = None
+
+    decoder = hpack.Decoder()
+    frames: list[dict] = []
+    profile_frames: list[dict] | None = None
+    navigation: tuple[dict, list] | None = None
+    xhr: dict | None = None
+    requests = 0
+
+    for ftype, flags, stream, payload in frames_from_stream(
+            bytes.fromhex(dump["client"])):
+        described = describe(ftype, flags, stream, payload)
+        if profile_frames is None:
+            frames.append(described)
+        if ftype != 1:  # only HEADERS carry a request
+            continue
+        if profile_frames is None:
+            profile_frames = frames      # ends with this HEADERS, as serve does
+        block = described.get("header_block")
+        if block is None:
+            continue
+        if not flags & 0x04:  # END_HEADERS
+            print(f"  {path.name}: a HEADERS frame is continued into "
+                  f"CONTINUATION, which nothing here reassembles - skipped",
+                  file=sys.stderr)
+            return None
+        try:
+            decoded = _decode_with(decoder, bytes.fromhex(block))
+        except Exception as exc:  # noqa: BLE001 - one bad dump, not a crash
+            print(f"  {path.name}: HPACK decoding failed at request "
+                  f"{requests + 1} ({type(exc).__name__}: {exc}). The stream is "
+                  f"misaligned, most likely recorded from part-way through a "
+                  f"connection - skipped", file=sys.stderr)
+            return None
+        requests += 1
+        if navigation is None:
+            navigation = (described, decoded)
+        elif xhr is None and _request_kind(dict(decoded)) == "cors":
+            xhr = {
+                "header_block": block,
+                "priority": described.get("priority"),
+                "headers": [[k, v] for k, v in decoded if not k.startswith(":")],
+            }
+
+    if navigation is None or profile_frames is None:
+        return None
+    first, headers = navigation
+    flat = dict(headers)
+    return {
+        "path": path,
+        "sni": dump.get("sni"),
+        "alpn": dump.get("alpn"),
+        "resumed": carries_psk(ch),
+        "kind": _request_kind(flat),
+        "requests": requests,
+        "headers": headers,
+        "user_agent": flat.get("user-agent", ""),
+        "record": {
+            "frames": profile_frames,
+            "client_hello": ch,
+            "captured_at": dump.get("captured_at", ""),
+        },
+        "xhr": xhr,
+    }
+
+
+#: What a request whose client sends no Fetch Metadata at all is called here.
+#: Not a `sec-fetch-mode` value - that is the point of it.
+UNLABELLED = "unlabelled"
+
+
+def _request_kind(flat: dict) -> str:
+    """navigate, cors, ... - which template this request would exercise.
+
+    `sec-fetch-mode` says it outright wherever it is sent, and where it is sent
+    it is authoritative: a request the browser itself calls `cors` is not a
+    navigation, whatever else it looks like.
+
+    Where it is absent the question is different, because `sec-fetch-*` is a
+    browser header - the Fetch spec's, not HTTP's. A native client, an iOS app
+    on NSURLSession, anything that is not a browser, sends none of it and has
+    no notion of a navigation to report. Such a request is `unlabelled`: not
+    "not a navigation", but "this client does not classify its requests".
+    Those are still worth capturing - the ClientHello and the HTTP/2 layer do
+    not care what a request is for - so `import-mitm` takes them, and says so.
+
+    An old browser is the one case in between: it sends no Fetch Metadata but
+    does ask for HTML on a navigation, which is enough to call it one.
+    """
+    mode = flat.get("sec-fetch-mode")
+    if mode:
+        return mode
+    if flat.get("accept", "").startswith("text/html"):
+        return "navigate"
+    return UNLABELLED
+
+
+def import_mitm(args: argparse.Namespace) -> int:
+    """Build a profile out of what mitm_addon.py recorded off a real site."""
+    source = Path(args.source)
+    paths = (sorted(p for p in source.iterdir() if p.suffix == ".json")
+             if source.is_dir() else [source])
+    if not paths:
+        print(f"no dumps in {source}", file=sys.stderr)
+        return 2
+
+    found = [d for d in (read_mitm_dump(p) for p in paths) if d]
+    if not found:
+        print(f"{len(paths)} dump(s) in {source}, none with a complete request "
+              f"in it. Capture again and let the page finish loading.",
+              file=sys.stderr)
+        return 2
+
+    print(f"{len(found)} connection(s) with a request:")
+    for d in found:
+        print(f"  {d['path'].name:<38} {d['sni'] or '?':<26} "
+              f"{d['alpn'] or '?':<5} {d['kind']:<10} {d['requests']:>3} req"
+              f"{'  +xhr' if d['xhr'] else '':<6}"
+              f"{'  RESUMED' if d['resumed'] else ''}")
+
+    usable = [d for d in found if not d["resumed"]] if not args.allow_resumed else found
+    if not usable:
+        print("\nevery connection resumed a session, so every ClientHello here "
+              "carries a pre_shared_key our client never sends. mitmproxy "
+              "cannot be told to stop issuing tickets, so clear the browser's "
+              "TLS state (a fresh --user-data-dir, or a new private window on "
+              "iOS) and capture again.", file=sys.stderr)
+        return 1
+
+    # A navigation is what the default header template reproduces, so it is
+    # what to look for. Failing that, a client that sends no Fetch Metadata at
+    # all has no navigation to find and its one kind of request is the one to
+    # take - see _request_kind. What is refused is the middle case: a browser
+    # that told us this request was a subresource, where taking it would put
+    # cors headers into a template that claims to be a navigation.
+    navigations = [d for d in usable if d["kind"] == "navigate"]
+    unlabelled = [d for d in usable if d["kind"] == UNLABELLED]
+    if not navigations and not unlabelled:
+        print(f"\nevery connection here carries a request the client itself "
+              f"labelled as something other than a navigation "
+              f"({', '.join(sorted({d['kind'] for d in usable}))}). The "
+              f"profile's header template is a navigation, so it cannot be "
+              f"built from these.\n"
+              f"  - from a browser: open the site in a new tab once the proxy "
+              f"is running, so a fresh connection carries the document "
+              f"request first\n"
+              f"  - check --host matches the domain serving the HTML, not just "
+              f"a CDN", file=sys.stderr)
+        return 1
+
+    # Prefer a navigation that also carried a cors request, so both templates
+    # come from one connection and the xhr block's HPACK state is the one our
+    # client reaches. A navigation alone is still fine; it just leaves the xhr
+    # template as it was.
+    if navigations:
+        navigation = next((d for d in navigations if d["xhr"]), navigations[0])
+    else:
+        navigation = unlabelled[0]
+        accept = dict(navigation["headers"]).get("accept", "(none)")
+        print(f"\nnote: this client sends no sec-fetch-* headers, so nothing "
+              f"says which of its requests are navigations - it is not a "
+              f"browser, or not a recent one. Taking the first request on "
+              f"{navigation['path'].name} as the template; it asked for "
+              f"{accept[:48]!r}. Check that is the request you meant to "
+              f"reproduce.", file=sys.stderr)
+    xhr = navigation["xhr"]
+
+    record = navigation["record"]
+    if args.out:
+        out, brand = Path(args.out), None
+    else:
+        brand = args.brand or brand_of(record)
+        out = profile_path(brand)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        record = {"brand": brand, **record}
+    if xhr is not None:
+        record["xhr"] = xhr
+
+    replacing = out.exists()
+    out.write_text(json.dumps(record, indent=2))
+    label = "navigation" if navigation["kind"] == "navigate" else "request"
+    print(f"\n  {label} from {navigation['path'].name}: "
+          f"{navigation['user_agent'] or '?'}")
+    if xhr:
+        print(f"  xhr from the same connection "
+              f"({len(xhr['header_block']) // 2}B)")
+    elif navigation["kind"] == "navigate":
+        print("  !! no cors request on that connection, so this profile has "
+              "no xhr template. Load a page that fetches something, and take "
+              "the capture from the connection that carried both.")
+    else:
+        # Nothing here reports a cors request, so there is no second template
+        # to look for and its absence is not a shortfall.
+        print("  no xhr template - this client does not label its requests, "
+              "so there is only the one")
+    print(f"  {'replaced' if replacing else 'stored as'} {out}")
+
+    summarise(record)
+    if brand:
+        report_profile(brand)
+    return 0
+
+
 def _load(name: str) -> tuple[dict, str]:
     """A capture, by path or by brand."""
     path = Path(name)
@@ -1534,10 +1811,15 @@ def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
     try:
         srv = listen(port)
     except OSError as exc:
+        # Not a failure: nothing about this capture has been found wrong, it
+        # simply cannot be replayed here. A capture taken off a real site -
+        # which import-mitm makes easy - names that site's authority, and
+        # binding its port needs either root or the port to be free.
         print(f"cannot listen on :{port} ({exc}). The port cannot simply be "
               f"changed - it is baked into {source}'s :authority - so free it "
-              f"and re-run.", file=sys.stderr)
-        return 1
+              f"and re-run, or run as root if it is a privileged port.",
+              file=sys.stderr)
+        return SKIPPED
 
     got: list[dict] = []
     want_xhr = ref.get("xhr") is not None
@@ -1581,8 +1863,368 @@ def selftest(args: argparse.Namespace) -> int:
     if len(targets) > 1:
         print("\n=== summary ===")
         for brand, rc in results.items():
-            print(f"  {brand:<16} {'PASS' if rc == 0 else 'FAIL'}")
-    return 0 if all(rc == 0 for rc in results.values()) else 1
+            verdict = {0: "PASS", SKIPPED: "SKIP (not replayable here)"}
+            print(f"  {brand:<16} {verdict.get(rc, 'FAIL')}")
+    # A skip is not a pass, but it is not a failure either - exiting non-zero
+    # on it would make "some profile came from a real site" look like a broken
+    # build for anyone running this in CI.
+    return 0 if all(rc in (0, SKIPPED) for rc in results.values()) else 1
+
+
+def one_client_hello(brand: str, sni: str, alpn: typing.Sequence[str] = ("h2", "http/1.1")
+                     ) -> bytes:
+    """The ClientHello this brand emits for `sni`, caught off a local socket.
+
+    No server, no certificate, no handshake: the ClientHello is the first thing
+    on the wire, so accepting the connection and reading once is enough. The
+    peer then closes and OpenSSL fails, which is the expected outcome here.
+    """
+    from . import browser_fp
+
+    got: dict[str, bytes] = {}
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def accept_one() -> None:
+        conn, _ = srv.accept()
+        got["raw"] = peek_client_hello(conn)
+        conn.close()
+
+    thread = threading.Thread(target=accept_one, daemon=True)
+    thread.start()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(list(alpn))
+    browser_fp.tls_profile.set_profile(ctx, browser_fp.profile(brand).tls_profile)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=5)
+    try:
+        ctx.wrap_socket(sock, server_hostname=sni)
+    except OSError:
+        pass                       # no server on the other end; expected
+    finally:
+        sock.close()
+        thread.join(timeout=5)
+        srv.close()
+    return got.get("raw", b"")
+
+
+#: What a padded ClientHello aims for, in handshake bytes (RFC 7685 / the F5
+#: workaround; 5 more on the wire for the record header).
+PAD_TARGET = 512
+
+
+#: Extensions a *client* chooses per connection rather than inheriting from the
+#: network stack, so a difference here does not mean a different stack.
+#:
+#: Measured on one iOS 16.7.12 device in a single session: the App Store's
+#: amp-api and xp.apple.com connections offer an empty session_ticket while the
+#: same device's mzstatic, fpinit and weather-edge connections do not - same OS,
+#: same ciphers, same groups, same HTTP/2 fingerprint. So `match` reports it,
+#: and does not let it turn a match into a miss. See
+#: SSL_CTX_set_fp_empty_ticket() and Transport(session_ticket=...).
+APP_CONTROLLED_EXTS = {"0x0023"}
+
+#: Extensions whose body is decided by the host the capture was taken against,
+#: so two captures of one client to different sites disagree about them by
+#: construction. server_name is the name; padding compensates for its length,
+#: which is why comparing two captures cannot be a byte comparison the way
+#: comparing our own output against one capture can.
+HOST_DEPENDENT_EXTS = {"0x0000", "0x0015"}
+
+
+def stack_shape(raw: bytes) -> dict:
+    """What a ClientHello says about the network stack that built it.
+
+    Everything a capture of one client to *any* host has in common with a
+    capture of the same client to any other: the cipher list, the extension
+    order, and every extension body except the ones the host decides.
+
+    Not a byte comparison, and it cannot be one - `selftest` compares our own
+    output against one capture and can hold the SNI equal, but two captures
+    taken against different sites carry different names, hence different
+    padding, hence different lengths throughout. What is left after removing
+    those is still the whole fingerprint-bearing part of the message.
+    """
+    canon, _, problems = canonical_client_hello(raw)
+    exts = extension_sequence(canon, raw)
+    o = 43
+    sid = canon[o]
+    o += 1 + sid
+    n = int.from_bytes(canon[o:o + 2], "big")
+    ciphers = [("GREASE" if int.from_bytes(raw[o + 2 + i:o + 4 + i], "big") in GREASE
+                else f"0x{int.from_bytes(raw[o + 2 + i:o + 4 + i], 'big'):04x}")
+               for i in range(0, n, 2)]
+    o += 2 + n
+    return {
+        "legacy_version": f"0x{int.from_bytes(canon[9:11], 'big'):04x}",
+        "ciphers": ciphers,
+        "compression": canon[o:o + 1 + canon[o]].hex(),
+        "extension_order": [k for k, _ in exts],
+        "bodies": {k: v.hex() for k, v in exts
+                   if k not in HOST_DEPENDENT_EXTS and k != "GREASE"},
+        "problems": problems,
+    }
+
+
+def _dump_record(path: Path) -> dict | None:
+    """The ClientHello and h2 frames of one capture, whatever wrote it.
+
+    Accepts a mitm_addon dump, a `serve` profile and a `--out` capture alike,
+    and unlike `read_mitm_dump` it does not insist on a decodable request - a
+    connection that only ever produced a ClientHello still says which stack
+    made it, which is the whole question here.
+    """
+    data = json.loads(path.read_text())
+    if "client" in data and data.get("format") == MITM_FORMAT:
+        raw = bytes.fromhex(data["client_hello"])
+        frames = [describe(*f) for f in
+                  frames_from_stream(bytes.fromhex(data["client"]))]
+        return {"sni": data.get("sni"), "alpn": data.get("alpn"),
+                "raw": raw, "frames": frames}
+    ch = data.get("client_hello")
+    if isinstance(ch, dict) and ch.get("raw"):
+        return {"sni": None, "alpn": None, "raw": bytes.fromhex(ch["raw"]),
+                "frames": data.get("frames") or []}
+    return None
+
+
+def match(args: argparse.Namespace) -> int:
+    """Which installed profile, if any, produced each of these captures.
+
+    The question this answers is not "is our client right" - `selftest` does
+    that - but "does this recording come from the stack a profile describes".
+    That is how an app is shown to be on the system stack rather than carrying
+    its own: five unrelated iOS clients agreeing on every field below is what
+    established that the iOS profiles belong to the OS and not to Safari.
+
+    Differences are reported in two groups, because they answer different
+    questions. A cipher list or a SETTINGS frame that disagrees means a
+    different stack or a different version of one. An `0x0023` that disagrees
+    means the same stack and a differently configured app - that one is the
+    caller's to set, so it never turns a match into a miss.
+    """
+    from . import browser_fp
+
+    paths: list[Path] = []
+    for name in args.source:
+        root = Path(name)
+        paths += sorted(root.rglob("*.json")) if root.is_dir() else [root]
+    if not paths:
+        print(f"no .json under {', '.join(args.source)}", file=sys.stderr)
+        return 2
+
+    brands = [args.brand] if args.brand else list(browser_fp.brands())
+    wanted = {}
+    for brand in brands:
+        prof_path = profile_path(brand)
+        rec = _dump_record(prof_path)
+        if rec is None:
+            print(f"{brand}: {prof_path} has no ClientHello to match against",
+                  file=sys.stderr)
+            return 2
+        wanted[brand] = (stack_shape(rec["raw"]),
+                         akamai_fingerprint({"frames": rec["frames"]})
+                         if rec["frames"] else None)
+
+    tally: dict[str, int] = {}
+    unmatched = 0
+    for path in paths:
+        try:
+            rec = _dump_record(path)
+        except Exception as exc:                       # noqa: BLE001
+            print(f"{path}: unreadable ({type(exc).__name__}: {exc})")
+            continue
+        if rec is None:
+            continue
+        try:
+            shape = stack_shape(rec["raw"])
+        except Malformed as exc:
+            print(f"{path.name}: malformed ClientHello ({exc})")
+            unmatched += 1
+            continue
+        theirs = (akamai_fingerprint({"frames": rec["frames"]})
+                  if any(f["type"] == "HEADERS" for f in rec["frames"]) else None)
+
+        label = rec["sni"] or path.stem
+        # Reported, not compared. The verdict below comes from the fields
+        # themselves; a hash could only ever be a lossier way of asking the
+        # same thing, and JA3 in particular is blind to two of the differences
+        # that matter here - it does not cover signature algorithms at all
+        # (iOS 16 and iOS 18 share a JA3 and differ in JA4), and it hashes the
+        # extension list in wire order, so a shuffling client never repeats
+        # one. Both are printed because between them they place a capture at a
+        # glance, and because "same JA3, different JA4" is worth seeing.
+        f = fingerprints.of_client_hello(rec["raw"])
+        print(f"\n{path.name}")
+        print(f"  {label}  alpn={rec['alpn'] or '?'}")
+        print(f"  ja3={f['ja3_hash']}  ja4={f['ja4']}")
+        print(f"  akamai={theirs or '(no h2 request in this connection)'}")
+        for text in shape["problems"]:
+            print(f"  !! {text}")
+
+        hit = False
+        for brand, (want_shape, want_akamai) in wanted.items():
+            stack, app = _shape_diff(want_shape, shape)
+            if theirs is not None and want_akamai is not None and theirs != want_akamai:
+                stack.append(f"akamai {want_akamai} vs {theirs}")
+            if stack:
+                if args.brand or args.verbose:
+                    print(f"  {brand:<16} no - {'; '.join(stack[:4])}"
+                          + (f" (+{len(stack) - 4} more)" if len(stack) > 4 else ""))
+                continue
+            hit = True
+            tally[brand] = tally.get(brand, 0) + 1
+            note = f" [app-controlled: {'; '.join(app)}]" if app else ""
+            print(f"  {brand:<16} MATCH{note}")
+        if not hit:
+            unmatched += 1
+            if not (args.brand or args.verbose):
+                print("  no installed profile matches this stack")
+
+    print(f"\n=== {len(paths)} file(s) ===")
+    for brand, n in sorted(tally.items()):
+        print(f"  {brand:<16} {n} match(es)")
+    if unmatched:
+        print(f"  {'unmatched':<16} {unmatched}")
+    return 0
+
+
+def _shape_diff(want: dict, got: dict) -> tuple[list[str], list[str]]:
+    """(differences that mean a different stack, differences an app chooses)."""
+    stack: list[str] = []
+    app: list[str] = []
+    for key in ("legacy_version", "compression"):
+        if want[key] != got[key]:
+            stack.append(f"{key} {want[key]} vs {got[key]}")
+    if want["ciphers"] != got["ciphers"]:
+        stack.append(f"{len(want['ciphers'])} ciphers vs {len(got['ciphers'])}"
+                     if len(want["ciphers"]) != len(got["ciphers"])
+                     else "cipher list differs")
+
+    wo = [e for e in want["extension_order"] if e not in APP_CONTROLLED_EXTS]
+    go = [e for e in got["extension_order"] if e not in APP_CONTROLLED_EXTS]
+    if wo != go:
+        stack.append("extension order differs" if sorted(wo) == sorted(go)
+                     else f"extension set differs ({len(wo)} vs {len(go)})")
+    for name in sorted(set(want["bodies"]) | set(got["bodies"])):
+        w, g = want["bodies"].get(name), got["bodies"].get(name)
+        if w == g:
+            continue
+        if w is None:
+            text = f"{name} in the capture, not in the profile"
+        elif g is None:
+            text = f"{name} in the profile, not in the capture"
+        else:
+            text = f"{name} body differs"
+        (app if name in APP_CONTROLLED_EXTS else stack).append(text)
+    return stack, app
+
+
+def _hostname_of_length(n: int) -> str:
+    """A syntactically valid hostname of exactly `n` characters.
+
+    Not just `"a" * n`: a DNS label is capped at 63 bytes and Python's idna
+    codec enforces it, so anything longer has to be split into labels. What is
+    being varied here is the length of the SNI on the wire, and the dots count
+    towards it exactly like any other byte.
+    """
+    if n <= 63:
+        return "a" * n
+    parts, left = [], n
+    while left > 63:
+        parts.append("a" * 63)
+        left -= 64                       # 63 characters and the dot after them
+    parts.append("a" * max(left, 1))
+    return ".".join(parts)[:n]
+
+
+def sniscan(args: argparse.Namespace) -> int:
+    """Emit a ClientHello at many SNI lengths and check the shape holds.
+
+    The one thing `selftest` cannot see. It compares against a capture taken at
+    one address, so it exercises exactly one SNI length - but a padded profile
+    computes its padding from the *total* length, so a different hostname moves
+    a byte count that nothing else in the tree ever varies. A padding rule that
+    is off by one, or that gives up past some length, would pass the self-test
+    every time and then send a differently-shaped ClientHello to the first real
+    site with a longer name than the probe's.
+
+    A padded profile must come out at exactly 512 bytes of handshake (517 on
+    the wire) until the message no longer fits, and then grow without padding.
+    An unpadded one must simply grow with the name.
+    """
+    from . import browser_fp
+
+    brands = [args.brand] if args.brand else list(browser_fp.brands())
+    rc = 0
+    for brand in brands:
+        print(f"=== {brand} ===")
+        rows: list[tuple[int, int, int | None]] = []
+        for n in range(1, args.max_length + 1, args.step):
+            host = _hostname_of_length(n)
+            try:
+                raw = one_client_hello(brand, host)
+            except Exception as exc:                       # noqa: BLE001
+                print(f"  {len(host):3d} chars: FAILED ({type(exc).__name__}: {exc})")
+                rc = 1
+                continue
+            if not raw:
+                print(f"  {len(host):3d} chars: no ClientHello captured")
+                rc = 1
+                continue
+            pad = next((len(body) for kind, body in
+                        extension_sequence(raw, raw) if kind == "0x0015"), None)
+            rows.append((len(host), len(raw), pad))
+
+        if not rows:
+            rc = 1
+            continue
+        padded = [r for r in rows if r[2] is not None]
+        plain = [r for r in rows if r[2] is None]
+
+        if not padded:
+            grew = all(x[1] < y[1] for x, y in zip(plain, plain[1:]))
+            print(f"  never padded; {plain[0][1]}B at {plain[0][0]} chars up to "
+                  f"{plain[-1][1]}B at {plain[-1][0]}, growing with the name: "
+                  f"{'OK' if grew else 'NOT MONOTONIC'}")
+            rc |= 0 if grew else 1
+            continue
+
+        # 512 is only reachable while the unpadded message still leaves room
+        # for the extension's own 4-byte header. Past that the target cannot be
+        # hit at all, so demanding it would be demanding the impossible.
+        exact, over, wrong = [], [], []
+        for chars, size, pad in padded:
+            unpadded = size - 5 - 4 - pad
+            (exact if unpadded + 4 <= PAD_TARGET else over).append((chars, size, pad))
+        wrong = [r for r in exact if r[1] != PAD_TARGET + 5]
+        if wrong:
+            rc = 1
+            print(f"  PADDING WRONG at {len(wrong)} of {len(exact)} reachable "
+                  f"lengths - it should hit exactly {PAD_TARGET + 5}B:")
+            for chars, size, pad in wrong:
+                print(f"      {chars:3d} chars -> {size}B record, padding {pad}B")
+        elif exact:
+            print(f"  {PAD_TARGET + 5}B on the wire at every SNI length that can "
+                  f"reach it: {exact[0][0]} to {exact[-1][0]} chars "
+                  f"({len(exact)} lengths), padding {exact[0][2]}B down to "
+                  f"{exact[-1][2]}B - OK")
+        if over:
+            # Upstream OpenSSL's own rule, unchanged by this fork: when fewer
+            # than 4 bytes are left it still emits a 1-byte padding extension
+            # rather than none, overshooting 512 by up to 4. No capture in this
+            # tree has an SNI that long, so there is nothing to say whether a
+            # real client does the same - it is reported, not corrected.
+            print(f"  {over[0][0]}-{over[-1][0]} chars: {PAD_TARGET}B is out of "
+                  f"reach, sizes {sorted({r[1] for r in over})} - upstream's "
+                  f"1-byte fallback, unmeasured against a real client")
+        for chars, size, pad in plain:
+            print(f"  {chars:3d} chars: {size}B, no padding extension")
+    return rc
 
 
 def list_profiles(_args: argparse.Namespace) -> int:
@@ -1603,17 +2245,9 @@ def main() -> int:
                                    "version in the name)")
     s.add_argument("--out", help="store at this path instead, without "
                                  "registering it as a brand")
-    s.add_argument("--peet", action="store_true",
-                   help="also ask the browser to fetch tls.peet.ws and post the "
-                        "answer back, as an outside opinion on what we compute "
-                        "ourselves. Costs a manual copy-paste (peet sends no "
-                        "CORS headers) and needs internet on the phone")
-    s.add_argument("--both", action="store_true",
-                   help="wait for both the XHR and the navigation variant of "
-                        "the reference; the page's own fetch gives the first, "
-                        "pasting tls.peet.ws into the page gives the second")
-    s.add_argument("--reference-timeout", type=float, default=25.0,
-                   help="how long to wait for that fetch (default 25s)")
+    s.add_argument("--xhr-timeout", type=float, default=25.0,
+                   help="how long to wait for the page's own /xhr-sample after "
+                        "the navigation arrives (default 25s)")
     s.add_argument("--host", help="address the client will use, comma-separated "
                                   "if several; goes into the certificate's SAN "
                                   "and is printed as the URL to visit. Needed "
@@ -1637,6 +2271,101 @@ def main() -> int:
     t.add_argument("--port", type=int, help="override the reference's port")
     t.add_argument("--openssl", default=str(Path.home() / "openssl/bin/openssl"))
     t.set_defaults(func=selftest)
+
+    cm = sub.add_parser(
+        "capture-mitm",
+        help="run mitmproxy with the addon loaded, then import the result",
+        description="Start mitmdump with mytls/mitm_addon.py loaded, wait "
+                    "while you browse, and import what it recorded. mitmproxy "
+                    "runs as a separate process on its own Python (>= 3.12); "
+                    "it is not imported here.")
+    cm.add_argument("--out", default="captures",
+                    help="where the raw dumps go; default: ./captures")
+    cm.add_argument("--host", action="append", metavar="REGEX",
+                    help="only dump connections whose SNI matches this regex - "
+                         "worth setting, or every TLS connection the device "
+                         "makes is dumped. Repeatable; several are combined "
+                         "with |")
+    cm.add_argument("--ignore-hosts", action="append", metavar="REGEX",
+                    help="do not intercept these at all - mitmproxy passes the "
+                         "connection through and never sees inside it. "
+                         "Different from --host, which decrypts everything and "
+                         "then dumps a subset. Repeatable. Worth pointing at "
+                         "whatever the device chatters to in the background: "
+                         "certificate-pinned endpoints fail the handshake when "
+                         "intercepted and the OS then retries and backs off, "
+                         "which is noise at best and can crowd out the flow "
+                         "being captured. On iOS: "
+                         r"--ignore-hosts '.*\.apple\.com' "
+                         r"--ignore-hosts '.*icloud\.com' "
+                         r"--ignore-hosts '.*mzstatic\.com'")
+    cm.add_argument("--brand", help="import into this profile once mitmproxy "
+                                    "stops; without it the dumps are only left "
+                                    "on disk")
+    cm.add_argument("--mode", default="regular",
+                    help="mitmproxy mode: regular (default), wireguard, "
+                         "transparent, local, socks5. wireguard suits phones "
+                         "and, unlike an explicit proxy, does not stop the "
+                         "browser resolving DNS itself - which is what GREASE "
+                         "ECH depends on")
+    cm.add_argument("--port", type=int, help="listen port; mitmproxy's default "
+                                             "is 8080 for regular mode")
+    cm.add_argument("--mitmdump", help="path to mitmdump, if not on PATH")
+    cm.add_argument("--allow-resumed", action="store_true",
+                    help="passed through to the import step")
+    cm.add_argument("extra", nargs=argparse.REMAINDER,
+                    help="further mitmdump options, after a '--' separator: "
+                         "capture-mitm --host x -- --showhost --anticache")
+    cm.set_defaults(func=capture_mitm)
+
+    m = sub.add_parser(
+        "import-mitm",
+        help="build a profile from what mitm_addon.py recorded off a real site",
+        description="Read the raw dumps mitm_addon.py wrote and turn them into "
+                    "a profile. Point it at the directory, not one file: a "
+                    "browser spreads a page load over several connections, and "
+                    "the navigation and the xhr are usually on different ones.")
+    m.add_argument("source", help="the --set fp_out directory, or one dump")
+    m.add_argument("--brand", help="which profile to write; default: read off "
+                                   "the captured user-agent")
+    m.add_argument("--out", help="write here instead of into the profiles "
+                                 "directory, and skip the reference")
+    m.add_argument("--allow-resumed", action="store_true",
+                   help="accept a ClientHello carrying pre_shared_key; it will "
+                        "not match our client, which never resumes")
+    m.set_defaults(func=import_mitm)
+
+    mt = sub.add_parser(
+        "match",
+        help="which profile, if any, each raw capture came from",
+        description="Compare captures - mitmproxy dumps, `serve` profiles, "
+                    "`--out` files - against the installed profiles, and say "
+                    "which stack produced them. Differences are split into "
+                    "ones that mean a different stack and ones an app chooses "
+                    "for itself; the second kind never turns a match into a "
+                    "miss. Offline.")
+    mt.add_argument("source", nargs="+",
+                    help="directories of captures, or files, or both")
+    mt.add_argument("--brand", help="test against this profile only, and say "
+                                    "why it does not match when it does not")
+    mt.add_argument("--verbose", "-v", action="store_true",
+                    help="show the reason for every profile that does not match")
+    mt.set_defaults(func=match)
+
+    sc = sub.add_parser(
+        "sniscan",
+        help="emit a ClientHello at many SNI lengths and check the shape holds",
+        description="The one thing selftest cannot see. It compares against a "
+                    "capture taken at one address, so it exercises one SNI "
+                    "length - but a padded profile computes its padding from "
+                    "the total length, which a longer hostname changes. Needs "
+                    "no server and no network.")
+    sc.add_argument("--brand", help="just one; default: every installed profile")
+    sc.add_argument("--max-length", type=int, default=253,
+                    help="longest hostname to try (default 253, the DNS maximum)")
+    sc.add_argument("--step", type=int, default=7,
+                    help="hostname length increment (default 7)")
+    sc.set_defaults(func=sniscan)
 
     ls = sub.add_parser("list", help="what browser_fp currently offers")
     ls.set_defaults(func=list_profiles)

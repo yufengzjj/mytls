@@ -322,11 +322,16 @@ EXT_RETURN tls_construct_ctos_session_ticket(SSL_CONNECTION *s, WPACKET *pkt,
 
     /*
      * An *empty* session_ticket is an offer of TLSv1.2-style resumption, and
-     * not every browser makes it - Safari does not. A ticket we actually hold
+     * not every client makes it - Safari does not. A ticket we actually hold
      * is still sent, so suppressing the offer costs nothing that was not
      * already unavailable.
+     *
+     * The profile is only the default here: measured on one iOS device, two
+     * apps on the same OS build disagree about this extension and about
+     * nothing else, so SSL_set_fp_empty_ticket() can override it. See
+     * ossl_ssl_fp_empty_ticket().
      */
-    if (ticklen == 0 && (ossl_ssl_fp(s)->flags & SSL_FP_EMPTY_TICKET) == 0)
+    if (ticklen == 0 && !ossl_ssl_fp_empty_ticket(s))
         return EXT_RETURN_NOT_SENT;
 
     if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_session_ticket)
@@ -1344,6 +1349,17 @@ EXT_RETURN tls_construct_ctos_psk(SSL_CONNECTION *s, WPACKET *pkt,
      */
     if (s->session->ssl_version != TLS1_3_VERSION
             || (s->session->ext.ticklen == 0 && s->psksession == NULL))
+        return EXT_RETURN_NOT_SENT;
+
+    /*
+     * A new session is forced in tls_construct_client_hello() unless the
+     * profile allows resuming, so the check above already covers resumption.
+     * This catches the other way in: an *external* PSK handed over by
+     * SSL_set_psk_use_session_callback(), which is not a session and so
+     * survives that. Either way pre_shared_key would make the ClientHello a
+     * shape no profile here has ever been measured in.
+     */
+    if ((ossl_ssl_fp(s)->flags & SSL_FP_ALLOW_RESUME) == 0)
         return EXT_RETURN_NOT_SENT;
 
     if (s->hello_retry_request == SSL_HRR_PENDING)

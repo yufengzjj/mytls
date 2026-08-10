@@ -777,6 +777,12 @@ SSL *ossl_ssl_connection_new_int(SSL_CTX *ctx, const SSL_METHOD *method)
     s->recv_max_early_data = ctx->recv_max_early_data;
 
     s->num_tickets = ctx->num_tickets;
+    /*
+     * Not copied from the context: SSL_FP_TICKET_PROFILE means "ask the
+     * context", so a later SSL_CTX_set_fp_empty_ticket() still reaches
+     * connections made before it. Copying would freeze the answer here.
+     */
+    s->fp_empty_ticket = SSL_FP_TICKET_PROFILE;
     s->pha_enabled = ctx->pha_enabled;
 
     /* Shallow copy of the ciphersuites stack */
@@ -4228,6 +4234,7 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
      * the self-test catches immediately.
      */
     (void)ossl_ssl_fp_apply_ctx(ret, ossl_ssl_fp_default());
+    ret->fp_empty_ticket = SSL_FP_TICKET_PROFILE;
     /*
      * From here on the cipher lists are part of the fingerprint and the public
      * setters will leave them alone. See ossl_ssl_ciphers_pinned().

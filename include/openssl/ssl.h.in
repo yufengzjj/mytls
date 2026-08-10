@@ -2288,6 +2288,27 @@ int SSL_set_fp_profile(SSL *s, const char *name);
 const char *SSL_get_fp_profile(const SSL *s);
 const char *SSL_fp_profile_name(size_t idx);
 
+/*
+ * Whether to offer an empty session_ticket extension, overriding the profile.
+ *
+ * A profile describes a network stack, and this one extension is not the
+ * stack's to decide: two apps on the same iOS build were measured offering
+ * different answers, which is worth a JA4 extension count of 14 against 15 and
+ * a different extension hash. Pass SSL_FP_TICKET_ON or SSL_FP_TICKET_OFF to
+ * pin it, or SSL_FP_TICKET_PROFILE to go back to whatever the profile says.
+ *
+ * The setters take that tri-state; the getters answer 0 or 1 - what the next
+ * ClientHello will actually do - or -1 if the argument is not a client SSL.
+ * A value set on an SSL overrides its SSL_CTX, as with the profile itself.
+ */
+# define SSL_FP_TICKET_PROFILE   (-1)
+# define SSL_FP_TICKET_OFF       0
+# define SSL_FP_TICKET_ON        1
+int SSL_CTX_set_fp_empty_ticket(SSL_CTX *ctx, int mode);
+int SSL_CTX_get_fp_empty_ticket(const SSL_CTX *ctx);
+int SSL_set_fp_empty_ticket(SSL *s, int mode);
+int SSL_get_fp_empty_ticket(const SSL *s);
+
 int SSL_set_record_padding_callback(SSL *ssl,
                                     size_t (*cb) (SSL *ssl, int type,
                                                   size_t len, void *arg));
