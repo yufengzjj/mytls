@@ -111,7 +111,23 @@ __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
            "profile", "brands", "brand_for", "reload", "describe", "catalog",
            "tls_profile"]
 
-_EXPECTED = {"httpx": "0.27.2", "httpcore": "1.0.9", "h2": "4.4.0"}
+#: Versions this module's subclassing has actually been run against, not
+#: versions it requires - pyproject pins only httpx, and h2 is left to whatever
+#: `httpx[http2]` resolves (`h2>=3,<5`). Several are listed where several have
+#: been measured: h2 4.3.0, 4.4.0 and 4.4.1 produce a byte-for-byte identical
+#: selftest across all four profiles, because everything that changed between
+#: them is on the *receiving* side (`validate_received_setting`, zero-length
+#: DATA flow control, `_get_stream_by_id`, a duplicate-Host check) while what
+#: is overridden here - `Settings` slot order, `__delitem__`, `send_headers`'
+#: priority arguments - did not move; 4.4.0 and 4.4.1 ship a byte-identical
+#: `connection.py` and `settings.py`.
+#: 4.3.0 matters because that is the version mitmproxy pins, so listing it is
+#: what lets mitmproxy live in the same interpreter.
+_EXPECTED = {
+    "httpx": ("0.27.2",),
+    "httpcore": ("1.0.9",),
+    "h2": ("4.4.1", "4.4.0", "4.3.0"),
+}
 
 #: Default for `priority_override` / `Transport(priority=...)`: whatever the
 #: capture did. A distinct sentinel rather than None, because None is a
@@ -1159,12 +1175,13 @@ def _check_versions() -> None:
         "httpcore": _httpcore.__version__,
         "h2": _h2.__version__,
     }
-    off = {k: v for k, v in actual.items() if v != _EXPECTED[k]}
+    off = {k: v for k, v in actual.items() if v not in _EXPECTED[k]}
     if off:
-        detail = ", ".join(f"{k} {v} (expected {_EXPECTED[k]})" for k, v in off.items())
+        detail = ", ".join(f"{k} {v} (tested: {', '.join(_EXPECTED[k])})"
+                           for k, v in off.items())
         warnings.warn(
-            f"browser_fp subclasses library internals and was written against "
-            f"{_EXPECTED}; found {detail}. Re-check httpcore's handle_request, "
+            f"browser_fp subclasses library internals and has only been run "
+            f"against {detail}. Re-check httpcore's handle_request, "
             f"create_connection, _send_connection_init and _send_request_headers "
             f"before trusting the fingerprint.",
             RuntimeWarning,

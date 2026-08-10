@@ -165,17 +165,17 @@ missing, builds CPython against the fork, installs the Python packages, and runs
 self-test. Overridable variables and skip switches:
 
 ```bash
-PREFIX=/opt/mytls PYTHON_VERSION=3.11.15 JOBS=8 ./install-python.sh
+PREFIX=/opt/mytls PYTHON_VERSION=3.12.13 JOBS=8 ./install-python.sh
 ./install-python.sh --skip-deps --skip-openssl --skip-python --skip-selftest --yes
 ```
 
-Defaults are `PREFIX=$HOME/openssl`, `PYTHON_VERSION=3.11.15`, `JOBS=$(nproc)`.
+Defaults are `PREFIX=$HOME/openssl`, `PYTHON_VERSION=3.12.13`, `JOBS=$(nproc)`.
 
 **If pyenv already has that version**, the script checks what it is linked against before
 doing anything. Built by an earlier run of this script against the same prefix, it is
 reused. Installed the ordinary way — linked against the system OpenSSL — it stops and says
 so, because `pyenv install --skip-existing` would not rebuild it and the result would be a
-client whose TLS layer is Python's own. Either `pyenv uninstall -f 3.11.15` and re-run, or
+client whose TLS layer is Python's own. Either `pyenv uninstall -f 3.12.13` and re-run, or
 give `PYTHON_VERSION` a patch version pyenv does not already have.
 
 ### By hand
@@ -196,7 +196,7 @@ CONFIGURE_OPTS="--with-openssl=$MYTLS --with-openssl-rpath=auto" \
 CPPFLAGS="-I$MYTLS/include" \
 LDFLAGS="-L$MYTLS/lib -Wl,-rpath,$MYTLS/lib" \
 MAKE_OPTS="-j$(nproc)" \
-pyenv install 3.11.15
+pyenv install 3.12.13
 
 # 4. the Python side, which pulls its own pinned dependencies
 pip install ./python          # or -e ./python to work on it in place
@@ -330,8 +330,11 @@ mytls-probe capture-mitm --brand ios16 --host 'whatsapp\.net$' \
     --ignore-hosts '.*\.apple\.com' --ignore-hosts '.*icloud\.com'
 ```
 
-That starts `mitmdump` with the addon loaded (as a separate process — mitmproxy needs its
-own Python ≥ 3.12), waits while you browse, and imports the result on Ctrl-C.
+That starts `mitmdump` with the addon loaded (a separate process, though no longer a
+separate Python — mitmproxy needs ≥ 3.12, which is what this script now builds), waits
+while you browse, and imports the result on Ctrl-C. `./install-python.sh --with-mitmproxy` installs it into that same
+interpreter; on musl one of its dependencies has no wheel and is stubbed out, which costs
+`--mode local` only — see [python/README.md](python/README.md).
 
 See [python/README.md](python/README.md) for what it can and cannot measure.
 

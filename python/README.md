@@ -236,7 +236,7 @@ CONFIGURE_OPTS="--with-openssl=$MYTLS --with-openssl-rpath=auto" \
 CPPFLAGS="-I$MYTLS/include" \
 LDFLAGS="-L$MYTLS/lib -Wl,-rpath,$MYTLS/lib" \
 MAKE_OPTS="-j4" \
-pyenv install 3.11.15
+pyenv install 3.12.13
 
 # 3. this package, which pulls its own pinned dependencies
 pip install ./python
@@ -646,17 +646,51 @@ is sent at all — an IP address carries none, a name does. So a capture taken a
 mytls-probe where ios18     # → 192.168.1.7:8443
 ```
 
-`selftest` goes to that address by itself. If the address is no longer on this machine
-(DHCP moved it, or it was the Windows IP at the time), it says so and falls back to
-localhost — the HPACK difference and the one SNI extension are then expected, and the h2
-layer is still compared in full:
+`selftest` goes to that address by itself. When it cannot — DHCP moved it, it was the
+Windows IP at the time, or the capture came off a real site and names that site on
+`:443`, which is not bindable without root — it moves to somewhere reachable, says so,
+and compares everything the move did not touch:
 
 ```
-note: ios18 was captured at 192.168.1.7, which is not an address this machine
-holds, so the request goes to localhost instead. :authority differs, so the HPACK
-block cannot match, and the capture carried no SNI while this one does, so the
-ClientHello will differ by one extension. The HTTP/2 layer is still compared in full.
+note: ios16 was captured at v.whatsapp.net, which is not an address this machine
+holds, so the request goes to localhost instead.
+note: cannot listen on :443 ([Errno 13] Permission denied); using :8443 instead.
 ```
+
+**This used to be a skip, and a skip cost everything.** Every capture taken through
+mitmproxy is in this position, so a growing half of the profiles were never tested at all
+— while the ClientHello, the frame layer and the header order had been measurable the
+whole time. What actually cannot be reproduced is one field, `:authority`, so that is what
+is excused and nothing else:
+
+| layer | what a moved address costs |
+|---|---|
+| ClientHello | `server_name` and `padding` are dropped rather than compared — padding is computed from the total record length, so it silently absorbs the hostname's length. **The rest is still byte for byte.** That padding pads to 512 is what `sniscan` measures, across a sweep of lengths |
+| HTTP/2 frames | nothing — compared in full |
+| HPACK | the block cannot match byte for byte, so the *fields and their order* are compared and `:authority` is marked not reproducible. A difference in any other field is still a failure |
+
+The byte-level answer for HPACK then comes from a check that needs no network at all:
+
+```
+=== HPACK re-encode (capture's own fields, cfnetwork encoder) ===
+  navigate  141B  IDENTICAL
+```
+
+That decodes the captured block, hands the fields straight back to the encoder the profile
+selects, and compares the result to the captured bytes. The input is the browser's own,
+authority included, so nothing is excused — what is under test is exactly the encoder's
+policy: what it indexes, what it huffman-codes, what it refuses to index. It runs for
+every brand, not only the moved ones, and it is sharp: forcing the wrong engine fails
+`stock` on all four profiles and `quiche` on `ios16` at byte 117, which is where
+`content-length` stops being indexed.
+
+The live replay still earns its place — it is the only thing that proves httpx and
+httpcore emit that field list, in that order, at all. The two are complementary and both
+run.
+
+`selftest` also drives the capture's own `:method` and `:path` (and synthesises a body
+when the captured headers declare a `content-length`), so a `POST /v2/pre_pn_client_log`
+is replayed as one instead of as `GET /api/all`.
 
 Run the self-test after capturing; it compares all three layers at once:
 
@@ -859,11 +893,37 @@ site — where `referer`, `cookie`, subresource `priority` and the full range of
 `mytls/mitm_addon.py` does that, by making mitmproxy stop speaking HTTP:
 
 ```bash
-pipx install mitmproxy       # 12.x; needs its own Python (>= 3.12), not the fork's 3.11
+pip install mitmproxy        # 12.x; the same interpreter is fine - see below
 
 mytls-probe capture-mitm --host 'example\.com' --brand chrome
 # browse to the site, then Ctrl-C - the import runs by itself
 ```
+
+mitmproxy needs Python ≥ 3.12, which is why `install-python.sh` builds 3.12 — it used to
+build 3.11 and mitmproxy then had to bring an interpreter of its own. The two dependency
+sets share exactly one package, `h2`, which mitmproxy pins at 4.3.0; `browser_fp._EXPECTED`
+lists that version because the self-test produces byte-identical output on it and on 4.4.0.
+`install-python.sh --with-mitmproxy` does the install, and `capture-mitm` looks for
+`mitmdump` beside the running interpreter before it looks on `PATH`, since a pyenv `bin/`
+usually is not on `PATH`. Keeping mitmproxy in a venv of its own still works and changes
+nothing here — pass `--mitmdump /path/to/mitmdump`.
+
+**On musl (Alpine) the plain install fails, and not for a reason 3.12 fixes.**
+`mitmproxy-rs` pins `mitmproxy-linux`, which publishes manylinux wheels only, so pip falls
+back to compiling its Rust/eBPF redirector and wants a nightly toolchain and `bpf-linker`.
+That package backs `mitmdump --mode local` and nothing else: no mitmproxy Python module
+imports it — only `mitmproxy_rs`' PyInstaller hook names it — and `capture-mitm` uses
+`--mode wireguard` or a plain proxy.
+
+So `--with-mitmproxy` tries the honest install first, and only after it fails builds a
+placeholder `mitmproxy-linux` that satisfies the pin and raises `NotImplementedError` if
+anything ever does reach for the redirector. It says so while doing it. If the plain
+install works on your platform — any glibc distro — the placeholder is never built.
+
+Sharing the interpreter does not make mitmproxy use the fork: its TLS goes through
+`cryptography`'s statically linked OpenSSL and `mitmproxy-rs`, never through this Python's
+`ssl`. That is the behaviour you want — the proxy has to look like a proxy, or the site on
+the other side sees Chrome's ClientHello coming from the wrong end of the capture.
 
 `capture-mitm` starts `mitmdump` with the addon loaded, waits, and hands the dumps to
 `import-mitm` when you stop it. It prints where the CA certificate is, since the device

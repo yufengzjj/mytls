@@ -10,28 +10,44 @@
 #
 # Everything is overridable:
 #
-#   PREFIX=/opt/mytls PYTHON_VERSION=3.11.15 JOBS=8 ./install-python.sh
+#   PREFIX=/opt/mytls PYTHON_VERSION=3.12.13 JOBS=8 ./install-python.sh
 #
 # Flags: --skip-deps --skip-openssl --skip-python --skip-selftest --yes
+#        --with-mitmproxy   also install mitmproxy, which `capture-mitm` shells
+#                           out to. Needs Python >= 3.12, which is why that is
+#                           the default version.
 #
 set -euo pipefail
 
 PREFIX="${PREFIX:-$HOME/openssl}"
-PYTHON_VERSION="${PYTHON_VERSION:-3.11.15}"
+# 3.12 rather than 3.11 so that mitmproxy, which needs >= 3.12, can be installed
+# into this same interpreter instead of needing a second Python of its own. The
+# two dependency sets do coexist: mitmproxy pins h2 exactly at 4.3.0, and 4.3.0
+# is one of the versions browser_fp has been measured against - see _EXPECTED
+# there. Nothing else in mytls cares which of the two is installed.
+PYTHON_VERSION="${PYTHON_VERSION:-3.12.13}"
 PYENV_ROOT="${PYENV_ROOT:-$HOME/.pyenv}"
 JOBS="${JOBS:-$( (nproc || sysctl -n hw.ncpu || echo 4) 2>/dev/null )}"
 # Leave empty to let Configure detect the platform (works for x86_64 and arm64).
 OPENSSL_TARGET="${OPENSSL_TARGET:-}"
 
 SKIP_DEPS=0 SKIP_OPENSSL=0 SKIP_PYTHON=0 SKIP_SELFTEST=0 ASSUME_YES=0
+WITH_MITMPROXY=0
 for arg in "$@"; do
     case "$arg" in
         --skip-deps)     SKIP_DEPS=1 ;;
         --skip-openssl)  SKIP_OPENSSL=1 ;;
         --skip-python)   SKIP_PYTHON=1 ;;
         --skip-selftest) SKIP_SELFTEST=1 ;;
+        --with-mitmproxy) WITH_MITMPROXY=1 ;;
         --yes|-y)        ASSUME_YES=1 ;;
-        -h|--help)      sed -n '/^# Build/,/^# Flags/p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        # The leading comment block, stripped of its `# `. Printed by scanning
+        # until the first non-comment line rather than by matching an end
+        # pattern: an earlier version stopped at /^# Flags/, and the range then
+        # reopened on the `# Building one per brand` comment further down and
+        # ran to the end of the file.
+        -h|--help)      awk 'NR > 1 && !/^#/ {exit}
+                             NR > 1 {sub(/^# ?/, ""); print}' "$0"; exit 0 ;;
         *) echo "unknown option: $arg (try --help)" >&2; exit 2 ;;
     esac
 done
@@ -51,9 +67,17 @@ die()  { printf '\033[1;31m error:\033[0m %s\n' "$*" >&2; exit 1; }
 # no dynamic link, and every caller decides for itself what to make of that.
 # LD_LIBRARY_PATH is unset on purpose - what matters is what the binary finds on
 # its own, not what this shell happens to be pointing at.
+#
+# ldd's own exit status is discarded on purpose. musl's ldd exits 127 when the
+# object has undefined symbols, and a CPython extension module always does -
+# every Py* symbol is resolved from the interpreter at load time, not from any
+# library. It still prints the DT_NEEDED lines we want first. Without the
+# `|| true` the `set -o pipefail` above turns that 127 into an abort, and the
+# script dies on Alpine right after reporting the CLI's linkage.
 libssl_of() {
     command -v ldd >/dev/null 2>&1 || return 0
-    env -u LD_LIBRARY_PATH ldd "$1" 2>/dev/null | awk '/libssl\.so/ {print $3}'
+    { env -u LD_LIBRARY_PATH ldd "$1" 2>/dev/null || true; } \
+        | awk '/libssl\.so/ {print $3}'
 }
 
 # --- privileges -------------------------------------------------------------
@@ -118,8 +142,15 @@ if grep -q $'\r' Configure 2>/dev/null; then
         read -r reply </dev/tty || reply=n
         case "$reply" in [yY]*) ;; *) die "aborted" ;; esac
     fi
+    # Binary files are skipped, and this is not cosmetic: `sed -i 's/\r$//'`
+    # over the whole tree silently truncates any file with a 0d 0a byte pair in
+    # it that is data rather than a line ending. test/smcont.bin loses two
+    # bytes that way and the S/MIME tests then fail on content nobody edited.
+    # perl's -B is the same heuristic `grep -I` uses, and perl is already
+    # required to run Configure.
     find . -path ./.git -prune -o -type f -print0 \
-        | xargs -0 -P"$JOBS" -n200 sed -i 's/\r$//'
+        | xargs -0 -P"$JOBS" -n200 \
+            perl -i -pe 'BEGIN { @ARGV = grep { !-B $_ } @ARGV } s/\r\n$/\n/'
 fi
 
 # --- 3. OpenSSL -------------------------------------------------------------
@@ -206,7 +237,7 @@ build_python() {
          it and re-run:
              pyenv uninstall -f $PYTHON_VERSION
          or build a different version instead:
-             PYTHON_VERSION=3.11.14 $0"
+             PYTHON_VERSION=3.12.12 $0"
                 ;;
             *)
                 die "pyenv already has $PYTHON_VERSION at $existing, and it is
@@ -220,7 +251,7 @@ build_python() {
            - remove it and re-run this script:
                  pyenv uninstall -f $PYTHON_VERSION
            - build a patch version pyenv does not already have:
-                 PYTHON_VERSION=3.11.14 $0
+                 PYTHON_VERSION=3.12.12 $0
            - keep it as it is, knowing the TLS layer will not work:
                  $0 --skip-python"
                 ;;
@@ -247,8 +278,114 @@ PY="$PYENV_ROOT/versions/$PYTHON_VERSION/bin/python$(echo "$PYTHON_VERSION" | cu
 # can `import mytls` without knowing where the repository is. Its dependencies -
 # httpx pinned exactly, plus brotli and zstandard - come from python/pyproject.toml.
 say "installing the mytls Python package"
+# setuptools' build/ is incremental and never removes files that disappeared
+# from the source tree, so a profile that was renamed - safari_ios.json ->
+# ios18.json - comes back from the dead in the wheel and the self-test then
+# fails on a brand that no longer exists. The captures are package data, which
+# makes this failure mode specific to this package rather than theoretical.
+rm -rf "$ROOT/python/build" "$ROOT/python/mytls.egg-info"
+# PYTHONNOUSERSITE hides ~/.local/lib/pythonX.Y/site-packages from pip, which
+# otherwise reports every dependency already satisfied from there and installs
+# none of them into this interpreter. That leaves the pinned httpx and the
+# httpcore whose internals browser_fp subclasses living in a directory this
+# environment does not own and pip here will not manage - so `pip install -U
+# httpx` under any *other* Python of the same minor version silently changes
+# what the fingerprint interpreter loads. The version check in browser_fp
+# would still fire, but only after the fact.
+export PYTHONNOUSERSITE=1
 "$PY" -m pip install --quiet --upgrade pip
 "$PY" -m pip install --quiet "$ROOT/python"
+
+# Optional, because it is ~25 further packages (cryptography, a Rust extension,
+# tornado, flask, urwid) that nothing in mytls imports - only `capture-mitm`
+# shells out to the `mitmdump` they provide. It goes into this interpreter
+# rather than one of its own only because PYTHON_VERSION is now >= 3.12; the
+# one shared dependency is h2, which mitmproxy pins at exactly 4.3.0 and which
+# browser_fp has been measured against. mitmproxy's own TLS is unaffected by
+# the fork - it goes through cryptography's statically linked OpenSSL and
+# mitmproxy-rs, not through this Python's `ssl` - which is what you want: the
+# proxy should look like a proxy, not like Chrome.
+# A placeholder distribution for mitmproxy-linux, built and installed only if
+# the honest install has already failed. mitmproxy-rs pins that package
+# exactly, but it publishes manylinux wheels only - so on musl pip falls back to
+# compiling its Rust/eBPF redirector, which wants a nightly toolchain and
+# bpf-linker. Nothing in mitmproxy's Python imports it (only mitmproxy_rs'
+# PyInstaller hook names it); it backs `mitmdump --mode local` alone, and
+# capture-mitm uses --mode wireguard or a plain proxy. So the placeholder
+# unblocks pip's resolver and raises NotImplementedError if anything ever does
+# reach for the redirector, rather than pretending to be it.
+install_mitmproxy_linux_placeholder() {
+    local dir
+    dir="$(mktemp -d)"
+    trap 'rm -rf "$dir"' RETURN
+    mkdir -p "$dir/mitmproxy_linux"
+    cat > "$dir/pyproject.toml" <<'TOML'
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mitmproxy-linux"
+version = "0.12.11"
+description = "Placeholder: the real eBPF redirector has no musl wheel"
+requires-python = ">=3.12"
+
+[tool.setuptools.packages.find]
+include = ["mitmproxy_linux"]
+TOML
+    cat > "$dir/mitmproxy_linux/__init__.py" <<'PY_EOF'
+"""Placeholder installed by mytls' install-python.sh. Not the real package.
+
+The real mitmproxy-linux ships a Rust/eBPF redirector and publishes manylinux
+wheels only, so it cannot be installed on musl without a nightly toolchain and
+bpf-linker. It serves `mitmdump --mode local` and nothing else, and no
+mitmproxy Python module imports it. This exists to satisfy mitmproxy-rs' pinned
+dependency, and fails loudly if the redirector is ever actually used.
+"""
+
+_WHY = ("mitmdump --mode local needs the real mitmproxy-linux, an eBPF "
+        "redirector with no musl wheel. Use --mode wireguard or a plain proxy.")
+
+
+class LocalRedirector:
+    def __init__(self, *args, **kwargs):
+        raise NotImplementedError(_WHY)
+
+    @staticmethod
+    def describe_spec(*args, **kwargs):
+        return ""
+
+
+def __getattr__(name):
+    raise AttributeError(f"{name}: {_WHY}")
+PY_EOF
+    "$PY" -m pip install --quiet "$dir"
+}
+
+if [ "$WITH_MITMPROXY" -eq 1 ]; then
+    say "installing mitmproxy into the same interpreter"
+    mitm_ok=1
+    if ! "$PY" -m pip install --quiet mitmproxy; then
+        warn "the plain install failed. If it named mitmproxy-linux this is a
+         musl system and that package has no musl wheel; retrying with a
+         placeholder for it, which costs 'mitmdump --mode local' and nothing
+         else."
+        install_mitmproxy_linux_placeholder \
+            && "$PY" -m pip install --quiet mitmproxy || mitm_ok=0
+    fi
+    if [ "$mitm_ok" -eq 1 ]; then
+        printf '  mitmproxy %s at %s\n' \
+            "$("$PY" -c 'from mitmproxy import version; print(version.VERSION)')" \
+            "$(dirname "$PY")/mitmdump"
+        printf '  h2        %s (mitmproxy pins this; browser_fp accepts it)\n' \
+            "$("$PY" -c 'import h2; print(h2.__version__)')"
+    else
+        # Everything else in this script has already succeeded, so this warns
+        # rather than dies - capture-mitm can be pointed at any mitmdump.
+        warn "mitmproxy did not install. Put it in a venv of its own and use
+         'capture-mitm --mitmdump /path/to/mitmdump'."
+    fi
+fi
 
 # --- 6. check ---------------------------------------------------------------
 # Linkage first, because getting this wrong is silent: a binary that resolves
@@ -278,9 +415,10 @@ check_links_to_prefix "python" \
     "$("$PY" -c 'import _ssl; print(_ssl.__file__)')"
 
 say "checking"
-env -u LD_LIBRARY_PATH "$PY" - <<'EOF'
+env -u LD_LIBRARY_PATH -u PYTHONNOUSERSITE "$PY" - <<'EOF'
 import ssl
 import sys
+import sysconfig
 
 print(f"  python  : {sys.version.split()[0]}")
 print(f"  openssl : {ssl.OPENSSL_VERSION}")
@@ -297,6 +435,22 @@ print(f"  modules : {'all present' if not missing else 'MISSING ' + ', '.join(mi
 
 import mytls
 from mytls import browser_fp
+
+# Deliberately checked with the user site *visible*, the way anything running
+# `python -m mytls` later will see it: an installed-but-shadowed dependency is
+# a version this environment did not choose and pip here cannot update.
+here = sysconfig.get_paths()["purelib"]
+shadowed = []
+for name in ("httpx", "httpcore", "h2", "hpack", "hyperframe"):
+    mod = __import__(name)
+    if mod.__file__ and not mod.__file__.startswith(here):
+        shadowed.append(f"{name} from {mod.__file__.rsplit('/' + name, 1)[0]}")
+if shadowed:
+    print("  !! these load from outside this interpreter's site-packages, so "
+          "pip here does\n     not manage them and another Python of the same "
+          "minor version can change them:")
+    for line in shadowed:
+        print(f"       {line}")
 
 print(f"  layers  : {mytls.check()}")
 

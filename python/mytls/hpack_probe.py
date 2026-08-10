@@ -809,7 +809,9 @@ def handle_h2(sock: ssl.SSLSocket, state: _Session, *,
 
 def run_client(authority: str, brand: str | None, *, quiet: bool = False,
                like: dict[str, str] | None = None,
-               xhr: dict | None = None) -> None:
+               xhr: dict | None = None,
+               method: str = "GET", path: str = "/api/all",
+               xhr_method: str = "GET", xhr_path: str = "/xhr-sample") -> None:
     """Send one request through the brand's transport at our own server.
 
     `authority` and not a port: it goes into the HPACK block verbatim and
@@ -823,6 +825,13 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
     `cache-control`, and a page's own fetch is `sec-fetch-mode: cors`. Without
     this a capture taken any way but by typing the address into a fresh tab
     could never be reproduced, which says nothing about the fingerprint.
+
+    `method` and `path` are the capture's own. They are two thirds of the
+    pseudo-header block, so driving a fixed `GET /api/all` at a capture taken
+    from real traffic made every such block differ on fields that say nothing
+    about the encoder. A body is synthesised when the captured headers declare
+    a `content-length`, because a POST whose length header disagrees with what
+    follows it is not a request either end would accept.
     """
     import httpx
 
@@ -861,9 +870,26 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
         for name in ("sec-fetch-site", "cache-control", "referer"):
             if name in like:
                 headers[name] = like[name]
+    def body_for(pairs: typing.Iterable[tuple[typing.Any, typing.Any]]
+                 ) -> bytes | None:
+        """Bytes matching whatever `content-length` the capture declared.
+
+        The value goes on the wire from the profile's own header list, so this
+        only has to make the request consistent - httpx would otherwise refuse
+        to send a body-less request that claims a length, and httpcore would
+        end the stream on the HEADERS frame.
+        """
+        for name, value in pairs:
+            # A profile holds str pairs; browser_fp's encoder holds bytes.
+            key = name.decode() if isinstance(name, bytes) else name
+            if key.lower() == "content-length":
+                return b"\x00" * int(value)
+        return None
+
     with httpx.Client(transport=transport, timeout=15) as c:
         try:
-            c.get(f"https://{authority}/api/all", headers=headers)
+            c.request(method, f"https://{authority}{path}", headers=headers,
+                      content=body_for(defaults))
             if xhr is not None:
                 # A second request on the *same* connection, the way the page's
                 # own fetch arrived. Its HPACK block only comes out right if the
@@ -878,7 +904,8 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
                     xhr.get("headers") or [])
                 prof.priority_override = captured.captured_priority("xhr") or None
                 try:
-                    c.get(f"https://{authority}/xhr-sample")
+                    c.request(xhr_method, f"https://{authority}{xhr_path}",
+                              content=body_for(prof.default_headers))
                 finally:
                     prof.default_headers = was_hdrs
                     prof.priority_override = was_prio
@@ -1025,7 +1052,8 @@ class Malformed(ValueError):
     """A ClientHello whose declared lengths do not add up."""
 
 
-def canonical_client_hello(raw: bytes, *, keep_record_version: bool = True
+def canonical_client_hello(raw: bytes, *, keep_record_version: bool = True,
+                           drop_host_dependent: bool = False
                            ) -> tuple[bytes, list[tuple[str, int]], list[str]]:
     """Zero out only what genuinely varies per connection.
 
@@ -1055,10 +1083,26 @@ def canonical_client_hello(raw: bytes, *, keep_record_version: bool = True
       * a GREASE extension's body must be empty or a single zero byte
 
     Blanking those instead would hide 190 bytes of an iOS ClientHello.
+
+    `drop_host_dependent` removes the two extensions in `HOST_DEPENDENT_EXTS`
+    outright - TLV and all - and blanks the extension block length with them.
+    Blanking their bodies would not be enough: `server_name` carries the
+    hostname, whose *length* differs, and `padding` is computed from the total
+    record length, so it silently absorbs that difference and comes out a
+    different size too. Two ClientHellos sent to different hostnames therefore
+    have no byte comparison at all unless both are excised, and the result is a
+    real one: everything the hostname does not touch, compared byte for byte,
+    instead of nothing. What is given up - that a name is padded to 512 - is
+    what `sniscan` measures across a sweep of hostname lengths, which is a
+    better test of it than one sample would be.
     """
     b = bytearray(raw)
     blanked: list[tuple[str, int]] = []
     problems: list[str] = []
+    #: (start, end) of each extension `drop_host_dependent` removes, plus the
+    #: two length bytes in front of the whole extension block.
+    host_spans: list[tuple[int, int]] = []
+    ext_len_at = 0
 
     def wipe(lo: int, hi: int, why: str) -> None:
         if hi > lo:
@@ -1100,6 +1144,7 @@ def canonical_client_hello(raw: bytes, *, keep_record_version: bool = True
     need(o, 1, "the compression method length")
     o += 1 + b[o]                                  # compared, never blanked
     need(o, 2, "the extension block length")
+    ext_len_at = o
     o += 2
 
     while o + 4 <= len(b):
@@ -1114,8 +1159,10 @@ def canonical_client_hello(raw: bytes, *, keep_record_version: bool = True
                                 f"{bytes(b[body:body + elen]).hex()}, "
                                 f"expected empty or 00")
         elif etype == 0x0000:                      # server_name
+            host_spans.append((o, body + elen))
             wipe(body, body + elen, "server_name")
         elif etype == 0x0015:                      # padding
+            host_spans.append((o, body + elen))
             if set(b[body:body + elen]) - {0}:
                 problems.append(f"padding is not all zeroes ({elen}B)")
         elif f"0x{etype:04x}" in RANDOM_BODY:      # GREASE ECH, pre_shared_key
@@ -1140,10 +1187,46 @@ def canonical_client_hello(raw: bytes, *, keep_record_version: bool = True
     if o != len(b):
         msg = f"{len(b) - o} trailing bytes after the last extension"
         raise Malformed(msg)
+
+    if drop_host_dependent:
+        # The extension block length counts the bytes about to disappear, so it
+        # cannot survive them. record_length and handshake_length are already
+        # blanked above for the same reason.
+        wipe(ext_len_at, ext_len_at + 2, "extensions_length")
+        # `blanked` already counts server_name's body; only the bytes that are
+        # not in it get their own entry, so the printed totals still add up.
+        kept = bytearray()
+        last = 0
+        for lo, hi in sorted(host_spans):
+            kept += b[last:lo]
+            last = hi
+            etype = int.from_bytes(b[lo:lo + 2], "big")
+            size = hi - lo
+            if etype == 0x0000:
+                size -= int.from_bytes(b[lo + 2:lo + 4], "big")
+            blanked.append((f"0x{etype:04x} dropped (host-dependent)", size))
+        kept += b[last:]
+        b = kept
+
     return bytes(b), blanked, problems
 
 
-def extension_sequence(canon: bytes, raw: bytes) -> list[tuple[str, bytes]]:
+def _walk_extensions(buf: bytes) -> typing.Iterator[tuple[int, bytes]]:
+    """(id, body) for each extension in a ClientHello, in wire order."""
+    o = 43
+    o += 1 + buf[o]                                  # session_id
+    o += 2 + int.from_bytes(buf[o:o + 2], "big")     # cipher_suites
+    o += 1 + buf[o]                                  # compression_methods
+    o += 2                                           # extension block length
+    while o + 4 <= len(buf):
+        elen = int.from_bytes(buf[o + 2:o + 4], "big")
+        yield int.from_bytes(buf[o:o + 2], "big"), buf[o + 4:o + 4 + elen]
+        o += 4 + elen
+
+
+def extension_sequence(canon: bytes, raw: bytes, *,
+                       dropped_host_dependent: bool = False
+                       ) -> list[tuple[str, bytes]]:
     """(id, canonical body) in wire order, for placing a difference.
 
     Takes both records because neither alone is enough: the bodies must come
@@ -1151,21 +1234,22 @@ def extension_sequence(canon: bytes, raw: bytes) -> list[tuple[str, bytes]]:
     *ids* must come from the original - blanking a GREASE id turns it into
     0x0000, which is `server_name`, and a Chrome ClientHello carrying two
     GREASE extensions would then appear to send `server_name` three times.
-    Blanking never changes a length, so the two walk in lockstep.
+
+    The two are walked separately rather than by a shared offset, because
+    `canonical_client_hello(drop_host_dependent=True)` makes them different
+    lengths - and a shared offset then reads ids out of the middle of whatever
+    followed the first extension it removed.
     """
-    o = 43
-    o += 1 + canon[o]
-    o += 2 + int.from_bytes(canon[o:o + 2], "big")
-    o += 1 + canon[o]
-    o += 2
-    out: list[tuple[str, bytes]] = []
-    while o + 4 <= len(canon):
-        etype = int.from_bytes(raw[o:o + 2], "big")
-        elen = int.from_bytes(canon[o + 2:o + 4], "big")
-        out.append(("GREASE" if etype in GREASE else f"0x{etype:04x}",
-                    canon[o + 4:o + 4 + elen]))
-        o += 4 + elen
-    return out
+    ids = [t for t, _ in _walk_extensions(raw)
+           if not (dropped_host_dependent
+                   and f"0x{t:04x}" in HOST_DEPENDENT_EXTS)]
+    bodies = [body for _, body in _walk_extensions(canon)]
+    if len(ids) != len(bodies):
+        msg = (f"{len(ids)} extension ids against {len(bodies)} bodies - the "
+               f"canonical record and the raw one disagree on how many there are")
+        raise Malformed(msg)
+    return [("GREASE" if t in GREASE else f"0x{t:04x}", body)
+            for t, body in zip(ids, bodies)]
 
 
 def _prefix_regions(raw: bytes) -> list[tuple[str, int, int]]:
@@ -1184,7 +1268,8 @@ def _prefix_regions(raw: bytes) -> list[tuple[str, int, int]]:
     return out
 
 
-def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
+def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str,
+                      *, host_differs: bool = False) -> bool:
     """Compare two ClientHellos byte for byte, outside what varies per connection.
 
     Not a list of fields. See `canonical_client_hello` for why: if these bytes
@@ -1210,22 +1295,32 @@ def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
     # against a measured 0x0301 would report a difference that is not one.
     keep_version = (a["record_version"] is not None
                     and b["record_version"] is not None)
+    if host_differs:
+        print("  note: the two were addressed at different hostnames, so "
+              "server_name and\n        padding - which absorbs server_name's "
+              "length - are dropped rather than\n        compared. Everything "
+              "the hostname does not reach still is.")
     try:
         ca, wa, pa = canonical_client_hello(bytes.fromhex(a["raw"]),
-                                            keep_record_version=keep_version)
+                                            keep_record_version=keep_version,
+                                            drop_host_dependent=host_differs)
         cb, wb, pb = canonical_client_hello(bytes.fromhex(b["raw"]),
-                                            keep_record_version=keep_version)
+                                            keep_record_version=keep_version,
+                                            drop_host_dependent=host_differs)
     except Malformed as exc:
         print(f"  MALFORMED: {exc}")
         return False
 
-    print(f"  {na} {len(ca)}B, {nb} {len(cb)}B")
-    for who, blanks in ((na, wa), (nb, wb)):
+    print(f"  {na} {len(ca)}B compared, {nb} {len(cb)}B compared")
+    for who, blanks, raw in ((na, wa, a["raw"]), (nb, wb, b["raw"])):
         merged: dict[str, int] = {}
         for why, size in blanks:
             merged[why] = merged.get(why, 0) + size
-        total = sum(merged.values())
-        print(f"  not compared ({who}, {total}B of {len(ca) if who == na else len(cb)}): "
+        # Against the size of the record as it went out, not the size of what
+        # is left of it: with drop_host_dependent those differ, and a total
+        # larger than the denominator reads as a bug in the arithmetic.
+        print(f"  not compared ({who}, {sum(merged.values())}B of "
+              f"{len(raw) // 2} on the wire): "
               + ", ".join(f"{k} {v}B" for k, v in sorted(merged.items())))
 
     same = True
@@ -1234,8 +1329,10 @@ def diff_client_hello(a: dict | None, b: dict | None, na: str, nb: str) -> bool:
             same = False
             print(f"  ASSERTION FAILED ({who}): {text}")
 
-    ea = extension_sequence(ca, bytes.fromhex(a["raw"]))
-    eb = extension_sequence(cb, bytes.fromhex(b["raw"]))
+    ea = extension_sequence(ca, bytes.fromhex(a["raw"]),
+                            dropped_host_dependent=host_differs)
+    eb = extension_sequence(cb, bytes.fromhex(b["raw"]),
+                            dropped_host_dependent=host_differs)
     order_a, order_b = [t for t, _ in ea], [t for t, _ in eb]
     if order_a == order_b:
         print("  extension order  identical")
@@ -1313,7 +1410,8 @@ def _short(value: str | None, limit: int = 72) -> str:
     return value if len(value) <= limit else f"{value[:limit]}... ({len(value)//2}B)"
 
 
-def diff_xhr(a: dict, b: dict, na: str, nb: str) -> bool:
+def diff_xhr(a: dict, b: dict, na: str, nb: str,
+             excused: typing.Collection[str] = ()) -> bool:
     """Compare the page's own GET - the second HEADERS block on the connection.
 
     Only possible because both sides sent the same first request first: the
@@ -1340,6 +1438,16 @@ def diff_xhr(a: dict, b: dict, na: str, nb: str) -> bool:
     if ba == bb:
         print("xhr HPACK bytes are IDENTICAL")
         return same
+    # The dynamic table carries the first block's `:authority` into this one,
+    # so an unreproducible authority moves these bytes too - and does it twice,
+    # once as a table reference and once in whatever it displaced.
+    da, db = _decode(ba), _decode(bb)
+    differing = {k for (k, v), (k2, v2) in zip(da, db) if (k, v) != (k2, v2)}
+    if excused and [k for k, _ in da] == [k for k, _ in db] \
+            and differing <= set(excused):
+        print(f"xhr fields are identical apart from {', '.join(sorted(differing))}, "
+              f"not reproducible here")
+        return same
     print("!! xhr HPACK bytes DIFFER")
     for name, blk in ((na, ba), (nb, bb)):
         print(f"  {name}: " + " ".join(
@@ -1347,15 +1455,26 @@ def diff_xhr(a: dict, b: dict, na: str, nb: str) -> bool:
     return False
 
 
-def diff_records(a: dict, b: dict, na: str, nb: str) -> int:
-    """Full comparison of two captures: TLS, h2 frames, then HPACK bytes."""
+def diff_records(a: dict, b: dict, na: str, nb: str,
+                 excused: typing.Collection[str] = ()) -> int:
+    """Full comparison of two captures: TLS, h2 frames, then HPACK bytes.
+
+    `excused` names the header fields the replay could not reproduce - in
+    practice `:authority`, when the capture was taken at an address this
+    machine does not hold. Those fields are still printed, but a block that
+    differs *only* in them is reported as such rather than as a failure and a
+    wall of byte offsets: the bytes cannot match, and saying so twenty times
+    over is not a finding. `diff_hpack_offline` is what still gives that block
+    a byte-level verdict.
+    """
     def headers_frame(rec):
         return next(f for f in rec["frames"] if f["type"] == "HEADERS")
 
     ba = bytes.fromhex(headers_frame(a)["header_block"])
     bb = bytes.fromhex(headers_frame(b)["header_block"])
 
-    ok = diff_client_hello(a.get("client_hello"), b.get("client_hello"), na, nb)
+    ok = diff_client_hello(a.get("client_hello"), b.get("client_hello"), na, nb,
+                           host_differs=":authority" in excused)
     print()
     ok &= diff_h2(a, b, na, nb)
 
@@ -1366,13 +1485,25 @@ def diff_records(a: dict, b: dict, na: str, nb: str) -> int:
     ha, hb = _decode(ba), _decode(bb)
     if [k for k, _ in ha] != [k for k, _ in hb]:
         print("\n!! header NAMES/order differ - fix that before comparing bytes")
+    unexcused = False
     for (ka, va), (kb, vb) in zip(ha, hb):
         if (ka, va) != (kb, vb):
-            print(f"  value differs: {ka}={va!r} vs {kb}={vb!r}")
+            tag = "  (not reproducible here)" if ka in excused and ka == kb else ""
+            unexcused |= not tag
+            print(f"  value differs: {ka}={va!r} vs {kb}={vb!r}{tag}")
 
     if ba == bb:
         print("\nHPACK bytes are IDENTICAL")
         ok &= diff_xhr(a, b, na, nb)
+        return 0 if ok else 1
+
+    if excused and not unexcused:
+        print(f"\nfields are identical apart from {', '.join(sorted(excused))}, "
+              f"which this machine cannot\nreproduce - so the bytes cannot "
+              f"match and are not compared. What the live path\nproves here is "
+              f"the field set and its order; the encoding is judged by the "
+              f"re-encode\nbelow, on the capture's own fields.")
+        ok &= diff_xhr(a, b, na, nb, excused=excused)
         return 0 if ok else 1
 
     print("\nfirst differing byte offsets:")
@@ -1387,6 +1518,93 @@ def diff_records(a: dict, b: dict, na: str, nb: str) -> int:
                 print("  ...")
                 break
     return 1
+
+
+def _split_table_size_update(block: bytes) -> tuple[bytes, int | None]:
+    """Peel a leading dynamic table size update off a header block.
+
+    RFC 7541 section 6.3: `001` in the top three bits, then a 5-bit prefix
+    integer. Clients emit one to acknowledge the peer's
+    SETTINGS_HEADER_TABLE_SIZE, and some emit it even when the value equals the
+    4096 default - which `hpack` never does, because it only writes one when
+    the size *changed*. That is an acknowledgement rather than an encoding
+    rule, so it is reported separately instead of counting as a difference in
+    how the fields were encoded.
+
+    Returns (block without the update, the size) or (block, None).
+    """
+    if not block or block[0] & 0xE0 != 0x20:
+        return block, None
+    value = block[0] & 0x1F
+    i = 1
+    if value == 0x1F:                              # continuation octets follow
+        shift = 0
+        while i < len(block):
+            octet = block[i]
+            i += 1
+            value += (octet & 0x7F) << shift
+            shift += 7
+            if not octet & 0x80:
+                break
+        else:
+            return block, None
+    return block[i:], value
+
+
+def diff_hpack_offline(ref: dict, brand: str) -> bool:
+    """Re-encode the capture's own fields with this brand's encoder.
+
+    The live replay cannot always reproduce a capture's `:authority` - one
+    taken off a real site names that site, and this machine does not hold its
+    address - and `:authority` is inside the header block, so those brands used
+    to be skipped outright.
+
+    This asks the same question without the network: decode the captured block,
+    hand the fields straight back to the encoder the profile selects, and
+    compare the result to the captured bytes. The input is the browser's own,
+    including the authority, so nothing has to be excused; what is under test is
+    exactly the encoder's policy - what it indexes, what it huffman-codes, what
+    it refuses to index - which is what the byte comparison was ever for.
+
+    What it does *not* cover is the part the live replay does: that httpx and
+    httpcore emit that field list, in that order, at all. The two are
+    complementary and both run.
+    """
+    import hpack
+
+    from . import browser_fp
+
+    prof = browser_fp.profile(brand)
+    print(f"\n=== HPACK re-encode (capture's own fields, {prof.hpack} encoder) ===")
+
+    decoder = hpack.Decoder()
+    encoder = browser_fp._ENCODERS[prof.hpack]()
+    ok = True
+    for label, rec in (("navigate", ref), ("xhr", ref.get("xhr"))):
+        if rec is None:
+            continue
+        frame = next((f for f in rec["frames"] if f["type"] == "HEADERS"), None) \
+            if "frames" in rec else None
+        block = bytes.fromhex(frame["header_block"] if frame else rec["header_block"])
+        # One decoder for both blocks and in order: the second indexes into the
+        # table the first built, so it cannot be decoded on its own.
+        fields = decoder.decode(block, raw=True)
+        body, update = _split_table_size_update(block)
+        ours = encoder.encode(fields)
+        if ours == body:
+            note = ("" if update is None else
+                    f" (after a {len(block) - len(body)}B dynamic table size "
+                    f"update to {update}, which hpack does not emit)")
+            print(f"  {label:<9} {len(block)}B  IDENTICAL{note}")
+            continue
+        ok = False
+        print(f"  {label:<9} {len(block)}B captured, {len(ours)}B ours  DIFFER")
+        for i in range(max(len(body), len(ours))):
+            if body[i:i + 1] != ours[i:i + 1]:
+                print(f"      first difference at byte {i}: "
+                      f"{body[i:i + 1].hex() or '--'} vs {ours[i:i + 1].hex() or '--'}")
+                break
+    return ok
 
 
 # --- importing a mitmproxy capture ------------------------------------------
@@ -1410,14 +1628,22 @@ def capture_mitm(args: argparse.Namespace) -> int:
     """
     from . import addon_path
 
-    mitmdump = args.mitmdump or shutil.which("mitmdump")
+    # Alongside this interpreter first. `install-python.sh --with-mitmproxy`
+    # puts it there, and a pyenv interpreter's bin/ is normally not on PATH -
+    # so without this the one case the script sets up is the one that is not
+    # found. PATH still wins if --mitmdump was not given and nothing is beside
+    # us, which keeps a pipx or distro install working as before.
+    beside = Path(sys.executable).parent / "mitmdump"
+    mitmdump = (args.mitmdump
+                or (str(beside) if beside.exists() else None)
+                or shutil.which("mitmdump"))
     if not mitmdump:
-        print("mitmdump is not on PATH.\n\n"
-              "  pipx install mitmproxy        # keeps it off this interpreter\n"
-              "  pip install mitmproxy         # needs its own Python >= 3.12\n\n"
-              "or point at one with --mitmdump. It does not have to be the "
-              "Python this package is installed in, and normally should not be "
-              "- this one is 3.11, built against the OpenSSL fork.",
+        print("mitmdump was not found beside this interpreter or on PATH.\n\n"
+              "  ./install-python.sh --with-mitmproxy   # into this interpreter\n"
+              "  pipx install mitmproxy                 # or keep it separate\n\n"
+              "or point at one with --mitmdump. It does not have to be this "
+              "Python: the addon is loaded by path and imports nothing from "
+              "mytls, so any interpreter >= 3.12 will do.",
               file=sys.stderr)
         return 2
 
@@ -1779,18 +2005,22 @@ def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
     result on an air-gapped machine, and nothing to clean up if it fails.
     """
     ref, source = _load(brand)
-    # The address is not free to choose: `:authority` is part of the HPACK
-    # block and the host half decides whether an SNI goes out. Address the
-    # server the way the captured browser did, or the comparison fails on
-    # differences that mean nothing.
+    # `:authority` is inside the HPACK block and its host half decides whether
+    # an SNI goes out, so a capture reproduces exactly only when it is
+    # addressed the way the browser addressed it. Where that is possible it is
+    # done. Where it is not - a capture taken off a real site names that site,
+    # and this machine neither holds its address nor may bind :443 - the
+    # request goes somewhere reachable and `:authority` joins `excused`.
+    # Refusing to run at all was the old behaviour and it cost everything: the
+    # ClientHello, the frame layer and the header order were all measurable the
+    # whole time, and every capture taken through mitmproxy is in this position.
     authority = authority_of(ref)
     host, want = split_authority(authority)
+    excused: set[str] = set()
 
     if port is not None and port != want:
-        print(f"note: {brand} was captured on port {want}; using {port} instead "
-              f"means :authority differs and the HPACK block cannot match. The "
-              f"ClientHello and HTTP/2 layers are still meaningful.")
-        authority = f"{host}:{port}"
+        print(f"note: {brand} was captured on port {want}; using {port} instead.")
+        authority, excused = f"{host}:{port}", {":authority"}
     else:
         port = want
 
@@ -1799,27 +2029,35 @@ def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
         # whatever the browser could reach - a router-assigned one that has
         # since changed, or under WSL the Windows host rather than this VM.
         print(f"note: {brand} was captured at {host}, which is not an address "
-              f"this machine holds, so the request goes to localhost instead. "
-              f":authority differs, so the HPACK block cannot match"
-              + (", and the capture carried no SNI while this one does, so the "
-                 "ClientHello will differ by one extension"
-                 if _is_ip(host) else "")
-              + ". The HTTP/2 layer is still compared in full.")
-        authority = f"localhost:{port}"
+              f"this machine holds, so the request goes to localhost instead."
+              + (" The capture carried no SNI while this one does, so the "
+                 "ClientHello will differ by one extension." if _is_ip(host) else ""))
+        authority, excused = f"localhost:{port}", {":authority"}
 
     ctx = tls_context(openssl)
     try:
         srv = listen(port)
     except OSError as exc:
-        # Not a failure: nothing about this capture has been found wrong, it
-        # simply cannot be replayed here. A capture taken off a real site -
-        # which import-mitm makes easy - names that site's authority, and
-        # binding its port needs either root or the port to be free.
-        print(f"cannot listen on :{port} ({exc}). The port cannot simply be "
-              f"changed - it is baked into {source}'s :authority - so free it "
-              f"and re-run, or run as root if it is a privileged port.",
-              file=sys.stderr)
-        return SKIPPED
+        # Not being able to bind the captured port is a fact about this machine,
+        # not about the capture. Move to one that is free and say so; the port
+        # is part of `:authority`, which is already excused above whenever the
+        # host was, and is excused here when it was not.
+        host, _, _ = authority.partition(":")
+        for fallback in (8443, 0):
+            try:
+                srv = listen(fallback)
+            except OSError:
+                continue
+            port = srv.getsockname()[1]
+            print(f"note: cannot listen on :{split_authority(authority)[1]} "
+                  f"({exc}); using :{port} instead.")
+            authority = f"{host}:{port}"
+            excused.add(":authority")
+            break
+        else:
+            print(f"no port could be bound at all, so {source} cannot be "
+                  f"replayed here.", file=sys.stderr)
+            return SKIPPED
 
     got: list[dict] = []
     want_xhr = ref.get("xhr") is not None
@@ -1828,9 +2066,23 @@ def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
             capture(srv, ctx, quiet=True, want_xhr=want_xhr, timeout=10.0)])),
         daemon=True)
     thread.start()
+    import hpack
+
+    # One decoder, in order: the xhr block indexes into the table the first
+    # block built, so decoding it on its own raises InvalidTableIndex.
+    decoder = hpack.Decoder()
+    frame = next(f for f in ref["frames"] if f["type"] == "HEADERS")
+    pseudo = dict(_decode_with(decoder, bytes.fromhex(frame["header_block"])))
+    xhr_pseudo = dict(
+        _decode_with(decoder, bytes.fromhex(ref["xhr"]["header_block"]))
+        if ref.get("xhr") else [])
     try:
-        run_client(authority, brand, quiet=True, like=headers_of(ref),
-                   xhr=ref.get("xhr"))
+        run_client(authority, brand, quiet=True, like=pseudo,
+                   xhr=ref.get("xhr"),
+                   method=pseudo.get(":method", "GET"),
+                   path=pseudo.get(":path", "/api/all"),
+                   xhr_method=xhr_pseudo.get(":method", "GET"),
+                   xhr_path=xhr_pseudo.get(":path", "/xhr-sample"))
     finally:
         thread.join(timeout=20)
         srv.close()
@@ -1841,7 +2093,10 @@ def selftest_one(brand: str, openssl: str, *, port: int | None = None) -> int:
         return 1
 
     print(f"=== {brand}: our bytes vs {source} ===\n")
-    return diff_records(ref, got[0], brand, "ours")
+    rc = diff_records(ref, got[0], brand, "ours", excused=excused)
+    # Always, not only when something was excused: it is the one check that
+    # judges the encoder on the browser's own fields, and it costs no network.
+    return rc or (0 if diff_hpack_offline(ref, brand) else 1)
 
 
 def selftest(args: argparse.Namespace) -> int:

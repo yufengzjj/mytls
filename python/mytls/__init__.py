@@ -90,8 +90,10 @@ def addon_path() -> str:
     """Where the mitmproxy addon lives, for `mitmdump -s`.
 
     Returned as a path rather than imported, because that module runs inside
-    mitmproxy's interpreter - 3.12 or newer, possibly the one bundled in a
-    standalone build - and not this one. Nothing here imports it.
+    mitmproxy's interpreter. That may now be this one - `install-python.sh`
+    builds 3.12 so mitmproxy can be installed alongside - but it may equally be
+    a standalone build's bundled Python or a pipx venv, so nothing here imports
+    it.
     """
     from pathlib import Path
 

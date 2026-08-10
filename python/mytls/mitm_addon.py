@@ -28,10 +28,12 @@ every existing profile - `parse_client_hello()` and `describe()`. Parsing here
 too would mean two implementations that have to agree, and the whole point of
 the byte-level comparison is that there is only one.
 
-It also imports nothing from `mytls`. It runs inside mitmproxy's interpreter,
-which is at least 3.12 (and may be the bundled one in a standalone build),
-while the interpreter that reads these dumps is the 3.11 linked against the
-OpenSSL fork. Keeping the two apart is what makes both possible.
+It also imports nothing from `mytls`, and that stays true even though the two
+can now share an interpreter: `install-python.sh` builds 3.12 precisely so that
+mitmproxy - which requires 3.12 - can be installed alongside, but a standalone
+mitmproxy build brings its own bundled Python, and a `pipx`-installed one gets
+its own venv. This file has to work in all three, so it depends on nothing but
+mitmproxy itself.
 
 Usage
 -----
