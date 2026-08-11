@@ -5,22 +5,30 @@ HEADERS frame exactly as they arrived - the header block fragment is written out
 verbatim, before anything decodes it. Point a browser at it to capture that
 browser, then point our own client at it and compare.
 
-    # wait for any browser at all
+    # wait for any browser at all; the raw dumps land in ./captures
     mytls-probe serve
 
     # Windows, fresh profile so no cookies/extensions get in the way
     chrome.exe --user-data-dir=%TEMP%\\cfp --ignore-certificate-errors ^
                https://localhost:8443/api/all
 
-    # that is all - it stored profiles/chrome.json and browser_fp now has a
-    # "chrome" transport
+    # then make a profile out of what arrived, and browser_fp has a "chrome"
+    # transport
+    mytls-probe import-mitm ./captures --brand chrome
     mytls-probe list
     mytls-probe selftest
 
-Which browser it was is read off the request it just sent, so nothing has to be
-named up front - point Chrome, Firefox or a phone at the address and each lands
-in its own file. A brand is a browser, not a browser version: capturing Chrome
-again replaces profiles/chrome.json, and the version stays inside the capture.
+On its own `serve` only *records*: one dump per connection, in the layout
+mitm_addon.py writes, so `import-mitm` and `match` read a capture taken here and
+one taken through mitmproxy with the same code. Nothing is installed as a brand
+until you say which brand it is - and a connection that never got as far as a
+request is kept too, which is the only way to measure a client that refuses our
+certificate.
+
+`serve --brand chrome` is the one-step form: capture, take the connection that
+carried the request, write profiles/chrome.json. A brand is a browser, not a
+browser version: capturing Chrome again replaces profiles/chrome.json, and the
+version stays inside the capture.
 
 A phone reaches this machine over the LAN, so it needs an address that is not
 localhost, and a certificate that says so:
@@ -399,6 +407,124 @@ def tls_context(openssl: str, hosts: typing.Iterable[str] = ()) -> ssl.SSLContex
     return ctx
 
 
+def _safe(name: str) -> str:
+    """A hostname reduced to something that can be a filename.
+
+    The same rule mitm_addon.py applies, written out again rather than shared:
+    that file runs under mitmproxy's own interpreter and imports nothing from
+    here.
+    """
+    return re.sub(r"[^a-zA-Z0-9._-]", "_", name) or "unknown"
+
+
+def sni_of(raw: bytes) -> str | None:
+    """The server_name a ClientHello carried, or None if it sent none.
+
+    A client addressing an IP literal sends no SNI at all, which is ordinary
+    here - the browser was pointed at this machine's address - and is why a
+    dump is named after the peer when this comes back empty.
+    """
+    try:
+        for etype, body in _walk_extensions(raw):
+            if etype == 0x0000 and len(body) >= 5:
+                n = int.from_bytes(body[3:5], "big")
+                return body[5:5 + n].decode("ascii", "replace") or None
+    except (IndexError, ValueError):
+        return None
+    return None
+
+
+#: How often a dump is rewritten while its connection is still open. The same
+#: interval mitm_addon.py uses, for the same reason: a run ends when the request
+#: it was waiting for arrives or when someone stops waiting, and neither is a
+#: moment the connections choose, so an interrupted one loses at most this much
+#: instead of the whole connection.
+FLUSH_INTERVAL = 1.0
+
+
+class _Wire:
+    """A socket that also keeps every decrypted byte that crossed it.
+
+    `serve` records frames as it parses them, which is all a profile needs. A
+    dump is the byte stream itself, so it has to be kept as it is read - after
+    decryption, before anything looks at it. The layout written out is
+    mitm_addon.py's, so one importer reads captures taken either way.
+
+    Everything that is not recv/sendall is forwarded to the real socket, so
+    `handle_h2` cannot tell it is not holding one. It is handed the socket by
+    `attach()` rather than at construction, because a connection that fails the
+    handshake never gets one and is still worth a dump.
+    """
+
+    def __init__(self, out: Path, peer: str, hello: bytes) -> None:
+        self._sock: ssl.SSLSocket | None = None
+        self._out = out
+        self.peer = peer
+        self.hello = hello
+        self.sni = sni_of(hello)
+        self.alpn: str | None = None
+        self.client = bytearray()
+        self.server = bytearray()
+        #: What the last write held, so an idle connection is not rewritten.
+        self._size = -1
+        self._flushed = 0.0
+        self.captured_at = datetime.datetime.now(
+            datetime.timezone.utc).replace(microsecond=0).isoformat()
+        # Named after this connection's own client_random, so the repeated
+        # writes of one connection land on one path while a second visit from
+        # the same browser gets a file of its own instead of overwriting it.
+        stamp = hashlib.sha256(hello).hexdigest()[:8]
+        self.path = out / f"{_safe(self.sni or peer)}-{stamp}.json"
+
+    def attach(self, sock: ssl.SSLSocket) -> _Wire:
+        self._sock = sock
+        return self
+
+    def recv(self, n: int) -> bytes:
+        chunk = self._sock.recv(n)
+        self.client += chunk
+        return chunk
+
+    def sendall(self, data: bytes) -> None:
+        self.server += data
+        self._sock.sendall(data)
+
+    def __getattr__(self, name: str) -> typing.Any:
+        return getattr(self._sock, name)
+
+    def due(self) -> bool:
+        """True if new bytes have arrived and it is time to write them again."""
+        return (len(self.client) + len(self.server) != self._size
+                and time.monotonic() - self._flushed >= FLUSH_INTERVAL)
+
+    def write(self) -> Path:
+        payload = {
+            "format": MITM_FORMAT,
+            "captured_at": self.captured_at,
+            "sni": self.sni,
+            "alpn": self.alpn,
+            "peer": self.peer,
+            "client_hello": self.hello.hex(),
+            # Peeked off the socket before wrap_socket() consumed it, so this
+            # is the record exactly as it went over the wire - the one thing
+            # mitmproxy cannot always supply.
+            "client_hello_exact": True,
+            "client": bytes(self.client).hex(),
+            "server": bytes(self.server).hex(),
+        }
+        # From the payload, not from the buffers: they may have grown while it
+        # was being built, and those bytes are not in this file.
+        self._size = (len(payload["client"]) + len(payload["server"])) // 2
+        self._flushed = time.monotonic()
+        self._out.mkdir(parents=True, exist_ok=True)
+        # A dump may be written while its connection is still open, so never
+        # leave a half-written file where the importer might pick it up.
+        tmp = self.path.with_name(self.path.name + ".tmp")
+        tmp.write_text(json.dumps(payload, indent=1))
+        tmp.replace(self.path)
+        return self.path
+
+
 class _Session:
     """What one capture run is collecting, shared across connections.
 
@@ -410,13 +536,22 @@ class _Session:
     """
 
     def __init__(self, *, timeout: float, quiet: bool,
-                 want_xhr: bool = False) -> None:
+                 want_xhr: bool = False, dumps: Path | None = None,
+                 written: list[Path] | None = None) -> None:
         #: Hold the connection open past the first request to also catch the
         #: page's own /xhr-sample. The browser sends one by itself; our own
         #: client has to be told to, which is what selftest does.
         self.want_xhr = want_xhr
         self.timeout = timeout
         self.quiet = quiet
+        #: Where one dump per connection goes, or None to record nothing but
+        #: the profile. Set when the run is not filing anything under a brand.
+        self.dumps = dumps
+        #: Dumps already on disk, in the order they were written.
+        self.written = [] if written is None else written
+        #: Connections still open, so a run that ends while one is mid-request
+        #: still writes out what it had.
+        self.wires: list[_Wire] = []
         self.lock = threading.Lock()
         self.record: dict | None = None
         #: The page's own GET, decoded and kept raw: the only measurement of
@@ -442,6 +577,59 @@ class _Session:
     def note(self, msg: str) -> None:
         if not self.quiet:
             print(msg, flush=True)
+
+    def open_dump(self, hello: bytes, peer: str) -> _Wire | None:
+        """Start recording a connection, if this run is writing dumps at all.
+
+        A connection that sent no ClientHello sent nothing that identifies it,
+        so there is nothing to dump - port scanners and health checks land here.
+        """
+        if self.dumps is None or not hello:
+            return None
+        wire = _Wire(self.dumps, peer, hello)
+        with self.lock:
+            self.wires.append(wire)
+        return wire
+
+    def close_dump(self, wire: _Wire | None) -> None:
+        """Write a connection out for the last time. Safe to call twice."""
+        if wire is None:
+            return
+        with self.lock:
+            if wire not in self.wires:
+                return
+            self.wires.remove(wire)
+        self._write_dump(wire, announce=True)
+
+    def _write_dump(self, wire: _Wire, *, announce: bool = False) -> None:
+        try:
+            path = wire.write()
+        except OSError as exc:
+            print(f"  {wire.peer}: could not write {wire.path} ({exc})",
+                  file=sys.stderr)
+            return
+        with self.lock:
+            if path not in self.written:
+                self.written.append(path)
+        if announce:
+            self.note(f"  {wire.peer}: {len(wire.client)}B from the client "
+                      f"-> {path.name}")
+
+    def flush_dumps(self, *, final: bool = False) -> None:
+        """Bring the open connections' dumps up to date on disk.
+
+        `final` also unregisters them, which is how a run ends: it stops on the
+        request it was waiting for, not on the browser closing its sockets, so
+        several connections are normally still live at that point - and one of
+        them may be the one that carried the xhr.
+        """
+        with self.lock:
+            pending = self.wires
+            if final:
+                pending, self.wires = self.wires, []
+        for wire in list(pending):
+            if final or wire.due():
+                self._write_dump(wire, announce=final)
 
     def claim_record(self, record: dict) -> bool:
         """True if this connection is the one that captured the profile."""
@@ -470,31 +658,48 @@ def shape_of(ch: dict) -> str:
 def _serve_connection(raw: socket.socket, peer: tuple, ctx: ssl.SSLContext,
                       state: _Session) -> None:
     # Peek first: wrap_socket() would consume the ClientHello.
-    client_hello = parse_client_hello(peek_client_hello(raw))
+    hello = peek_client_hello(raw)
+    client_hello = parse_client_hello(hello)
+    # Every connection is dumped, including the ones that go no further: the
+    # ClientHello is already in hand by now, and it is what `match` reads.
+    wire = state.open_dump(hello, peer[0])
     try:
         sock = ctx.wrap_socket(raw, server_side=True)
-    except ssl.SSLError as exc:
+    except OSError as exc:
         # The ClientHello goes out before any certificate is validated, so a
         # client that refuses our self-signed one has still told us everything
         # about itself. Report it rather than throwing it away: a client that
         # cannot be clicked through (an in-app WebView) is otherwise impossible
         # to measure at all.
-        state.note(f"  {peer[0]}: TLS failed ({exc.reason})"
+        #
+        # OSError and not just SSLError: a client that dislikes the certificate
+        # may send an alert (SSLError here) or simply reset the connection
+        # (ConnectionResetError), and the second one used to end this thread
+        # with a traceback - now it is the same reportable outcome as the
+        # first, with the same ClientHello behind it.
+        why = getattr(exc, "reason", None) or type(exc).__name__
+        state.note(f"  {peer[0]}: TLS failed ({why})"
                    + (f" - {shape_of(client_hello)}" if client_hello else ""))
         raw.close()
+        state.close_dump(wire)
         return
 
-    if sock.selected_alpn_protocol() != "h2":
-        state.note(f"  {peer[0]}: negotiated "
-                   f"{sock.selected_alpn_protocol()!r}, not h2 - ignoring")
+    alpn = sock.selected_alpn_protocol()
+    if wire is not None:
+        wire.alpn = alpn
+    if alpn != "h2":
+        state.note(f"  {peer[0]}: negotiated {alpn!r}, not h2 - ignoring")
         sock.close()
+        state.close_dump(wire)
         return
 
     try:
-        handle_h2(sock, state, client_hello=client_hello, peer=peer[0])
+        handle_h2(wire.attach(sock) if wire is not None else sock, state,
+                  client_hello=client_hello, peer=peer[0])
     except (ConnectionError, ssl.SSLError, struct.error, TimeoutError) as exc:
         state.note(f"  {peer[0]}: {type(exc).__name__}: {exc}")
     finally:
+        state.close_dump(wire)
         _graceful_close(sock)
 
 
@@ -517,34 +722,64 @@ def _graceful_close(sock: ssl.SSLSocket) -> None:
 
 
 def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
-            timeout: float = 25.0, want_xhr: bool = False) -> dict | None:
+            timeout: float = 25.0, want_xhr: bool = False,
+            dumps: Path | None = None,
+            written: list[Path] | None = None) -> dict | None:
     """Serve until the profile is captured, and the page's own fetch with it.
 
     Returns None if the listening socket is closed from under us, which is how
     selftest stops a capture that never arrived.
+
+    `dumps` additionally writes every connection's raw bytes into that
+    directory, and `written` collects the paths - the return value is one
+    profile, and a run may have recorded several connections worth keeping.
     """
-    state = _Session(timeout=timeout, quiet=quiet, want_xhr=want_xhr)
+    state = _Session(timeout=timeout, quiet=quiet, want_xhr=want_xhr,
+                     dumps=dumps, written=written)
     threads: list[threading.Thread] = []
     srv.settimeout(0.5)
 
-    while not state.done.is_set() and not state.expired():
-        try:
-            raw, peer = srv.accept()
-        except TimeoutError:
-            continue
-        except OSError:
-            if state.record is None:
-                return None
-            break
-        t = threading.Thread(target=_serve_connection,
-                             args=(raw, peer, ctx, state), daemon=True)
-        t.start()
-        threads.append(t)
+    # Ctrl-C is the only way out of a run that nothing ever completes - a
+    # client that will not accept our certificate leaves no request to wait
+    # for - so it ends the run rather than propagating, and what arrived is
+    # written out below. The guard is around the whole loop and not just
+    # accept(): the interrupt is delivered at whatever bytecode boundary comes
+    # next, which is as often the flush or the loop condition.
+    try:
+        while not state.done.is_set() and not state.expired():
+            # At least twice a second, since accept() times out that often.
+            state.flush_dumps()
+            accepted = None
+            try:
+                accepted = srv.accept()
+            except TimeoutError:
+                pass          # nothing yet; see below for why not `continue`
+            except OSError:
+                if state.record is None:
+                    state.flush_dumps(final=True)
+                    return None
+                break
+            if accepted is None:
+                # Deliberately out here rather than a `continue` in the handler
+                # above: an interrupt delivered on that jump is raised while
+                # the TimeoutError is still being handled, and escapes the
+                # guard below - measured, on CPython 3.12. Since a timeout is
+                # the state this loop spends all its time in, that is where a
+                # Ctrl-C almost always lands.
+                continue
+            raw, peer = accepted
+            t = threading.Thread(target=_serve_connection,
+                                 args=(raw, peer, ctx, state), daemon=True)
+            t.start()
+            threads.append(t)
+    except KeyboardInterrupt:
+        state.note("\ninterrupted - writing out what arrived")
 
     # Long enough for the winning connection to finish writing its response -
     # the page is waiting on that 200 to say it is done.
     for t in threads:
         t.join(timeout=2)
+    state.flush_dumps(final=True)
 
     if state.record is not None and state.xhr is not None:
         # Attached after the fact rather than into the frozen frame list: the
@@ -587,18 +822,27 @@ def brand_of(record: dict) -> str:
 
 
 def serve(args: argparse.Namespace) -> int:
-    """Capture one client and store it under the brand it says it is.
+    """Capture whatever visits, and write it down.
 
-    The browser identifies itself in the request it just sent, so the brand is
-    read off the capture rather than typed in beforehand: point any browser at
-    the address, and it lands in the right file. --brand overrides that, --out
-    stores at a path without registering a brand at all.
+    On its own this only records: one dump per connection under --captures, in
+    the layout mitm_addon.py writes, to be handed to `import-mitm` afterwards -
+    the same two steps as `capture-mitm` without a --brand. --brand does both
+    steps here and now, storing the connection that carried the request as that
+    profile; --out stores it at a path without registering a brand at all.
+
+    Recording and filing are separate because they fail separately. Which
+    browser a capture is cannot always be read off it - a WebView, an app on
+    NSURLSession, or anything that refused our certificate before sending a
+    request - and those are exactly the clients worth capturing. Guessing a
+    brand there used to lose the whole visit; now the bytes are on disk either
+    way and naming them is a later decision.
     """
     if args.brand and args.out:
         print("give --brand or --out, not both", file=sys.stderr)
         return 2
     if args.brand:
         profile_path(args.brand)          # reject a bad name before we listen
+    dumps = None if (args.brand or args.out) else Path(args.captures).resolve()
 
     hosts = [h.strip() for h in (args.host or "").split(",") if h.strip()]
     detected = local_ipv4()
@@ -610,6 +854,9 @@ def serve(args: argparse.Namespace) -> int:
     reach = hosts[0] if hosts else "localhost"
     print(f"listening on :{args.port} - waiting for any h2 client "
           f"(https://{reach}:{args.port}/api/all)")
+    if dumps is not None:
+        print(f"  dumps    {dumps}   (one per connection; nothing is filed "
+              f"under a brand - pass --brand to do that in one step)")
     if hosts and not can_bind(hosts[0]):
         # Under WSL2 the VM sits behind NAT, so the address a phone can reach
         # is the Windows host's and packets only arrive if Windows forwards
@@ -624,13 +871,16 @@ def serve(args: argparse.Namespace) -> int:
               f"    netsh advfirewall firewall add rule name=hpack_probe "
               f"dir=in action=allow protocol=TCP localport={args.port}")
 
+    written: list[Path] = []
     record = capture(srv, ctx, timeout=args.xhr_timeout,
                      # The page fetches /xhr-sample by itself, but the run has
                      # to be told to stay up for it - otherwise it ends on the
                      # navigation and the xhr half is lost. It arrives in
                      # milliseconds; the timeout is only the giving-up point.
-                     want_xhr=True)
+                     want_xhr=True, dumps=dumps, written=written)
     srv.close()
+    if dumps is not None:
+        return report_dumps(dumps, written, record)
     if record is None:
         return 1
 
@@ -638,15 +888,7 @@ def serve(args: argparse.Namespace) -> int:
     if args.out:
         out, brand = Path(args.out), None
     else:
-        try:
-            brand = args.brand or brand_of(record)
-        except Exception as exc:  # noqa: BLE001 - the capture is worth keeping
-            fallback = Path("capture.json")
-            fallback.write_text(json.dumps(record, indent=2))
-            print(f"  captured from {peer}, but {exc}\n"
-                  f"  kept it at {fallback} - re-run with --brand, or move it "
-                  f"into {PROFILES_DIR} yourself", file=sys.stderr)
-            return 1
+        brand = args.brand
         out = profile_path(brand)
         out.parent.mkdir(parents=True, exist_ok=True)
         record = {"brand": brand, **record}
@@ -656,18 +898,62 @@ def serve(args: argparse.Namespace) -> int:
     ua = headers_of(record).get("user-agent", "?")
     print(f"  captured from {peer}: {ua}")
     print(f"  {'replaced' if replacing else 'stored as'} {out}")
+    warn_if_resumed(record)
 
-    # We refuse to issue tickets, but a browser that collected one before that
-    # was true still offers it, and the capture is then a resumed handshake.
+    summarise(record)
+    if brand:
+        report_profile(brand)
+    return 0
+
+
+def warn_if_resumed(record: dict) -> None:
+    """Say so if the capture is of a resumed handshake, which is not usable.
+
+    We refuse to issue tickets, but a browser that collected one before that
+    was true still offers it, and the ClientHello then carries an extension our
+    client never sends.
+    """
     if carries_psk(record.get("client_hello")):
         print("  !! this ClientHello carries pre_shared_key: the browser resumed "
               "a session it had from an earlier visit, so the capture has one "
               "extension our client never sends. Re-capture from a fresh "
               "browser profile (a new --user-data-dir).", file=sys.stderr)
 
+
+def report_dumps(out: Path, written: list[Path], record: dict | None) -> int:
+    """Say what landed in the captures directory and how to make use of it.
+
+    Nothing is installed here - that is `import-mitm`'s job, and it is given
+    the whole directory rather than a chosen file, because it is the one that
+    knows which connection carried a navigation and which carried the xhr.
+    What this does say is whether a *request* arrived at all: a run that only
+    collected a rejected handshake is worth telling apart from one that got
+    everything, and the exit status follows that rather than the file count.
+    """
+    if not written:
+        print("\nnothing was captured. Check that the browser really reached "
+              "this address, and that it got as far as sending a ClientHello.",
+              file=sys.stderr)
+        return 1
+
+    print(f"\n{len(written)} dump(s) in {out}")
+    if record is None:
+        print("  none of them carries an HTTP/2 request - a ClientHello alone "
+              "still says which stack it came from (`mytls-probe match "
+              f"{out}`), but a profile cannot be built from it. If the browser "
+              "stopped at the certificate warning, click through it.",
+              file=sys.stderr)
+        return 1
+
+    peer = record.pop("peer", "?")
+    try:
+        ua = headers_of(record).get("user-agent", "?")
+    except Exception as exc:  # noqa: BLE001 - the dumps are already on disk
+        ua = f"(user-agent unreadable: {type(exc).__name__}: {exc})"
+    print(f"  captured from {peer}: {ua}")
+    warn_if_resumed(record)
     summarise(record)
-    if brand:
-        report_profile(brand)
+    print(f"\n  import with:\n    mytls-probe import-mitm {out} --brand <name>")
     return 0
 
 
@@ -1621,10 +1907,12 @@ SKIPPED = 2
 def capture_mitm(args: argparse.Namespace) -> int:
     """Run mitmproxy with our addon loaded, then import what it recorded.
 
-    mitmproxy has to be a separate process, not an import: it needs Python 3.12
-    or newer and this one is the 3.11 built against the fork. That is also why
-    the addon is passed by path rather than by module name - it is read by the
-    other interpreter, and a standalone mitmproxy build has its own.
+    mitmproxy is a separate process, not an import. It may now be the *same*
+    interpreter - `install-python.sh` builds 3.12 against the fork, which is
+    what mitmproxy requires - but it need not be, and running it out of process
+    is what keeps a standalone build or a pipx venv working unchanged. It is
+    also why the addon is passed by path rather than by module name: it is read
+    by whichever interpreter mitmdump happens to be.
     """
     from . import addon_path
 
@@ -2494,12 +2782,22 @@ def main() -> int:
 
     s = sub.add_parser(
         "serve",
-        help="capture one client and store it as the brand it says it is")
-    s.add_argument("--brand", help="override the brand read off the client's "
-                                   "user-agent (one file per browser, no "
+        help="run an h2 server and record whatever connects to it",
+        description="Stand up an HTTP/2 server over TLS and write down the raw "
+                    "bytes of every connection that reaches it. Without "
+                    "--brand nothing is installed: the dumps go to --captures "
+                    "in mitm_addon.py's layout, for `import-mitm` to turn into "
+                    "a profile afterwards - the same two steps as capture-mitm, "
+                    "against our own server instead of a real site.")
+    s.add_argument("--captures", default="captures", metavar="DIR",
+                   help="where the raw dumps go when no --brand is given; "
+                        "default: ./captures")
+    s.add_argument("--brand", help="skip the dumps and store the connection "
+                                   "that carried the request as this profile, "
+                                   "in one step (one file per browser, no "
                                    "version in the name)")
-    s.add_argument("--out", help="store at this path instead, without "
-                                 "registering it as a brand")
+    s.add_argument("--out", help="store that same single capture at this path, "
+                                 "without registering it as a brand")
     s.add_argument("--xhr-timeout", type=float, default=25.0,
                    help="how long to wait for the page's own /xhr-sample after "
                         "the navigation arrives (default 25s)")

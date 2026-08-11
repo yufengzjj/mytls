@@ -38,7 +38,7 @@ The captures ship inside it, so a project that depends on it does not need this 
 | `pyproject.toml` | Package metadata. httpx is pinned exactly, and the captures are declared as package data |
 | `mytls/__init__.py` | What `import mytls` gives you, plus `check()` — one line saying whether **both** layers are actually live |
 | `mytls/browser_fp.py` | The main module. Provides a transport per brand; `catalog()` / `describe()` report what is installed and what each imitates |
-| `mytls/hpack_probe.py` | Runs an h2 server that records the **raw ClientHello + h2 frames + HPACK bytes**; `serve` captures a visiting browser, `selftest` captures ourselves and diffs byte for byte. Installed as `mytls-probe` |
+| `mytls/hpack_probe.py` | Runs an h2 server that records the **raw ClientHello + h2 frames + HPACK bytes**; `serve` dumps every connection a visiting browser makes (`import-mitm` turns those into a profile), `selftest` captures ourselves and diffs byte for byte. Installed as `mytls-probe` |
 | `mytls/verify_fp.py` | The live check: real servers accept our handshake, and tls.peet.ws / check.ja3.zone are asked about us and compared against fingerprints computed on the spot from the profile's bytes. Nothing stored. Installed as `mytls-verify` |
 | `mytls/mitm_addon.py` | A mitmproxy 12 addon that records the same raw bytes off a **real site** rather than off our own server. Runs under mitmproxy's interpreter, imports nothing from here; `mytls-probe import-mitm` turns its dumps into a profile |
 | `mytls/tls_profile.py` | Selects the TLS-layer profile from Python (ctypes into libssl) |
@@ -281,11 +281,11 @@ import ssl; print(ssl.OPENSSL_VERSION)   # should be OpenSSL 3.4.0
 
 ## Adding a browser
 
-Start the server, visit it once with the browser you want, done. **Nothing has to be named
-up front and no Python code changes**:
+Start the server, visit it once with the browser you want, name what arrived. **No Python
+code changes**:
 
 ```bash
-mytls-probe serve
+mytls-probe serve                                   # records into ./captures
 ```
 
 ```
@@ -302,16 +302,50 @@ few more pitfalls; see [phones](#phones).
 
 ```
 listening on :8443 - waiting for any h2 client
+  dumps    /home/you/captures   (one per connection; nothing is filed under a brand)
+  192.168.1.19: 0B from the client -> localhost-4f1c0a72.json
+  192.168.1.19: 812B from the client -> localhost-b0810613.json
+
+2 dump(s) in /home/you/captures
   captured from 192.168.1.19: Mozilla/5.0 (Linux; Android 10; K) ... Chrome/149.0.0.0 Mobile Safari/537.36
-  stored as .../profiles/chrome_android.json
-  ...
+    ClientHello   517B, 18 ciphers, 12 extensions
+    ...
+  import with:
+    mytls-probe import-mitm /home/you/captures --brand <name>
+```
+
+```bash
+mytls-probe import-mitm ./captures --brand chrome_android
+```
+
+```
 chrome_android  (Chrome 149 on Android)
   transport      : browser_fp.ChromeAndroidTransport() / transport('chrome_android')
 ```
 
-**One visit produces one file.** `profiles/<brand>.json` gets the raw bytes — the whole
-ClientHello, every h2 frame, the HPACK blocks — and that is the entire capture. Opening the
-page is the whole procedure; there is nothing to fetch, paste or read.
+**Recording and naming are two steps, and that is deliberate.** `serve` alone writes one
+dump per *connection* — raw ClientHello, raw byte stream, both directions — in exactly the
+layout [the mitmproxy addon](#capturing-from-a-real-site-instead-mitmproxy) writes, so
+`import-mitm` and `match` read a capture taken here and one taken off a real site with the
+same code. `import-mitm` then picks the connection that carried a navigation, prefers one
+that also carried the page's `fetch`, and writes `profiles/<brand>.json`.
+
+Splitting them costs one command and buys two things. A browsing session is worth more than
+a guess at its name: a WebView, an app on `NSURLSession`, or anything that gave up at the
+certificate warning cannot be named from its request — it may not have sent one — and used
+to lose the whole visit. And **every** connection is kept, including the ones that never got
+past the handshake, which is the only way to measure a client that will not accept our
+certificate at all (`mytls-probe match ./captures` will still place it).
+
+`--brand` does both steps in one go where the name is already known:
+
+```bash
+mytls-probe serve --brand chrome     # capture, then store it as `chrome` directly
+```
+
+Either way the capture is the raw bytes — the whole ClientHello, every h2 frame, the HPACK
+blocks — and opening the page is the whole procedure; there is nothing to fetch, paste or
+read.
 
 There used to be a second file, `references/<brand>.json`, holding what tls.peet.ws and
 check.ja3.zone made of the same browser, collected in the same visit through a page that
@@ -331,8 +365,8 @@ could never have had a reference at all, because a third-party service behind an
 intercepting proxy reports *mitmproxy's* TLS, not the phone's. `ios16` is such a brand and
 now verifies like any other.
 
-**The brand is whatever the client says it is**, read off the `user-agent` of the request
-that just arrived:
+**`import-mitm --brand` may be left off**, and then the brand is whatever the client says it
+is, read off the `user-agent` of the request that was captured:
 
 | Who visited | Stored as |
 |---|---|
@@ -342,27 +376,29 @@ that just arrived:
 | iPhone, iOS 16 | `ios16` |
 | Firefox / Edge / Opera / Vivaldi / Samsung / Yandex | `firefox` / `edge` / `opera` / … |
 
-If it cannot be identified (curl, say) the capture is left in `capture.json` and you are
-asked to name it with `--brand`; `--brand` also simply overrides the automatic choice.
-Right after capturing, the new brand is printed (the `describe()` output), and at that
-point:
+A client it cannot identify (curl, say, or an app) has to be named with `--brand`, which
+also simply overrides the automatic choice. The dumps are untouched by a failed import, so
+naming it is a re-run and not a re-capture. Right after importing, the new brand is printed
+(the `describe()` output), and at that point:
 
 ```python
 fp.transport("chrome_android")     # already works
 fp.ChromeAndroidTransport()        # already works
 ```
 
-**Where a capture lands depends on how the package was installed.** `serve` writes into
-`mytls/profiles/` *inside the installed package* — with `pip install ./python` that is
-site-packages, and the new brand is invisible to git. Work on this repository with an
-editable install so captures land in the tree:
+**Where a profile lands depends on how the package was installed.** `import-mitm` (and
+`serve --brand`) writes into `mytls/profiles/` *inside the installed package* — with
+`pip install ./python` that is site-packages, and the new brand is invisible to git. Work
+on this repository with an editable install so profiles land in the tree:
 
 ```bash
 pip install -e ./python
 ```
 
 To try one out without committing it to the tree, point `BROWSER_FP_PROFILES` at another
-directory — `serve` honours it too, so the capture lands straight there.
+directory — both commands honour it, so the profile lands straight there. The dumps
+themselves are unaffected: they go where `--captures` says, `./captures` by default, and
+nothing reads them unless asked to.
 
 **What is derived automatically:**
 
@@ -969,6 +1005,11 @@ mitmdump -s "$(python -c 'import mytls; print(mytls.addon_path())')" \
          --set fp_out=./captures --set fp_hosts='example\.com'
 mytls-probe import-mitm ./captures --brand chrome
 ```
+
+**`serve` writes this same layout**, so the second step is the same command whether the
+bytes came off a real site through the proxy or off our own server — one importer, one
+`match`, one `FORMAT` number that refuses a dump written by an older addon rather than
+misreading it.
 
 **Why not just read mitmproxy's flows.** In its normal mode mitmproxy is an HTTP/2
 endpoint: it decodes HPACK, keeps the decoded headers and re-encodes towards the server.

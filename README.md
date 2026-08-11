@@ -317,9 +317,11 @@ Nothing is stored for it: the values to compare against are computed on the spot
 
 ### Capturing a browser against a real site
 
-`mytls-probe serve` captures a browser that visits us. To capture one talking to a real
-site — where `referer`, `cookie` and subresource priorities actually occur — there is a
-mitmproxy 12 addon that relays the connection raw, below HTTP, so the HPACK bytes survive:
+`mytls-probe serve` captures a browser that visits us, dumping every connection into
+`./captures` for `mytls-probe import-mitm` to turn into a profile. To capture one talking to
+a real site instead — where `referer`, `cookie` and subresource priorities actually occur —
+there is a mitmproxy 12 addon that relays the connection raw, below HTTP, so the HPACK bytes
+survive into the same kind of dump:
 
 ```bash
 mytls-probe capture-mitm --host 'example\.com' --brand chrome

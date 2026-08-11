@@ -123,10 +123,21 @@ __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
 #: `connection.py` and `settings.py`.
 #: 4.3.0 matters because that is the version mitmproxy pins, so listing it is
 #: what lets mitmproxy live in the same interpreter.
+#:
+#: hpack is here for the opposite reason to h2: nothing pins it *at all* - it
+#: arrives two hops down, httpx[http2] -> h2>=3,<5 -> hpack>=4.1,<5 - and what
+#: this module does to it is deeper than anything it does to h2. `_QuicheEncoder`
+#: subclasses `hpack.Encoder` and calls `_encode_literal`,
+#: `_encode_indexed_literal`, `header_table.search`, `huffman_coder` and
+#: `hpack.hpack.INDEX_NEVER`, all private. A change there does not raise: it
+#: silently encodes different bytes, which is the one failure this package
+#: exists to prevent. 4.1.0 is what every listed h2 resolves to, and all four
+#: profiles re-encode byte-identically on it.
 _EXPECTED = {
     "httpx": ("0.27.2",),
     "httpcore": ("1.0.9",),
     "h2": ("4.4.1", "4.4.0", "4.3.0"),
+    "hpack": ("4.1.0",),
 }
 
 #: Default for `priority_override` / `Transport(priority=...)`: whatever the
@@ -1167,6 +1178,7 @@ def _check_versions() -> None:
     _warned_versions = True
 
     import h2 as _h2
+    import hpack as _hpack
     import httpcore as _httpcore
     import httpx as _httpx
 
@@ -1174,6 +1186,7 @@ def _check_versions() -> None:
         "httpx": _httpx.__version__,
         "httpcore": _httpcore.__version__,
         "h2": _h2.__version__,
+        "hpack": _hpack.__version__,
     }
     off = {k: v for k, v in actual.items() if v not in _EXPECTED[k]}
     if off:
@@ -1182,8 +1195,9 @@ def _check_versions() -> None:
         warnings.warn(
             f"browser_fp subclasses library internals and has only been run "
             f"against {detail}. Re-check httpcore's handle_request, "
-            f"create_connection, _send_connection_init and _send_request_headers "
-            f"before trusting the fingerprint.",
+            f"create_connection, _send_connection_init and _send_request_headers, "
+            f"and hpack's Encoder internals, before trusting the fingerprint. "
+            f"`mytls-probe selftest` answers it as bytes and needs no network.",
             RuntimeWarning,
             stacklevel=3,
         )
