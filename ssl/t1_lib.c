@@ -205,21 +205,21 @@ static const uint16_t supported_groups_default[] = {
     OSSL_TLS_GROUP_ID_X25519MLKEM768, /* X25519MLKEM768 (0x11ec) */
     OSSL_TLS_GROUP_ID_x25519,        /* X25519 (29) */
     OSSL_TLS_GROUP_ID_secp256r1,     /* secp256r1 (23) */
-//    OSSL_TLS_GROUP_ID_x448,          /* X448 (30) */
+    OSSL_TLS_GROUP_ID_x448,          /* X448 (30) */
     OSSL_TLS_GROUP_ID_secp384r1,     /* secp384r1 (24) */
-//    OSSL_TLS_GROUP_ID_secp521r1,     /* secp521r1 (25) */
-//    OSSL_TLS_GROUP_ID_gc256A,        /* GC256A (34) */
-//    OSSL_TLS_GROUP_ID_gc256B,        /* GC256B (35) */
-//    OSSL_TLS_GROUP_ID_gc256C,        /* GC256C (36) */
-//    OSSL_TLS_GROUP_ID_gc256D,        /* GC256D (37) */
-//    OSSL_TLS_GROUP_ID_gc512A,        /* GC512A (38) */
-//    OSSL_TLS_GROUP_ID_gc512B,        /* GC512B (39) */
-//    OSSL_TLS_GROUP_ID_gc512C,        /* GC512C (40) */
-//    OSSL_TLS_GROUP_ID_ffdhe2048,     /* ffdhe2048 (0x100) */
-//    OSSL_TLS_GROUP_ID_ffdhe3072,     /* ffdhe3072 (0x101) */
-//    OSSL_TLS_GROUP_ID_ffdhe4096,     /* ffdhe4096 (0x102) */
-//    OSSL_TLS_GROUP_ID_ffdhe6144,     /* ffdhe6144 (0x103) */
-//    OSSL_TLS_GROUP_ID_ffdhe8192,     /* ffdhe8192 (0x104) */
+    OSSL_TLS_GROUP_ID_secp521r1,     /* secp521r1 (25) */
+    OSSL_TLS_GROUP_ID_gc256A,        /* GC256A (34) */
+    OSSL_TLS_GROUP_ID_gc256B,        /* GC256B (35) */
+    OSSL_TLS_GROUP_ID_gc256C,        /* GC256C (36) */
+    OSSL_TLS_GROUP_ID_gc256D,        /* GC256D (37) */
+    OSSL_TLS_GROUP_ID_gc512A,        /* GC512A (38) */
+    OSSL_TLS_GROUP_ID_gc512B,        /* GC512B (39) */
+    OSSL_TLS_GROUP_ID_gc512C,        /* GC512C (40) */
+    OSSL_TLS_GROUP_ID_ffdhe2048,     /* ffdhe2048 (0x100) */
+    OSSL_TLS_GROUP_ID_ffdhe3072,     /* ffdhe3072 (0x101) */
+    OSSL_TLS_GROUP_ID_ffdhe4096,     /* ffdhe4096 (0x102) */
+    OSSL_TLS_GROUP_ID_ffdhe6144,     /* ffdhe6144 (0x103) */
+    OSSL_TLS_GROUP_ID_ffdhe8192,     /* ffdhe8192 (0x104) */
 };
 
 static const uint16_t suiteb_curves[] = {

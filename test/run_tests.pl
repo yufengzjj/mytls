@@ -19,6 +19,15 @@ BEGIN {
     $ENV{HARNESS_VERBOSE_FAILURE_PROGRESS} = "yes"
         if ($ENV{VERBOSE_FAILURE_PROGRESS} || $ENV{VFP}
             || $ENV{REPORT_FAILURES_PROGRESS});
+    # This fork's default profile makes every ClientHello look like Chrome's -
+    # GREASE codepoints, a shuffled extension order, a GREASE ECH - which the
+    # tests below assert against byte for byte and would therefore all fail.
+    # Run them against the `stock` profile, which is upstream's behaviour, so
+    # that a failure here means a regression rather than the fork existing.
+    # Set MYTLS_FP_PROFILE yourself to test a browser profile instead.
+    $ENV{MYTLS_FP_PROFILE} = "stock" unless defined $ENV{MYTLS_FP_PROFILE};
+    $ENV{MYTLS_ALLOW_CIPHER_OVERRIDE} = "1"
+        unless defined $ENV{MYTLS_ALLOW_CIPHER_OVERRIDE};
 }
 
 use File::Spec::Functions qw/catdir catfile curdir abs2rel rel2abs/;

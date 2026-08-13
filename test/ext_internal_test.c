@@ -24,18 +24,19 @@ typedef struct {
 
 /* The order here does matter! */
 static EXT_LIST ext_list[] = {
-
-    EXT_ENTRY(renegotiate),
     EXT_ENTRY(server_name),
+    EXT_ENTRY(extended_master_secret),
+    EXT_ENTRY(renegotiate),
     EXT_ENTRY(max_fragment_length),
 #ifndef OPENSSL_NO_SRP
     EXT_ENTRY(srp),
 #else
     EXT_EXCEPTION(srp),
 #endif
-    EXT_ENTRY(ec_point_formats),
     EXT_ENTRY(supported_groups),
+    EXT_ENTRY(ec_point_formats),
     EXT_ENTRY(session_ticket),
+    EXT_ENTRY(application_layer_protocol_negotiation),
 #ifndef OPENSSL_NO_OCSP
     EXT_ENTRY(status_request),
 #else
@@ -46,32 +47,32 @@ static EXT_LIST ext_list[] = {
 #else
     EXT_EXCEPTION(next_proto_neg),
 #endif
-    EXT_ENTRY(application_layer_protocol_negotiation),
 #ifndef OPENSSL_NO_SRTP
     EXT_ENTRY(use_srtp),
 #else
     EXT_EXCEPTION(use_srtp),
 #endif
     EXT_ENTRY(encrypt_then_mac),
+    EXT_ENTRY(signature_algorithms),
 #ifndef OPENSSL_NO_CT
     EXT_ENTRY(signed_certificate_timestamp),
 #else
     EXT_EXCEPTION(signed_certificate_timestamp),
 #endif
-    EXT_ENTRY(extended_master_secret),
+    EXT_ENTRY(key_share),
+    EXT_ENTRY(psk_kex_modes),
     EXT_ENTRY(signature_algorithms_cert),
     EXT_ENTRY(post_handshake_auth),
     EXT_ENTRY(client_cert_type),
     EXT_ENTRY(server_cert_type),
-    EXT_ENTRY(signature_algorithms),
     EXT_ENTRY(supported_versions),
-    EXT_ENTRY(psk_kex_modes),
-    EXT_ENTRY(key_share),
     EXT_ENTRY(cookie),
     EXT_ENTRY(cryptopro_bug),
     EXT_ENTRY(compress_certificate),
     EXT_ENTRY(early_data),
     EXT_ENTRY(certificate_authorities),
+    EXT_ENTRY(application_settings),
+    EXT_ENTRY(encrypted_client_hello),
     EXT_ENTRY(padding),
     EXT_ENTRY(psk),
     EXT_END(num_builtins)

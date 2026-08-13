@@ -256,13 +256,21 @@ class FingerprintCapture:
             return None
         alpn = flow.client_conn.alpn
         alpn = alpn.decode("ascii", "replace") if alpn else None
-        host = hello["sni"] or "unknown"
+        peername = flow.client_conn.peername
+        peer = f"{peername[0]}" if peername else ""
+        # Falls back to who it came from, not to "unknown": a client addressing
+        # an IP literal sends no SNI at all, and on a phone that is the normal
+        # case rather than an odd one - a directory of `unknown-*.json` says
+        # nothing about which device made which connection. `hpack_probe`'s
+        # `serve` names its dumps by the same rule, so a capture taken either
+        # way reads the same on disk.
+        host = hello["sni"] or peer
         record = {
             "format": FORMAT,
             "captured_at": _now(),
             "sni": hello["sni"],
             "alpn": alpn,
-            "peer": f"{flow.client_conn.peername[0]}",
+            "peer": peer,
             "client_hello": hello["raw"],
             #: False if the record header had to be synthesised, in which case
             #: its version is an artefact and import-mitm will not record one.

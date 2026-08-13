@@ -755,6 +755,20 @@ typedef enum ssl_grease_index_en {
  * profile was actually measured from.
  */
 # define SSL_FP_ALLOW_RESUME    0x0020  /* may offer session resumption */
+# define SSL_FP_GREASE          0x0040  /* insert GREASE codepoints (RFC 8701) */
+/*
+ * "This profile is upstream OpenSSL, not a browser." Only the `stock` profile
+ * sets it, and it exists because a few of this fork's changes are not additions
+ * that a flag can switch off but *replacements* of an upstream rule - the
+ * ClientHello padding threshold, and not padding the second ClientHello. A
+ * profile with no lists of its own needs the rule that was there before.
+ *
+ * It is what makes `make test` mean something: upstream's own tests assert the
+ * exact shape of a ClientHello, which every browser profile here deliberately
+ * violates, so without a profile that does not, the whole suite is permanently
+ * red and stops being a regression net.
+ */
+# define SSL_FP_STOCK           0x0080  /* upstream behaviour, no fingerprint */
 
 /*
  * SSL_FP_EMPTY_TICKET is the one bit above with a public override, because it
@@ -1947,11 +1961,19 @@ struct ssl_connection_st {
      *
      * |ext_permutation| is the randomised ClientHello extension order, also
      * drawn once per connection, for the same reason.
+     *
+     * |ech_grease| is the body of the GREASE encrypted_client_hello extension,
+     * kept for the same reason again: draft-ietf-tls-esni section 6.2.1 says
+     * that on a HelloRetryRequest "the client copies the entire
+     * encrypted_client_hello extension from the first ClientHello", so it
+     * cannot be rebuilt from fresh randomness the second time round.
      */
     unsigned char grease_seed[SSL_GREASE_LAST];
     int grease_seeded;
     unsigned char ext_permutation[TLSEXT_IDX_num_builtins];
     size_t ext_permutation_len;
+    unsigned char *ech_grease;
+    size_t ech_grease_len;
 
     /*
      * Overrides the context's profile for this connection only; NULL means

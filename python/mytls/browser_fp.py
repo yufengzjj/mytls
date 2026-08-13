@@ -108,8 +108,8 @@ from . import tls_profile
 
 __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
            "Transport", "AsyncTransport", "transport", "async_transport",
-           "profile", "brands", "brand_for", "reload", "describe", "catalog",
-           "tls_profile"]
+           "profile", "brands", "brand_for", "system_of", "reload", "describe",
+           "catalog", "tls_profile"]
 
 #: Versions this module's subclassing has actually been run against, not
 #: versions it requires - pyproject pins only httpx, and h2 is left to whatever
@@ -279,6 +279,111 @@ def brand_for(headers: dict[str, str]) -> str:
     return base
 
 
+#: How a client names its operating system, most specific form first. The
+#: second element is what to call it; None means the pattern captures the name
+#: itself.
+#:
+#: `sec-ch-ua-platform-version` is deliberately not consulted. It is only sent
+#: when a server asks for it through Accept-CH, and its number is the *platform
+#: release* rather than the marketing version - on Windows it reads "15.0.0"
+#: for Windows 11, which would be a more precise way of being wrong than the
+#: user-agent already is.
+_SYSTEMS: tuple[tuple[re.Pattern, str | None], ...] = (
+    # A native client naming its OS outright: `WhatsApp/2.26.30.78 iOS/16.7.12
+    # Device/iPhone_8_Plus`. The most precise form there is - an app reports
+    # the real point release, where a browser has frozen or rounded it.
+    (re.compile(r"\b(iOS|iPadOS|Android|Windows|macOS)/(\d[\d._]*)"), None),
+    # Apple's browsers: `CPU iPhone OS 18_5 like Mac OS X`, and `CPU OS 16_7`
+    # on an iPad.
+    (re.compile(r"CPU (?:iPhone )?OS (\d[\d_]*) like Mac OS X"), "iOS"),
+    (re.compile(r"Mac OS X (\d[\d_]*)"), "macOS"),
+    (re.compile(r"\bAndroid (\d[\d.]*)"), "Android"),
+    # Reported as the user-agent spells it rather than translated: NT 10.0 is
+    # Windows 10 *and* 11, since Chrome freezes it at 10.0 for both.
+    (re.compile(r"\bWindows NT (\d[\d.]*)"), "Windows NT"),
+)
+
+
+#: Tokens a browser sends whatever the device runs. Reading a version out of
+#: one measures the freeze and not the phone, so it is not read at all: Chrome
+#: reduced its Android token in 110 and has sent this exact string - down to
+#: the `K` where the model used to be - on every Android device since. A real
+#: Android 10 running an older Chrome says `Android 10; SM-G973F`, so matching
+#: the whole frozen string leaves that one readable.
+_FROZEN = ("Android 10; K",)
+
+#: Safari's own version, `Version/26.0`. On iOS it is the OS version - every
+#: capture in this repository agrees, 18.0 through 18.6 - which makes it the
+#: way past a frozen Apple token. See _unfrozen().
+_SAFARI_VERSION = re.compile(r"\bVersion/(\d[\d.]*)")
+
+
+def _major(version: str) -> int:
+    return int(version.partition(".")[0])
+
+
+def _unfrozen(name: str, version: str, user_agent: str) -> str:
+    """The OS version, corrected where Apple's token has stopped advancing.
+
+    Apple freezes these tokens rather than dropping them: every Mac has
+    claimed `Mac OS X 10_15_7` since Big Sur, and since iOS 26 every iPhone
+    claims `CPU iPhone OS 18_6`. The two captures in ../captures are the
+    measurement - an iOS 18.6 phone and an iOS 26.0 phone send a byte-identical
+    OS token and are told apart by `Version/` alone, 18.6 against 26.0.
+
+    Safari's version is what corrects it because on iOS the two have always
+    been the same number; 18.0, 18.1, 18.2, 18.4 and 18.6 each sent a matching
+    `Version/`. Where the token is not behind it is the better of the two - an
+    iOS 18.3.1 device sends `CPU iPhone OS 18_3_1` against `Version/18.3` - so
+    Safari wins only when its major is higher, which is exactly the frozen
+    case.
+
+    macOS gets the same treatment only from 26. Safari 18 ran on macOS 15 and
+    Safari 17 on macOS 14, so below 26 the two numbers are unrelated and
+    Safari's says nothing about the system underneath; the frozen 10.15.7 is
+    left to stand as what the machine itself claimed.
+    """
+    found = _SAFARI_VERSION.search(user_agent)
+    if found is None or name not in ("iOS", "iPadOS", "macOS"):
+        return version
+    safari = found.group(1)
+    if _major(safari) <= _major(version):
+        return version
+    if name == "macOS" and _major(safari) < 26:
+        return version
+    return safari
+
+
+def system_of(headers: dict[str, str]) -> str | None:
+    """The client's operating system and version, as it reports them.
+
+    None when nothing in the request says - which is an answer too, and a
+    common one: `Android 10; K` is what every Chrome since 110 sends whatever
+    the device runs, and a client that sends no user-agent at all says nothing
+    here either.
+
+    What a client says is not always what it runs, and where that is known the
+    known part is corrected rather than repeated - see _unfrozen(). An iPhone
+    on iOS 26 reports its OS as 18.6, and reporting it back would make the one
+    capture whose TLS layer changed look like the one whose did not.
+
+    This needs a decoded request, so it exists only for a capture that got as
+    far as HTTP/2. A connection that stopped at the ClientHello still has a
+    fingerprint and no idea whose it is.
+    """
+    user_agent = headers.get("user-agent", "")
+    if any(token in user_agent for token in _FROZEN):
+        return None
+    for pattern, spelling in _SYSTEMS:
+        found = pattern.search(user_agent)
+        if not found:
+            continue
+        name = spelling or found.group(1)
+        version = found.group(2 if spelling is None else 1).replace("_", ".")
+        return f"{name} {_unfrozen(name, version, user_agent)}"
+    return None
+
+
 def _platform(headers: dict[str, str], user_agent: str) -> str:
     """`sec-ch-ua-platform` when the browser sends it, else read off the UA."""
     if "sec-ch-ua-platform" in headers:
@@ -363,8 +468,33 @@ class Profile:
         #: TLS stack (every Chromium fork does) and only one profile exists for
         #: them in ssl/ssl_fp_profile.c.
         self.tls_profile: str = cap["meta"].get("tls_profile") or self.brand
+
+        #: The capture file's own `meta` object, verbatim. Three of its keys
+        #: are acted on - `hpack`, `tls_profile` and `label`, each read where
+        #: it is used - and anything else a capture carries is kept here and
+        #: surfaced through `meta` below: which device it came from, why it was
+        #: taken, whatever the person who made it knew and the bytes do not
+        #: say. A field nothing reads is still a field somebody wrote down.
+        self.stored_meta: dict = dict(cap["meta"])
+
+        #: What listings call this profile. Derived here rather than stored in
+        #: the capture, like everything else a capture can say about itself:
+        #: `{"meta": {"label": "..."}}` still wins, but a stored label freezes
+        #: one reading of the user-agent into the file, where a derived one
+        #: improves for every capture already on disk when the reading does -
+        #: which it just did, see system_of().
+        #:
+        #: An Apple capture is named for the OS and not for the client, the way
+        #: the profiles themselves are: the ClientHello and the HPACK encoder
+        #: belong to CFNetwork, so Safari, WhatsApp and the App Store on one
+        #: phone are one stack behind three product tokens, and calling this
+        #: one "Safari 604" would name the one part of it that is not being
+        #: imitated. Everything else is named for the browser, where the stack
+        #: does ship with the browser.
+        system = system_of(self.header_map)
         self.label: str = cap["meta"].get("label") or (
-            f"{self.browser} {self.version.split('.')[0]} on {self.platform}")
+            f"{system} network stack" if system and self.platform == "iOS"
+            else f"{self.browser} {self.version.split('.')[0]} on {self.platform}")
 
         # --- the four fields the akamai fingerprint is computed from ---
 
@@ -511,8 +641,16 @@ class Profile:
 
     @property
     def meta(self) -> dict:
-        """Everything about the captured browser that is not wire behaviour."""
-        return {
+        """Everything about the captured browser that is not wire behaviour.
+
+        Derived first, then whatever else the capture's own `meta` carried -
+        `{"meta": {"device": "iPhone 8 Plus"}}` reads back as
+        `profile(...).meta["device"]`. Derived wins on a collision: a stored
+        `label` is already here as the effective one, and a stored `platform`
+        must not overwrite what was read off the wire. `stored_meta` is the
+        unmixed version, for a caller that wants to know which is which.
+        """
+        derived = {
             "brand": self.brand,
             "label": self.label,
             "browser": self.browser,
@@ -525,11 +663,15 @@ class Profile:
             "accept_language": self.header_map.get("accept-language", ""),
             "sec_fetch_mode": self.header_map.get("sec-fetch-mode", ""),
             "hpack": self.hpack,
+            "tls_profile": self.tls_profile,
             "akamai_fingerprint": self.akamai_fingerprint,
             "akamai_hash": self.akamai_hash,
             "source": self.source,
             "captured_at": self.captured_at,
         }
+        for key, value in self.stored_meta.items():
+            derived.setdefault(key, value)
+        return derived
 
     @property
     def class_name(self) -> str:

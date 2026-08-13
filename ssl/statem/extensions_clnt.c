@@ -249,8 +249,10 @@ EXT_RETURN tls_construct_ctos_supported_groups(SSL_CONNECTION *s, WPACKET *pkt,
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
-    if (!WPACKET_put_bytes_u16(pkt,
-                               ossl_ssl_grease_value(s, SSL_GREASE_GROUP))) {
+    if ((ossl_ssl_fp(s)->flags & SSL_FP_GREASE) != 0
+            && !WPACKET_put_bytes_u16(pkt,
+                                      ossl_ssl_grease_value(s,
+                                                            SSL_GREASE_GROUP))) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
@@ -366,7 +368,8 @@ EXT_RETURN tls_construct_ctos_sig_algs(SSL_CONNECTION *s, WPACKET *pkt,
      * This constructor is shared with the server's CertificateRequest, which
      * must advertise what we can really verify.
      */
-    if ((context & SSL_EXT_CLIENT_HELLO) == 0) {
+    if ((context & SSL_EXT_CLIENT_HELLO) == 0
+            || ossl_ssl_fp(s)->sigalgs == NULL) {
         salglen = tls12_get_psigalgs(s, 1, &salg);
         if (!tls12_copy_sigalgs(s, pkt, salg, salglen)) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
@@ -641,8 +644,10 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
-    if (!WPACKET_put_bytes_u16(pkt,
-                               ossl_ssl_grease_value(s, SSL_GREASE_VERSION))) {
+    if ((fp->flags & SSL_FP_GREASE) != 0
+            && !WPACKET_put_bytes_u16(pkt,
+                                      ossl_ssl_grease_value(s,
+                                                            SSL_GREASE_VERSION))) {
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
@@ -653,6 +658,16 @@ EXT_RETURN tls_construct_ctos_supported_versions(SSL_CONNECTION *s, WPACKET *pkt
      * material. Offering an old version does not mean accepting it -
      * ssl_choose_client_version() still enforces the real minimum.
      */
+    if (fp->versions == NULL) {
+        int currv;
+
+        for (currv = max_version; currv >= min_version; currv--) {
+            if (!WPACKET_put_bytes_u16(pkt, currv)) {
+                SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+                return EXT_RETURN_FAIL;
+            }
+        }
+    }
     for (i = 0; i < fp->versions_len; i++) {
         if (!WPACKET_put_bytes_u16(pkt, fp->versions[i])) {
             SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
@@ -736,7 +751,8 @@ static int add_key_share(SSL_CONNECTION *s, WPACKET *pkt, unsigned int curve_id,
      * key_share after a HelloRetryRequest to contain exactly one entry, for
      * the group the server asked for, and servers do enforce that.
      */
-    if (idx == 0 && s->hello_retry_request == SSL_HRR_NONE) {
+    if (idx == 0 && s->hello_retry_request == SSL_HRR_NONE
+            && (ossl_ssl_fp(s)->flags & SSL_FP_GREASE) != 0) {
         static const unsigned char dummy_point[] = { 0x00 };
 
         if (!WPACKET_put_bytes_u16(pkt,
@@ -1036,6 +1052,8 @@ EXT_RETURN tls_construct_ctos_early_data(SSL_CONNECTION *s, WPACKET *pkt,
 }
 
 #define F5_WORKAROUND_MIN_MSG_LEN   0xff
+/* What upstream uses, kept for the `stock` profile. */
+#define F5_WORKAROUND_UPSTREAM_MIN  0x20
 #define F5_WORKAROUND_MAX_MSG_LEN   0x200
 
 /*
@@ -1059,7 +1077,21 @@ EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
     size_t hlen;
 
     if ((s->options & SSL_OP_TLSEXT_PADDING) == 0
-            || (ossl_ssl_fp(s)->flags & SSL_FP_PADDING) == 0)
+            || (ossl_ssl_fp(s)->flags & (SSL_FP_PADDING | SSL_FP_STOCK)) == 0)
+        return EXT_RETURN_NOT_SENT;
+
+    /*
+     * Not in the second ClientHello. Measured, not reasoned: an iOS 18 device
+     * answered sixteen HelloRetryRequests on the LAN and dropped the extension
+     * outright every time - 517 bytes padded to 512 in the first ClientHello,
+     * then 324 bytes with no padding extension at all in the second, even
+     * though 315 bytes of handshake is squarely inside the range that would
+     * otherwise pad. Upstream's rule pads both, which put us 193 bytes and one
+     * extension away from the client we imitate, on a message any server can
+     * ask for. See `mytls-probe hrr` in python/README.md for the capture.
+     */
+    if (s->hello_retry_request != SSL_HRR_NONE
+            && (ossl_ssl_fp(s)->flags & SSL_FP_STOCK) == 0)
         return EXT_RETURN_NOT_SENT;
 
     /*
@@ -1097,7 +1129,9 @@ EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
         }
     }
 
-    if (hlen > F5_WORKAROUND_MIN_MSG_LEN && hlen < F5_WORKAROUND_MAX_MSG_LEN) {
+    if (hlen > ((ossl_ssl_fp(s)->flags & SSL_FP_STOCK) != 0
+               ? F5_WORKAROUND_UPSTREAM_MIN : F5_WORKAROUND_MIN_MSG_LEN)
+            && hlen < F5_WORKAROUND_MAX_MSG_LEN) {
         /* Calculate the amount of padding we need to add */
         hlen = F5_WORKAROUND_MAX_MSG_LEN - hlen;
 
@@ -1223,6 +1257,8 @@ int tls_parse_stoc_alps(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
 #define ECH_GREASE_AEAD_ID      0x0001
 /* An X25519 public key, the only KEM used for ECH in practice. */
 #define ECH_GREASE_ENC_LEN      32
+/* type, kdf, aead, config_id and the two length bytes in front of |enc|. */
+#define ECH_GREASE_HEAD_LEN     8
 #define ECH_GREASE_AEAD_TAG_LEN 16
 /*
  * Size of an inner ClientHello excluding the server_name and its padding. The
@@ -1240,9 +1276,9 @@ EXT_RETURN tls_construct_ctos_ech(SSL_CONNECTION *s, WPACKET *pkt,
                                   unsigned int context, X509 *x,
                                   size_t chainidx)
 {
-    unsigned char *encp, *payloadp;
+    unsigned char *encp, *payloadp, *body;
     unsigned char cfgid;
-    size_t namelen, payloadlen;
+    size_t namelen, payloadlen, start, end;
     OSSL_LIB_CTX *libctx = SSL_CONNECTION_GET_CTX(s)->libctx;
 
     if ((ossl_ssl_fp(s)->flags & SSL_FP_ECH_GREASE) == 0)
@@ -1250,6 +1286,26 @@ EXT_RETURN tls_construct_ctos_ech(SSL_CONNECTION *s, WPACKET *pkt,
 
     if (SSL_CONNECTION_IS_DTLS(s))
         return EXT_RETURN_NOT_SENT;
+
+    /*
+     * The second ClientHello after a HelloRetryRequest repeats the first one's
+     * extension byte for byte - draft-ietf-tls-esni section 6.2.1, "the client
+     * copies the entire encrypted_client_hello extension from the first
+     * ClientHello". Rebuilding it from fresh randomness would redraw config_id,
+     * which names the ECHConfig in use and which a real ECH client leaves
+     * unchanged across a retry (section 6.1.1) - so a server that sends one
+     * retry could tell our GREASE from a real ECH, which is the one thing
+     * sending GREASE ECH at all is meant to prevent.
+     */
+    if (s->ech_grease != NULL) {
+        if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_encrypted_client_hello)
+                || !WPACKET_sub_memcpy_u16(pkt, s->ech_grease,
+                                           s->ech_grease_len)) {
+            SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+            return EXT_RETURN_FAIL;
+        }
+        return EXT_RETURN_SENT;
+    }
 
     /*
      * Reproduce the padding rule of the ECH draft so that the length we
@@ -1269,24 +1325,38 @@ EXT_RETURN tls_construct_ctos_ech(SSL_CONNECTION *s, WPACKET *pkt,
     payloadlen = (payloadlen + 31) & ~(size_t)31;
     payloadlen += ECH_GREASE_AEAD_TAG_LEN;
 
+    /*
+     * Assembled in a buffer of our own rather than straight into the WPACKET,
+     * so that the same bytes can be kept for the retry above. Reading them back
+     * out of the packet afterwards would mean reaching into its internals, and
+     * the extension is a few hundred bytes once per connection.
+     */
+    end = ECH_GREASE_HEAD_LEN + ECH_GREASE_ENC_LEN + 2 + payloadlen;
+    body = OPENSSL_malloc(end);
+    if (body == NULL) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_MALLOC_FAILURE);
+        return EXT_RETURN_FAIL;
+    }
+
     if (RAND_bytes_ex(libctx, &cfgid, sizeof(cfgid), 0) <= 0) {
+        OPENSSL_free(body);
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
 
-    if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_encrypted_client_hello)
-            || !WPACKET_start_sub_packet_u16(pkt)
-               /* ECHClientHelloType: outer */
-            || !WPACKET_put_bytes_u8(pkt, 0)
-            || !WPACKET_put_bytes_u16(pkt, ECH_GREASE_KDF_ID)
-            || !WPACKET_put_bytes_u16(pkt, ECH_GREASE_AEAD_ID)
-            || !WPACKET_put_bytes_u8(pkt, cfgid)
-            || !WPACKET_sub_allocate_bytes_u16(pkt, ECH_GREASE_ENC_LEN, &encp)
-            || !WPACKET_sub_allocate_bytes_u16(pkt, payloadlen, &payloadp)
-            || !WPACKET_close(pkt)) {
-        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
-        return EXT_RETURN_FAIL;
-    }
+    body[0] = 0;                                /* ECHClientHelloType: outer */
+    body[1] = (ECH_GREASE_KDF_ID >> 8) & 0xff;
+    body[2] = ECH_GREASE_KDF_ID & 0xff;
+    body[3] = (ECH_GREASE_AEAD_ID >> 8) & 0xff;
+    body[4] = ECH_GREASE_AEAD_ID & 0xff;
+    body[5] = cfgid;
+    body[6] = (ECH_GREASE_ENC_LEN >> 8) & 0xff;
+    body[7] = ECH_GREASE_ENC_LEN & 0xff;
+    encp = body + ECH_GREASE_HEAD_LEN;
+    start = ECH_GREASE_HEAD_LEN + ECH_GREASE_ENC_LEN;
+    body[start] = (unsigned char)((payloadlen >> 8) & 0xff);
+    body[start + 1] = (unsigned char)(payloadlen & 0xff);
+    payloadp = body + start + 2;
 
     /*
      * Both fields are indistinguishable from the real thing to anyone without
@@ -1295,10 +1365,21 @@ EXT_RETURN tls_construct_ctos_ech(SSL_CONNECTION *s, WPACKET *pkt,
      */
     if (RAND_bytes_ex(libctx, encp, ECH_GREASE_ENC_LEN, 0) <= 0
             || RAND_bytes_ex(libctx, payloadp, payloadlen, 0) <= 0) {
+        OPENSSL_free(body);
         SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
         return EXT_RETURN_FAIL;
     }
 
+    if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_encrypted_client_hello)
+            || !WPACKET_sub_memcpy_u16(pkt, body, end)) {
+        OPENSSL_free(body);
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+
+    OPENSSL_free(s->ech_grease);
+    s->ech_grease = body;
+    s->ech_grease_len = end;
     return EXT_RETURN_SENT;
 }
 
@@ -1546,14 +1627,35 @@ EXT_RETURN tls_construct_ctos_post_handshake_auth(ossl_unused SSL_CONNECTION *s,
                                                   ossl_unused X509 *x,
                                                   ossl_unused size_t chainidx)
 {
+#ifndef OPENSSL_NO_TLS1_3
     /*
-     * Never offered. Chrome does not support post-handshake authentication, so
-     * sending the extension would add a codepoint to the ClientHello that no
-     * browser sends. Applications turn it on without meaning to - httpx calls
+     * Not offered by a browser profile, whatever the application asked for.
+     * Chrome does not support post-handshake authentication, so the extension
+     * would add a codepoint to the ClientHello that no browser sends - and
+     * applications turn it on without meaning to: httpx calls
      * SSL_CTX_set_post_handshake_auth() on every context it builds, which is
      * enough on its own to change the JA4 extension count.
+     *
+     * Under `stock` the application gets what it asked for, which is upstream's
+     * behaviour and what upstream's client-auth tests check.
      */
+    if ((ossl_ssl_fp(s)->flags & SSL_FP_STOCK) == 0 || !s->pha_enabled)
+        return EXT_RETURN_NOT_SENT;
+
+    /* construct extension - 0 length, no contents */
+    if (!WPACKET_put_bytes_u16(pkt, TLSEXT_TYPE_post_handshake_auth)
+            || !WPACKET_start_sub_packet_u16(pkt)
+            || !WPACKET_close(pkt)) {
+        SSLfatal(s, SSL_AD_INTERNAL_ERROR, ERR_R_INTERNAL_ERROR);
+        return EXT_RETURN_FAIL;
+    }
+
+    s->post_handshake_auth = SSL_PHA_EXT_SENT;
+
+    return EXT_RETURN_SENT;
+#else
     return EXT_RETURN_NOT_SENT;
+#endif
 }
 
 

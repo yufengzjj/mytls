@@ -2274,7 +2274,7 @@ int SSL_CTX_set_block_padding_ex(SSL_CTX *ctx, size_t app_block_size,
 
 /*
  * Client fingerprint profiles. Selects which browser's ClientHello this
- * library imitates: "chrome", "safari_ios", ... SSL_fp_profile_name() walks
+ * library imitates: "chrome", "ios26", ... SSL_fp_profile_name() walks
  * the built-in list, returning NULL once |idx| runs off the end, so a caller
  * can discover the names rather than hardcode them.
  *

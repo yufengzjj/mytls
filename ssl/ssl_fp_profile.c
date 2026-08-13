@@ -24,6 +24,8 @@
 
 #include <openssl/ssl.h>
 #include "ssl_local.h"
+#include "internal/cryptlib.h"          /* ossl_safe_getenv */
+#include "internal/thread_once.h"       /* RUN_ONCE */
 
 static int fp_apply_ssl(SSL *s, const SSL_FP_PROFILE *prof);
 
@@ -73,6 +75,9 @@ static const uint16_t chrome_android_sigalgs[] = {
  * rsa_pss_rsae_sha384 genuinely appears twice - both the capture and
  * tls.peet.ws agree - so it is written twice here. Removing the duplicate
  * would change the length of the extension and the JA4 hash with it.
+ *
+ * iOS 26 sends this list unchanged, entry for entry, and shares it below -
+ * which is worth knowing given how much else it did change.
  */
 static const uint16_t ios18_sigalgs[] = {
     TLSEXT_SIGALG_ecdsa_secp256r1_sha256,
@@ -117,8 +122,9 @@ static const uint16_t ios16_sigalgs[] = {
 
 /*
  * supported_versions, after the GREASE entry. Chrome offers only what it will
- * speak; iOS still lists TLSv1.1 and TLSv1.0. See the struct comment: this is
- * what goes on the wire, not what will be accepted.
+ * speak; iOS 16 and 18 still list TLSv1.1 and TLSv1.0, and iOS 26 stopped.
+ * See the struct comment: this is what goes on the wire, not what will be
+ * accepted.
  */
 static const uint16_t chrome_versions[] = {
     TLS1_3_VERSION, TLS1_2_VERSION
@@ -128,23 +134,53 @@ static const uint16_t ios_versions[] = {
     TLS1_3_VERSION, TLS1_2_VERSION, TLS1_1_VERSION, TLS1_VERSION
 };
 
+/*
+ * iOS 26 stopped offering TLSv1.1 and TLSv1.0. The list is now the same two
+ * entries Chrome sends, and is still written out rather than shared with
+ * chrome_versions: the two agree by coincidence, not by common origin, and a
+ * later Chrome capture must not be able to change what iOS advertises.
+ */
+static const uint16_t ios26_versions[] = {
+    TLS1_3_VERSION, TLS1_2_VERSION
+};
+
 /* compress_certificate. Chromium ships brotli, Apple ships zlib. */
 static const uint16_t chrome_cert_comp[] = { TLSEXT_comp_cert_brotli };
 static const uint16_t ios_cert_comp[] = { TLSEXT_comp_cert_zlib };
 
 /*
- * supported_groups. Chrome leads with the post-quantum hybrid; iOS offers
- * four plain curves and no hybrid, but does still offer P-521, which Chrome
- * dropped.
+ * supported_groups. Chrome leads with the post-quantum hybrid; iOS 16 and 18
+ * offer four plain curves and no hybrid, but do still offer P-521, which
+ * Chrome dropped. iOS 26 has the hybrid too - see ios26_groups.
  */
 static const char chrome_groups[] = "X25519MLKEM768:X25519:P-256:P-384";
 static const char ios_groups[] = "X25519:P-256:P-384:P-521";
 
-/* TLSv1.3 suites. Chrome and iOS offer the same three in the same order. */
+/*
+ * iOS 26 puts the same post-quantum hybrid Chrome leads with in front of the
+ * four curves iOS has always offered, and keeps all four - so this is not
+ * Chrome's list either, which dropped P-521.
+ */
+static const char ios26_groups[] = "X25519MLKEM768:X25519:P-256:P-384:P-521";
+
+/*
+ * TLSv1.3 suites. The same three in the same order for Chrome, Chrome on
+ * Android and iOS 16 and 18 - but not for iOS 26, which reorders them below.
+ */
 static const char tls13_ciphers_common[] =
     "TLS_AES_128_GCM_SHA256:"
     "TLS_AES_256_GCM_SHA384:"
     "TLS_CHACHA20_POLY1305_SHA256";
+
+/*
+ * iOS 26 leads with AES-256 and puts AES-128 last. Nothing else about the
+ * cipher list moved: the seventeen TLSv1.2-and-below suites below follow in
+ * exactly the order iOS 16 and 18 send them.
+ */
+static const char ios26_tls13_ciphers[] =
+    "TLS_AES_256_GCM_SHA384:"
+    "TLS_CHACHA20_POLY1305_SHA256:"
+    "TLS_AES_128_GCM_SHA256";
 
 /* TLSv1.2 and below, in Chrome's order. */
 static const char chrome_ciphers[] =
@@ -203,7 +239,8 @@ static const SSL_FP_PROFILE fp_profile_chrome = {
      * the padding extension would never fire - saying so is clearer than
      * relying on that.
      */
-    SSL_FP_SHUFFLE_EXTS | SSL_FP_ALPS | SSL_FP_ECH_GREASE | SSL_FP_EMPTY_TICKET
+    SSL_FP_GREASE | SSL_FP_SHUFFLE_EXTS | SSL_FP_ALPS | SSL_FP_ECH_GREASE
+    | SSL_FP_EMPTY_TICKET
 };
 
 /*
@@ -219,7 +256,8 @@ static const SSL_FP_PROFILE fp_profile_chrome_android = {
     chrome_cert_comp, OSSL_NELEM(chrome_cert_comp),
     2,
     chrome_groups, tls13_ciphers_common, chrome_ciphers,
-    SSL_FP_SHUFFLE_EXTS | SSL_FP_ALPS | SSL_FP_ECH_GREASE | SSL_FP_EMPTY_TICKET
+    SSL_FP_GREASE | SSL_FP_SHUFFLE_EXTS | SSL_FP_ALPS | SSL_FP_ECH_GREASE
+    | SSL_FP_EMPTY_TICKET
 };
 
 /*
@@ -242,7 +280,7 @@ static const SSL_FP_PROFILE fp_profile_ios18 = {
     ios_cert_comp, OSSL_NELEM(ios_cert_comp),
     1,                                  /* X25519 only - no hybrid */
     ios_groups, tls13_ciphers_common, ios_ciphers,
-    SSL_FP_PADDING
+    SSL_FP_GREASE | SSL_FP_PADDING
 };
 
 /*
@@ -259,7 +297,64 @@ static const SSL_FP_PROFILE fp_profile_ios16 = {
     ios_cert_comp, OSSL_NELEM(ios_cert_comp),
     1,
     ios_groups, tls13_ciphers_common, ios_ciphers,
-    SSL_FP_PADDING
+    SSL_FP_GREASE | SSL_FP_PADDING
+};
+
+/*
+ * iOS 26. The first Apple capture that is not a variation on the other two:
+ * where 16 and 18 differ by one signature algorithm, this one moved four
+ * things at once, and its ClientHello is 1541 bytes where theirs are 517.
+ *
+ *   - the post-quantum hybrid X25519MLKEM768 leads supported_groups and
+ *     carries a 1216-byte key_share, so two real shares go out rather than one
+ *   - TLSv1.1 and TLSv1.0 are no longer advertised
+ *   - the three TLSv1.3 suites are reordered, AES-256 first
+ *   - no padding extension: at 1541 bytes it would never have fired anyway
+ *
+ * Unchanged from iOS 18, and shared here by reference: the signature
+ * algorithms entry for entry, the seventeen older cipher suites in the same
+ * order, zlib certificate compression, and the extension order once padding
+ * is gone. Still no shuffling, no ALPS, no GREASE ECH and no empty
+ * session_ticket - that last one remains the caller's to override.
+ */
+static const SSL_FP_PROFILE fp_profile_ios26 = {
+    "ios26",
+    ios18_sigalgs, OSSL_NELEM(ios18_sigalgs),
+    ios26_versions, OSSL_NELEM(ios26_versions),
+    ios_cert_comp, OSSL_NELEM(ios_cert_comp),
+    2,                                  /* X25519MLKEM768 and X25519 */
+    ios26_groups, ios26_tls13_ciphers, ios_ciphers,
+    SSL_FP_GREASE
+};
+
+/*
+ * Not a browser: upstream OpenSSL, with every fingerprint behaviour off.
+ *
+ * All six lists are NULL, which is the signal each consumer reads - the
+ * extension constructors fall back to the upstream code path they always had,
+ * and SSL_CTX_new_ex() leaves the library's own cipher and group lists in place
+ * instead of installing and pinning a browser's.
+ *
+ * It exists so that `make test` means something. Upstream's own tests assert
+ * the exact shape of a ClientHello, which every profile above deliberately
+ * violates - GREASE codepoints in four places, a shuffled extension order, a
+ * GREASE ECH - so with a browser as the only possible default the whole suite
+ * is red no matter what anybody changes, and stops being able to catch a
+ * regression. Select it with MYTLS_FP_PROFILE=stock, which is what
+ * test/run_tests.pl does.
+ *
+ * SSL_FP_ALLOW_RESUME because upstream resumes; the reasoning for withholding
+ * it from the browser profiles is about captures we do not have, and does not
+ * apply to a profile that is not imitating anything.
+ */
+static const SSL_FP_PROFILE fp_profile_stock = {
+    "stock",
+    NULL, 0,                            /* signature_algorithms */
+    NULL, 0,                            /* supported_versions */
+    NULL, 0,                            /* compress_certificate */
+    1,                                  /* one key_share, as upstream sends */
+    NULL, NULL, NULL,                   /* groups, TLSv1.3 and TLSv1.2 ciphers */
+    SSL_FP_STOCK | SSL_FP_ALLOW_RESUME | SSL_FP_EMPTY_TICKET
 };
 
 /*
@@ -267,13 +362,16 @@ static const SSL_FP_PROFILE fp_profile_ios16 = {
  * this fork imitated before profiles existed and an unchanged program must
  * keep producing the bytes it produced yesterday.
  */
-static const SSL_FP_PROFILE *const fp_profile_default = &fp_profile_chrome;
+static const SSL_FP_PROFILE *const fp_profile_builtin_default =
+    &fp_profile_chrome;
 
 static const SSL_FP_PROFILE *const fp_profiles[] = {
     &fp_profile_chrome,
     &fp_profile_chrome_android,
     &fp_profile_ios18,
-    &fp_profile_ios16
+    &fp_profile_ios16,
+    &fp_profile_ios26,
+    &fp_profile_stock
 };
 
 const SSL_FP_PROFILE *ossl_ssl_fp_profile_by_name(const char *name)
@@ -296,7 +394,7 @@ const SSL_FP_PROFILE *ossl_ssl_fp(const SSL_CONNECTION *s)
     const SSL_CTX *ctx;
 
     if (s == NULL)
-        return fp_profile_default;
+        return ossl_ssl_fp_default();
     if (s->fp_profile != NULL)
         return s->fp_profile;
 
@@ -304,7 +402,7 @@ const SSL_FP_PROFILE *ossl_ssl_fp(const SSL_CONNECTION *s)
     if (ctx != NULL && ctx->fp_profile != NULL)
         return ctx->fp_profile;
 
-    return fp_profile_default;
+    return ossl_ssl_fp_default();
 }
 
 int SSL_CTX_set_fp_profile(SSL_CTX *ctx, const char *name)
@@ -356,12 +454,40 @@ const char *SSL_CTX_get_fp_profile(const SSL_CTX *ctx)
         return NULL;
 
     return ctx->fp_profile != NULL ? ctx->fp_profile->name
-                                   : fp_profile_default->name;
+                                   : ossl_ssl_fp_default()->name;
+}
+
+/*
+ * The default profile, once, honouring MYTLS_FP_PROFILE.
+ *
+ * An environment override rather than a build option because the thing that
+ * needs it is a *test run* of programs this library only links into - the
+ * recipes drive `openssl s_client` and the test binaries, none of which have
+ * anywhere to pass a profile. The same reasoning, and the same shape, as
+ * MYTLS_ALLOW_CIPHER_OVERRIDE in ssl_lib.c.
+ *
+ * An unset or unrecognised value leaves the compiled-in default alone, so a
+ * typo degrades to the behaviour an unchanged program has always had.
+ */
+static const SSL_FP_PROFILE *fp_env_default = NULL;
+static CRYPTO_ONCE fp_env_once = CRYPTO_ONCE_STATIC_INIT;
+
+DEFINE_RUN_ONCE_STATIC(fp_init_env_default)
+{
+    const char *name = ossl_safe_getenv("MYTLS_FP_PROFILE");
+
+    if (name != NULL && *name != '\0')
+        fp_env_default = ossl_ssl_fp_profile_by_name(name);
+    if (fp_env_default == NULL)
+        fp_env_default = fp_profile_builtin_default;
+    return 1;
 }
 
 const SSL_FP_PROFILE *ossl_ssl_fp_default(void)
 {
-    return fp_profile_default;
+    if (!RUN_ONCE(&fp_env_once, fp_init_env_default))
+        return fp_profile_builtin_default;
+    return fp_env_default;
 }
 
 /*
@@ -436,7 +562,7 @@ int SSL_CTX_get_fp_empty_ticket(const SSL_CTX *ctx)
     if (ctx->fp_empty_ticket != SSL_FP_TICKET_PROFILE)
         return ctx->fp_empty_ticket != 0;
 
-    prof = ctx->fp_profile != NULL ? ctx->fp_profile : fp_profile_default;
+    prof = ctx->fp_profile != NULL ? ctx->fp_profile : ossl_ssl_fp_default();
     return (prof->flags & SSL_FP_EMPTY_TICKET) != 0;
 }
 
@@ -463,6 +589,15 @@ int ossl_ssl_fp_apply_ctx(SSL_CTX *ctx, const SSL_FP_PROFILE *prof)
     if (ctx == NULL || prof == NULL)
         return 0;
 
+    /*
+     * A profile with no lists of its own - `stock` - leaves the library's in
+     * place rather than installing anything, which is the whole of what makes
+     * it upstream. Returning success without touching the context also keeps
+     * SSL_CTX_new_ex() from pinning: see the caller.
+     */
+    if (prof->ciphers == NULL)
+        return 1;
+
     pinned = ctx->ciphers_pinned;
     ctx->ciphers_pinned = 0;
     ok = SSL_CTX_set_ciphersuites(ctx, prof->tls13_ciphers)
@@ -478,6 +613,8 @@ static int fp_apply_ssl(SSL *s, const SSL_FP_PROFILE *prof)
 
     if (s->ctx == NULL)
         return 0;
+    if (prof->ciphers == NULL)
+        return 1;
 
     pinned = s->ctx->ciphers_pinned;
     s->ctx->ciphers_pinned = 0;

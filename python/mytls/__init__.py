@@ -129,10 +129,21 @@ def check() -> str:
         return (f"TLS layer: NOT ACTIVE - {ssl.OPENSSL_VERSION} has no fingerprint "
                 f"profiles, so every ClientHello will be Python's own. "
                 f"HTTP/2 layer: ready ({installed}).")
-    missing = [b for b in brands() if b not in got]
+    # What each brand *asks* the library for, which is not always its own name:
+    # `{"meta": {"tls_profile": "..."}}` points a brand at another brand's
+    # ClientHello, and several legitimately share one - every Chromium fork has
+    # Chrome's TLS, and iOS 17 has iOS 16's. Comparing brand names here instead
+    # reported those as missing, sending you to write a profile that is already
+    # there under the name the capture names.
+    wanted = {}
+    for brand in brands():
+        wanted.setdefault(profile(brand).tls_profile, []).append(brand)
+    missing = {name: bs for name, bs in wanted.items() if name not in got}
     if missing:
         return (f"TLS layer: partial - {ssl.OPENSSL_VERSION} offers "
-                f"{', '.join(got)}, but no profile for {', '.join(missing)}. "
-                f"HTTP/2 layer: ready ({installed}).")
+                f"{', '.join(got)}, but no profile for "
+                + ", ".join(f"{name} (wanted by {', '.join(bs)})"
+                            for name, bs in missing.items())
+                + f". HTTP/2 layer: ready ({installed}).")
     return (f"both layers ready - TLS profiles {', '.join(got)} "
             f"({ssl.OPENSSL_VERSION}); HTTP/2 profiles {installed}.")

@@ -234,8 +234,5 @@
         "gzip, deflate, br"
       ]
     ]
-  },
-  "meta": {
-    "label": "iOS 18.5 network stack"
   }
 }

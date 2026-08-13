@@ -14,8 +14,8 @@ algorithms, how many key_share entries to send, plus a few switches (whether to 
 the extension order, and whether to send ALPS, a GREASE ECH, an empty session_ticket, or
 padding).
 
-`ssl/ssl_fp_profile.c` is the only file that spells any of this out. Four are built in:
-`chrome`, `chrome_android`, `ios18` and `ios16`.
+`ssl/ssl_fp_profile.c` is the only file that spells any of this out. Five are built in:
+`chrome`, `chrome_android`, `ios18`, `ios16` and `ios26`.
 
 The two iOS profiles are named for the **OS**, not for a browser, because none of this
 belongs to a browser: every app that goes through NSURLSession or CFNetwork produces the
@@ -24,6 +24,13 @@ one device (Safari, WhatsApp, the App Store, and Apple's telemetry and weather d
 produced no difference in the handshake at all, and no difference in the HTTP/2 fingerprint
 either. `ios16` and `ios18` in turn differ in exactly one entry: `ios16` advertises
 `ecdsa_sha1` (`0x0203`) among its signature algorithms and `ios18` does not.
+
+`ios26` is the first Apple capture that is not a variation on those two. Its ClientHello is
+1541 bytes where theirs are 517, and four things moved at once: the post-quantum hybrid
+`X25519MLKEM768` leads its groups and carries a 1216-byte key share (two real shares now,
+not one), TLSv1.1 and TLSv1.0 are no longer advertised, the three TLSv1.3 suites are
+reordered with AES-256 first, and the padding extension is gone — at that size it would
+never have fired. Its signature algorithms are iOS 18's, entry for entry.
 
 ```c
 int         SSL_CTX_set_fp_profile(SSL_CTX *ctx, const char *name);
@@ -222,8 +229,8 @@ python -m mytls        # both halves, in one line, plus the installed profiles
 ```
 
 ```
-both layers ready - TLS profiles chrome, chrome_android, ios18, ios16
-(OpenSSL 3.4.0); HTTP/2 profiles chrome, chrome_android, ios16, ios18.
+both layers ready - TLS profiles chrome, chrome_android, ios18, ios16, ios26
+(OpenSSL 3.4.0); HTTP/2 profiles chrome, chrome_android, ios16, ios18, ios26.
 ```
 
 Anything other than `both layers ready` means the Python being used is not linked against
@@ -317,11 +324,12 @@ Nothing is stored for it: the values to compare against are computed on the spot
 
 ### Capturing a browser against a real site
 
-`mytls-probe serve` captures a browser that visits us, dumping every connection into
-`./captures` for `mytls-probe import-mitm` to turn into a profile. To capture one talking to
-a real site instead — where `referer`, `cookie` and subresource priorities actually occur —
-there is a mitmproxy 12 addon that relays the connection raw, below HTTP, so the HPACK bytes
-survive into the same kind of dump:
+`mytls-probe serve` captures a browser that visits us: it runs until Ctrl-C and dumps every
+connection, and every request on it, into `./captures` for `mytls-probe import-mitm` to turn
+into a profile. To capture a browser talking to a real site instead — where `referer`,
+`cookie` and subresource priorities actually occur — there is a mitmproxy 12 addon that
+relays the connection raw, below HTTP, so the HPACK bytes survive into the same kind of
+dump:
 
 ```bash
 mytls-probe capture-mitm --host 'example\.com' --brand chrome

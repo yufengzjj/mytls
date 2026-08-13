@@ -594,13 +594,16 @@ int ossl_ssl_connection_reset(SSL *s)
     sc->sent_tickets = 0;
 
     /*
-     * Draw fresh GREASE values and a fresh extension order for the next
-     * connection - reusing them would make every ClientHello from this SSL
-     * object identical, which is exactly what the randomisation is there to
-     * avoid.
+     * Draw fresh GREASE values, a fresh extension order and a fresh GREASE ECH
+     * for the next connection - reusing them would make every ClientHello from
+     * this SSL object identical, which is exactly what the randomisation is
+     * there to avoid. Within one connection they are held; see ssl_grease.c.
      */
     sc->grease_seeded = 0;
     sc->ext_permutation_len = 0;
+    OPENSSL_free(sc->ech_grease);
+    sc->ech_grease = NULL;
+    sc->ech_grease_len = 0;
 
     sc->error = 0;
     sc->hit = 0;
@@ -1487,6 +1490,7 @@ void ossl_ssl_connection_free(SSL *ssl)
 
     OPENSSL_free(s->client_cert_type);
     OPENSSL_free(s->server_cert_type);
+    OPENSSL_free(s->ech_grease);
 
     OSSL_STACK_OF_X509_free(s->verified_chain);
 
@@ -4211,22 +4215,30 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
      * what Chrome would send. Anything an application overrides afterwards
      * (ALPN, SNI, ...) is its own business, but everything that feeds the
      * fingerprint is pinned here.
+     *
+     * All of it is skipped under the `stock` profile, which exists to be
+     * upstream: these are not additions a flag can switch off but the very
+     * defaults upstream's own tests assert against, down to which extensions
+     * appear in a ClientHello at all.
      */
-    SSL_CTX_clear_options(ret, SSL_OP_NO_COMPRESSION);
-    SSL_CTX_clear_options(ret, SSL_OP_NO_RX_CERTIFICATE_COMPRESSION);
-    /* Chrome advertises brotli, and only brotli, for certificate compression */
-    SSL_CTX_clear_options(ret, SSL_OP_NO_TLSv1_2 | SSL_OP_NO_TLSv1_3);
-    SSL_CTX_set_options(ret, SSL_OP_TLSEXT_PADDING);
-    SSL_CTX_set_options(ret, SSL_OP_NO_ENCRYPT_THEN_MAC);
-    SSL_CTX_set_tlsext_status_type(ret, TLSEXT_STATUSTYPE_ocsp);
-    SSL_CTX_enable_ct(ret, SSL_CT_VALIDATION_PERMISSIVE);
-    /*
-     * TLSv1.2 is the floor: supported_versions must offer exactly {1.3, 1.2},
-     * and the empty renegotiation_info extension takes the place of the
-     * TLS_EMPTY_RENEGOTIATION_INFO_SCSV cipher only when TLSv1.0 is off.
-     */
-    SSL_CTX_set_min_proto_version(ret, TLS1_2_VERSION);
-    SSL_CTX_set_max_proto_version(ret, TLS1_3_VERSION);
+    if ((ossl_ssl_fp_default()->flags & SSL_FP_STOCK) == 0) {
+        SSL_CTX_clear_options(ret, SSL_OP_NO_COMPRESSION);
+        SSL_CTX_clear_options(ret, SSL_OP_NO_RX_CERTIFICATE_COMPRESSION);
+        /* Chrome advertises brotli, and only brotli, for cert compression */
+        SSL_CTX_clear_options(ret, SSL_OP_NO_TLSv1_2 | SSL_OP_NO_TLSv1_3);
+        SSL_CTX_set_options(ret, SSL_OP_TLSEXT_PADDING);
+        SSL_CTX_set_options(ret, SSL_OP_NO_ENCRYPT_THEN_MAC);
+        SSL_CTX_set_tlsext_status_type(ret, TLSEXT_STATUSTYPE_ocsp);
+        SSL_CTX_enable_ct(ret, SSL_CT_VALIDATION_PERMISSIVE);
+        /*
+         * TLSv1.2 is the floor: supported_versions must offer exactly
+         * {1.3, 1.2}, and the empty renegotiation_info extension takes the
+         * place of the TLS_EMPTY_RENEGOTIATION_INFO_SCSV cipher only when
+         * TLSv1.0 is off.
+         */
+        SSL_CTX_set_min_proto_version(ret, TLS1_2_VERSION);
+        SSL_CTX_set_max_proto_version(ret, TLS1_3_VERSION);
+    }
     /*
      * The cipher and group lists come from the default fingerprint profile, so
      * that ssl/ssl_fp_profile.c stays the only place any browser's lists are
@@ -4238,8 +4250,13 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
     /*
      * From here on the cipher lists are part of the fingerprint and the public
      * setters will leave them alone. See ossl_ssl_ciphers_pinned().
+     *
+     * Not under the `stock` profile: nothing was installed, so there is nothing
+     * to protect, and pinning the library's own defaults would make every
+     * application that sets a cipher list - upstream's test suite included -
+     * silently get a different one.
      */
-    ret->ciphers_pinned = 1;
+    ret->ciphers_pinned = (ossl_ssl_fp_default()->flags & SSL_FP_STOCK) == 0;
     if (getenv("SSLKEYLOGFILE") != NULL)
         SSL_CTX_set_keylog_callback(ret, keylog_callback);
     return ret;

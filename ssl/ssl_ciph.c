@@ -2242,9 +2242,18 @@ int ssl_cert_is_disabled(SSL_CTX *ctx, size_t idx)
  * Default list of TLSv1.2 (and earlier) ciphers
  * SSL_DEFAULT_CIPHER_LIST deprecated in 3.0.0
  * Update both macro and function simultaneously
+ *
+ * Empty, because a fingerprint profile installs the browser's list in full and
+ * anything left over from the library's own default would be an extra cipher
+ * on the wire. The `stock` profile has no list of its own, so for it this has
+ * to be what upstream returns - without it the context comes out of
+ * SSL_CTX_new_ex() holding the three TLSv1.3 suites and nothing else, and any
+ * connection that cannot negotiate TLSv1.3 fails with "no ciphers available".
  */
 const char *OSSL_default_cipher_list(void)
 {
+    if ((ossl_ssl_fp_default()->flags & SSL_FP_STOCK) != 0)
+        return SSL_DEFAULT_CIPHER_LIST;
     return "";
 }
 
@@ -2255,6 +2264,16 @@ const char *OSSL_default_cipher_list(void)
  */
 const char *OSSL_default_ciphersuites(void)
 {
+    /*
+     * Chrome's order, which is not upstream's - it leads with AES-128 where
+     * upstream leads with AES-256, and the three appear in the ClientHello in
+     * exactly this order. `stock` gets upstream's back; see
+     * OSSL_default_cipher_list() above for why this cannot just be one list.
+     */
+    if ((ossl_ssl_fp_default()->flags & SSL_FP_STOCK) != 0)
+        return "TLS_AES_256_GCM_SHA384:"
+               "TLS_CHACHA20_POLY1305_SHA256:"
+               "TLS_AES_128_GCM_SHA256";
     return "TLS_AES_128_GCM_SHA256:"
            "TLS_AES_256_GCM_SHA384:"
            "TLS_CHACHA20_POLY1305_SHA256";

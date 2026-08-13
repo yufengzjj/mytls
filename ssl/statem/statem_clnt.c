@@ -4148,7 +4148,7 @@ int ssl_cipher_list_to_bytes(SSL_CONNECTION *s, STACK_OF(SSL_CIPHER) *sk,
     if (s->mode & SSL_MODE_SEND_FALLBACK_SCSV)
         maxlen -= 2;
     /* A GREASE value (RFC 8701) always leads the list. */
-    if (!s->server) {
+    if (!s->server && (ossl_ssl_fp(s)->flags & SSL_FP_GREASE) != 0) {
         if (!WPACKET_put_bytes_u16(pkt,
                                    ossl_ssl_grease_value(s,
                                                          SSL_GREASE_CIPHER))) {

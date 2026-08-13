@@ -5,7 +5,8 @@ HEADERS frame exactly as they arrived - the header block fragment is written out
 verbatim, before anything decodes it. Point a browser at it to capture that
 browser, then point our own client at it and compare.
 
-    # wait for any browser at all; the raw dumps land in ./captures
+    # wait for any browser at all; the raw dumps land in ./captures.
+    # Browse for as long as you like, then Ctrl-C.
     mytls-probe serve
 
     # Windows, fresh profile so no cookies/extensions get in the way
@@ -18,17 +19,20 @@ browser, then point our own client at it and compare.
     mytls-probe list
     mytls-probe selftest
 
-On its own `serve` only *records*: one dump per connection, in the layout
-mitm_addon.py writes, so `import-mitm` and `match` read a capture taken here and
-one taken through mitmproxy with the same code. Nothing is installed as a brand
-until you say which brand it is - and a connection that never got as far as a
-request is kept too, which is the only way to measure a client that refuses our
+On its own `serve` only *records*, and it keeps recording until interrupted -
+the same shape as `capture-mitm`, against our own server rather than a real
+site. One dump per connection, every request on it, in the layout mitm_addon.py
+writes, so `import-mitm` and `match` read a capture taken here and one taken
+through mitmproxy with the same code. Nothing is installed as a brand until you
+say which brand it is - and a connection that never got as far as a request is
+kept too, which is the only way to measure a client that refuses our
 certificate.
 
-`serve --brand chrome` is the one-step form: capture, take the connection that
-carried the request, write profiles/chrome.json. A brand is a browser, not a
-browser version: capturing Chrome again replaces profiles/chrome.json, and the
-version stays inside the capture.
+`serve --brand chrome` is the one-step form, and the one that ends by itself:
+capture until one profile is complete, take the connection that carried the
+request, write profiles/chrome.json. A brand is a browser, not a browser
+version: capturing Chrome again replaces profiles/chrome.json, and the version
+stays inside the capture.
 
 A phone reaches this machine over the LAN, so it needs an address that is not
 localhost, and a certificate that says so:
@@ -103,6 +107,32 @@ SETTING_NAMES = {
 }
 
 
+def carried_meta(path: Path) -> dict:
+    """The `meta` of the capture this run is about to replace.
+
+    Everything else in a profile is re-read from the new dump, which is the
+    point of re-capturing. `meta` is the one part no dump can produce - it is
+    what a person knew and the bytes do not say - so a rewrite has to bring it
+    across rather than drop it.
+
+    Not cosmetic: `meta.tls_profile` is what points a brand at another brand's
+    ClientHello, and without it the brand falls back to the library default.
+    Re-capturing iOS 17 used to silently start sending Chrome's handshake -
+    the HTTP/2 layer would still be iOS 17's, so nothing looked wrong until
+    the self-test.
+    """
+    if not path.exists():
+        return {}
+    try:
+        old = json.loads(path.read_text())
+    except (OSError, ValueError):
+        # Not a capture, or not readable: this is a best-effort rescue of a
+        # file that is being replaced anyway, so it must never be what fails.
+        return {}
+    meta = old.get("meta") if isinstance(old, dict) else None
+    return meta if isinstance(meta, dict) else {}
+
+
 def profile_path(brand: str) -> Path:
     """Where `brand`'s capture lives. One file per brand, no version in the name."""
     if not re.fullmatch(r"[a-z][a-z0-9_]*", brand):
@@ -173,26 +203,102 @@ def _san(hosts: typing.Iterable[str]) -> str:
     return ",".join(entries)
 
 
-def ensure_cert(openssl: str, hosts: typing.Iterable[str] = ()) -> None:
+def _cert_validity(openssl: str, within: int = 7 * 24 * 3600) -> tuple[str, str]:
+    """How much life the certificate has left: (state, notAfter).
+
+    `state` is "ok", "expiring" within the window, "expired", or "unknown" when
+    openssl cannot be reached. The date is what openssl printed, verbatim.
+
+    openssl is asked rather than the date parsed here, because `%b` in strptime
+    follows the locale and none of this may depend on one. The common case
+    costs a single call; a second is only made to tell "nearly out" from "out".
+
+    A certificate openssl cannot read at all comes back "expired", which is the
+    useful answer: a corrupt one has to be replaced too, and replacing is what
+    that verdict does.
+    """
+    def ask(seconds: int) -> subprocess.CompletedProcess:
+        return subprocess.run(  # noqa: S603
+            [openssl, "x509", "-in", str(CERT), "-noout", "-enddate",
+             "-checkend", str(seconds)],
+            capture_output=True, text=True, check=False)
+
+    try:
+        proc = ask(within)
+    except OSError:
+        # No openssl to ask. A certificate that is fine needs none - only
+        # issuing one does - so this must not be what stops a run.
+        return "unknown", ""
+    end = (proc.stdout.partition("notAfter=")[2].splitlines() or [""])[0].strip()
+    if proc.returncode == 0:
+        return "ok", end
+    return ("expired" if ask(0).returncode != 0 else "expiring"), end
+
+
+def ensure_cert(openssl: str, hosts: typing.Iterable[str] = (),
+                optional: typing.Iterable[str] = ()) -> None:
     """Make sure the server cert covers every name a client might use.
 
-    The SAN accumulates: a run without --host keeps the addresses an earlier
-    run put in, because regenerating means re-installing on every phone that
-    trusted the old one. iOS is the reason for the extensions - since iOS 13 a
-    server certificate is rejected outright unless it has a SAN (CN is
-    ignored), carries extendedKeyUsage=serverAuth and lives no longer than 398
-    days.
+    Re-issuing is the expensive operation here, and the cost is not ours: every
+    device that trusted the old certificate has to be walked through trusting
+    the new one by hand. So it happens only when a host that was *asked for* is
+    not covered already. The SAN accumulates for the same reason - a run
+    without --host keeps the addresses an earlier run put in.
+
+    `optional` goes into a certificate that is being issued anyway and is never
+    itself a reason to issue one. This machine's own address is optional: it
+    moves with DHCP, with a VPN coming up, and with every WSL restart, and none
+    of those are a reason to invalidate a phone's trust. When it turns out not
+    to be covered, that is reported rather than fixed - `--host` is how you say
+    an address matters enough to pay for it.
+
+    The one thing that re-issues without being asked is an expiry that has
+    already passed. There is no trust left to protect at that point: every
+    client refuses the certificate, so keeping it costs everything and saves
+    nothing. Running *low* is only reported - the old one still works, and
+    replacing it is a job for a moment you choose.
+
+    iOS is the reason for the extensions - since iOS 13 a server certificate is
+    rejected outright unless it has a SAN (CN is ignored), carries
+    extendedKeyUsage=serverAuth and lives no longer than 398 days.
     """
     stamp = WORK / "cert.san"
     have = stamp.read_text().split(",") if stamp.exists() else []
-    want = _san(hosts)
-    merged = ",".join(dict.fromkeys([*have, *want.split(",")]))
+    asked = _san(hosts).split(",")
+    everything = _san([*hosts, *optional]).split(",")
+
+    covers = (CERT.exists() and KEY.exists()
+              and not [e for e in asked if e not in have])
+    state, end = _cert_validity(openssl) if covers else ("", "")
+
+    if covers and state != "expired":
+        uncovered = [e for e in everything if e not in have]
+        if uncovered:
+            print(f"keeping the cert at {CERT}\n"
+                  f"  it does not cover {', '.join(uncovered)}, so a client "
+                  f"reaching us there sees a name mismatch. That address was "
+                  f"detected, not asked for, and re-issuing would cost every "
+                  f"device that already trusts this cert - pass --host "
+                  f"{uncovered[0].partition(':')[2]} to say it is worth it.")
+        if state == "expiring":
+            print(f"  !! this certificate is only valid until {end}. After that "
+                  f"every client refuses it and it is re-issued automatically, "
+                  f"which means trusting it again on every device - so replace "
+                  f"it when that suits you, not when it runs out:\n"
+                  f"       rm {CERT} {KEY}", file=sys.stderr)
+        return
+
+    if covers:                                   # state == "expired"
+        # Nothing is being protected by keeping this one: every client already
+        # refuses it, so the trust it used to carry is gone whatever we do.
+        print(f"the cert at {CERT} is out of date"
+              + (f" (expired {end})" if end else " (openssl cannot read it)")
+              + " - issuing a new one.")
+
+    merged = ",".join(dict.fromkeys([*have, *everything]))
     # DNS entries first, IP after: order inside the extension is cosmetic, but
     # a stable spelling is what lets us compare against the stamp at all.
     merged = ",".join(sorted(merged.split(","), key=lambda e: e.startswith("IP:")))
-    if CERT.exists() and KEY.exists() and merged == ",".join(have):
-        return
-
     WORK.mkdir(parents=True, exist_ok=True)
     conf = WORK / "openssl.cnf"
     conf.write_text(
@@ -391,8 +497,9 @@ def listen(port: int) -> socket.socket:
     return srv
 
 
-def tls_context(openssl: str, hosts: typing.Iterable[str] = ()) -> ssl.SSLContext:
-    ensure_cert(openssl, hosts)
+def tls_context(openssl: str, hosts: typing.Iterable[str] = (),
+                optional: typing.Iterable[str] = ()) -> ssl.SSLContext:
+    ensure_cert(openssl, hosts, optional)
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
     ctx.load_cert_chain(str(CERT), str(KEY))
     ctx.set_alpn_protocols(["h2", "http/1.1"])
@@ -533,17 +640,25 @@ class _Session:
     to open a second connection to the same origin, and does. So connections are
     served concurrently and the results land here; the first HEADERS frame to
     arrive anywhere is the profile.
+
+    `forever` is the recording run: it has no such finishing line, keeps every
+    connection open and serving, and ends only when interrupted. What stops a
+    one-shot run - the profile is captured, the xhr arrived, the timeout ran
+    out - is precisely what it must not stop on.
     """
 
     def __init__(self, *, timeout: float, quiet: bool,
                  want_xhr: bool = False, dumps: Path | None = None,
-                 written: list[Path] | None = None) -> None:
+                 written: list[Path] | None = None,
+                 forever: bool = False) -> None:
         #: Hold the connection open past the first request to also catch the
         #: page's own /xhr-sample. The browser sends one by itself; our own
         #: client has to be told to, which is what selftest does.
         self.want_xhr = want_xhr
         self.timeout = timeout
         self.quiet = quiet
+        #: Serve until interrupted rather than until one profile is complete.
+        self.forever = forever
         #: Where one dump per connection goes, or None to record nothing but
         #: the profile. Set when the run is not filing anything under a brand.
         self.dumps = dumps
@@ -572,7 +687,8 @@ class _Session:
                 "priority": info.get("priority"),
                 "headers": [[k, v] for k, v in decoded if not k.startswith(":")],
             }
-        self.done.set()
+        if not self.forever:
+            self.done.set()
 
     def note(self, msg: str) -> None:
         if not self.quiet:
@@ -637,13 +753,20 @@ class _Session:
             if self.record is not None:
                 return False
             self.record = record
-            self.deadline = time.monotonic() + self.timeout
-        if not self.want_xhr:
+            # A recording run has nothing to give up on - it is not waiting for
+            # the xhr, it is keeping whatever arrives - so it takes no deadline.
+            if not self.forever:
+                self.deadline = time.monotonic() + self.timeout
+        if not self.want_xhr and not self.forever:
             self.done.set()
         return True
 
     def expired(self) -> bool:
         return self.deadline is not None and time.monotonic() > self.deadline
+
+    def running(self) -> bool:
+        """Whether the accept loop should go round again."""
+        return self.forever or (not self.done.is_set() and not self.expired())
 
 
 def shape_of(ch: dict) -> str:
@@ -724,7 +847,8 @@ def _graceful_close(sock: ssl.SSLSocket) -> None:
 def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
             timeout: float = 25.0, want_xhr: bool = False,
             dumps: Path | None = None,
-            written: list[Path] | None = None) -> dict | None:
+            written: list[Path] | None = None,
+            forever: bool = False) -> dict | None:
     """Serve until the profile is captured, and the page's own fetch with it.
 
     Returns None if the listening socket is closed from under us, which is how
@@ -733,9 +857,15 @@ def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
     `dumps` additionally writes every connection's raw bytes into that
     directory, and `written` collects the paths - the return value is one
     profile, and a run may have recorded several connections worth keeping.
+
+    `forever` drops the finishing line: serve and record until interrupted,
+    keeping every connection open and answering every request on it, the way
+    `capture-mitm` runs until you stop it. The return value is still the first
+    request seen - it is what the caller summarises - but by then it is one of
+    many, and the dumps are the output.
     """
     state = _Session(timeout=timeout, quiet=quiet, want_xhr=want_xhr,
-                     dumps=dumps, written=written)
+                     dumps=dumps, written=written, forever=forever)
     threads: list[threading.Thread] = []
     srv.settimeout(0.5)
 
@@ -746,7 +876,7 @@ def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
     # accept(): the interrupt is delivered at whatever bytecode boundary comes
     # next, which is as often the flush or the loop condition.
     try:
-        while not state.done.is_set() and not state.expired():
+        while state.running():
             # At least twice a second, since accept() times out that often.
             state.flush_dumps()
             accepted = None
@@ -772,13 +902,22 @@ def capture(srv: socket.socket, ctx: ssl.SSLContext, *, quiet: bool = False,
                                  args=(raw, peer, ctx, state), daemon=True)
             t.start()
             threads.append(t)
+            # A recording run outlives any number of connections - a phone
+            # browsing for ten minutes opens hundreds - and the finished ones
+            # would otherwise be joined one by one at the end.
+            if len(threads) > 32:
+                threads = [t for t in threads if t.is_alive()]
     except KeyboardInterrupt:
         state.note("\ninterrupted - writing out what arrived")
 
     # Long enough for the winning connection to finish writing its response -
-    # the page is waiting on that 200 to say it is done.
+    # the page is waiting on that 200 to say it is done. Bounded in total
+    # rather than per thread: the connections still open at the end of a
+    # recording run are blocked reading a request that will never come, and
+    # there may be many of them.
+    until = time.monotonic() + 3.0
     for t in threads:
-        t.join(timeout=2)
+        t.join(timeout=max(0.0, until - time.monotonic()))
     state.flush_dumps(final=True)
 
     if state.record is not None and state.xhr is not None:
@@ -824,11 +963,15 @@ def brand_of(record: dict) -> str:
 def serve(args: argparse.Namespace) -> int:
     """Capture whatever visits, and write it down.
 
-    On its own this only records: one dump per connection under --captures, in
-    the layout mitm_addon.py writes, to be handed to `import-mitm` afterwards -
-    the same two steps as `capture-mitm` without a --brand. --brand does both
-    steps here and now, storing the connection that carried the request as that
-    profile; --out stores it at a path without registering a brand at all.
+    On its own this only records, and it records until you stop it: one dump
+    per connection under --captures, in the layout mitm_addon.py writes, to be
+    handed to `import-mitm` afterwards. That is `capture-mitm` without a
+    --brand, against our own server instead of a real site - browse for as long
+    as you like, Ctrl-C, and every connection and every request on it is on
+    disk. --brand instead does both steps here and now, ending as soon as one
+    profile is complete and storing it; --out is the same, at a path, without
+    registering a brand. The two combine: --out picks the path, and --brand
+    given with it writes the name into the file without installing it.
 
     Recording and filing are separate because they fail separately. Which
     browser a capture is cannot always be read off it - a WebView, an app on
@@ -837,26 +980,28 @@ def serve(args: argparse.Namespace) -> int:
     brand there used to lose the whole visit; now the bytes are on disk either
     way and naming them is a later decision.
     """
-    if args.brand and args.out:
-        print("give --brand or --out, not both", file=sys.stderr)
-        return 2
     if args.brand:
         profile_path(args.brand)          # reject a bad name before we listen
     dumps = None if (args.brand or args.out) else Path(args.captures).resolve()
 
-    hosts = [h.strip() for h in (args.host or "").split(",") if h.strip()]
+    named = [h.strip() for h in (args.host or "").split(",") if h.strip()]
     detected = local_ipv4()
-    if detected:
-        hosts.append(detected)
-    ctx = tls_context(args.openssl, hosts)
+    # The address this machine happens to hold today goes into a certificate
+    # that is being issued anyway, but never causes one to be issued: it moves
+    # on its own, and a phone's trust does not. See ensure_cert.
+    hosts = [*named, detected] if detected else list(named)
+    ctx = tls_context(args.openssl, named,
+                      optional=[detected] if detected else [])
     srv = listen(args.port)
 
     reach = hosts[0] if hosts else "localhost"
     print(f"listening on :{args.port} - waiting for any h2 client "
           f"(https://{reach}:{args.port}/api/all)")
     if dumps is not None:
-        print(f"  dumps    {dumps}   (one per connection; nothing is filed "
-              f"under a brand - pass --brand to do that in one step)")
+        print(f"  dumps    {dumps}   (one per connection, rewritten as it "
+              f"grows; nothing is filed under a brand)\n"
+              f"  Browse for as long as you like, then stop with Ctrl-C. "
+              f"Pass --brand to capture one profile and stop instead.")
     if hosts and not can_bind(hosts[0]):
         # Under WSL2 the VM sits behind NAT, so the address a phone can reach
         # is the Windows host's and packets only arrive if Windows forwards
@@ -877,7 +1022,10 @@ def serve(args: argparse.Namespace) -> int:
                      # to be told to stay up for it - otherwise it ends on the
                      # navigation and the xhr half is lost. It arrives in
                      # milliseconds; the timeout is only the giving-up point.
-                     want_xhr=True, dumps=dumps, written=written)
+                     want_xhr=True, dumps=dumps, written=written,
+                     # Recording has no finishing line: it is not after one
+                     # profile, so nothing it collects is a reason to stop.
+                     forever=dumps is not None)
     srv.close()
     if dumps is not None:
         return report_dumps(dumps, written, record)
@@ -885,23 +1033,32 @@ def serve(args: argparse.Namespace) -> int:
         return 1
 
     peer = record.pop("peer", "?")
+    # As in import_mitm: --out picks the path, --brand names what is in it, and
+    # the two are independent. Only a capture filed into the profiles directory
+    # is reported back at the end.
     if args.out:
-        out, brand = Path(args.out), None
+        out, brand, filed = Path(args.out), args.brand, False
     else:
-        brand = args.brand
+        brand, filed = args.brand, True
         out = profile_path(brand)
         out.parent.mkdir(parents=True, exist_ok=True)
+    if brand:
         record = {"brand": brand, **record}
+    kept = carried_meta(out)
+    if kept:
+        record["meta"] = kept
 
     replacing = out.exists()
     out.write_text(json.dumps(record, indent=2))
     ua = headers_of(record).get("user-agent", "?")
     print(f"  captured from {peer}: {ua}")
+    if kept:
+        print(f"  kept the meta the old file carried: {', '.join(kept)}")
     print(f"  {'replaced' if replacing else 'stored as'} {out}")
     warn_if_resumed(record)
 
     summarise(record)
-    if brand:
+    if filed:
         report_profile(brand)
     return 0
 
@@ -927,8 +1084,12 @@ def report_dumps(out: Path, written: list[Path], record: dict | None) -> int:
     the whole directory rather than a chosen file, because it is the one that
     knows which connection carried a navigation and which carried the xhr.
     What this does say is whether a *request* arrived at all: a run that only
-    collected a rejected handshake is worth telling apart from one that got
+    collected rejected handshakes is worth telling apart from one that got
     everything, and the exit status follows that rather than the file count.
+
+    Each dump is read back rather than reported from what was in memory. It
+    costs nothing at this point and it is the honest question: what is on disk
+    for `import-mitm` to find, not what we believe we wrote.
     """
     if not written:
         print("\nnothing was captured. Check that the browser really reached "
@@ -937,8 +1098,23 @@ def report_dumps(out: Path, written: list[Path], record: dict | None) -> int:
         return 1
 
     print(f"\n{len(written)} dump(s) in {out}")
+    requests = 0
+    for path in written:
+        try:
+            rec = _dump_record(path)
+        except Exception as exc:  # noqa: BLE001 - one bad file, not a crash
+            print(f"  {path.name:<38} unreadable ({type(exc).__name__}: {exc})")
+            continue
+        if rec is None:
+            print(f"  {path.name:<38} (no ClientHello)")
+            continue
+        n = sum(1 for f in rec["frames"] if f["type"] == "HEADERS")
+        requests += n
+        print(f"  {path.name:<38} {rec['sni'] or '?':<26} "
+              f"{rec['alpn'] or '-':<9} {n:>3} req")
+
     if record is None:
-        print("  none of them carries an HTTP/2 request - a ClientHello alone "
+        print("\n  none of them carries an HTTP/2 request - a ClientHello alone "
               "still says which stack it came from (`mytls-probe match "
               f"{out}`), but a profile cannot be built from it. If the browser "
               "stopped at the certificate warning, click through it.",
@@ -950,7 +1126,7 @@ def report_dumps(out: Path, written: list[Path], record: dict | None) -> int:
         ua = headers_of(record).get("user-agent", "?")
     except Exception as exc:  # noqa: BLE001 - the dumps are already on disk
         ua = f"(user-agent unreadable: {type(exc).__name__}: {exc})"
-    print(f"  captured from {peer}: {ua}")
+    print(f"\n{requests} request(s); the first was from {peer}: {ua}")
     warn_if_resumed(record)
     summarise(record)
     print(f"\n  import with:\n    mytls-probe import-mitm {out} --brand <name>")
@@ -2233,20 +2409,34 @@ def import_mitm(args: argparse.Namespace) -> int:
 
     record = navigation["record"]
     if args.out:
-        out, brand = Path(args.out), None
+        # --out decides where the file goes; --brand, when given, still says
+        # whose bytes are in it. Dropping the name here left a capture that had
+        # been named claiming nothing, and the loader falls back to the file's
+        # stem - so `--brand ios18a --out aaa.json` loaded as brand `aaa`.
+        # Without a --brand the file stays anonymous, which is what makes an
+        # --out capture safe to rename and try out under any name.
+        out, brand, filed = Path(args.out), args.brand, False
+        if brand:
+            profile_path(brand)          # reject a bad name before writing it
     else:
-        brand = args.brand or brand_of(record)
+        brand, filed = args.brand or brand_of(record), True
         out = profile_path(brand)
         out.parent.mkdir(parents=True, exist_ok=True)
+    if brand:
         record = {"brand": brand, **record}
     if xhr is not None:
         record["xhr"] = xhr
+    kept = carried_meta(out)
+    if kept:
+        record["meta"] = kept
 
     replacing = out.exists()
     out.write_text(json.dumps(record, indent=2))
     label = "navigation" if navigation["kind"] == "navigate" else "request"
     print(f"\n  {label} from {navigation['path'].name}: "
           f"{navigation['user_agent'] or '?'}")
+    if kept:
+        print(f"  kept the meta the old file carried: {', '.join(kept)}")
     if xhr:
         print(f"  xhr from the same connection "
               f"({len(xhr['header_block']) // 2}B)")
@@ -2262,7 +2452,10 @@ def import_mitm(args: argparse.Namespace) -> int:
     print(f"  {'replaced' if replacing else 'stored as'} {out}")
 
     summarise(record)
-    if brand:
+    # Only for a capture that was filed under its brand: report_profile reads
+    # it back out of the profiles directory, and an --out file is not there -
+    # naming one would report whatever else already holds that brand.
+    if filed:
         report_profile(brand)
     return 0
 
@@ -2479,18 +2672,31 @@ APP_CONTROLLED_EXTS = {"0x0023"}
 HOST_DEPENDENT_EXTS = {"0x0000", "0x0015"}
 
 
-def stack_shape(raw: bytes) -> dict:
+def stack_shape(raw: bytes, *, measured_record_version: bool = True) -> dict:
     """What a ClientHello says about the network stack that built it.
 
     Everything a capture of one client to *any* host has in common with a
-    capture of the same client to any other: the cipher list, the extension
-    order, and every extension body except the ones the host decides.
+    capture of the same client to any other: the record header, the session id
+    length, the cipher list, the extension order, and every extension body
+    except the ones the host decides.
 
     Not a byte comparison, and it cannot be one - `selftest` compares our own
     output against one capture and can hold the SNI equal, but two captures
     taken against different sites carry different names, hence different
     padding, hence different lengths throughout. What is left after removing
     those is still the whole fingerprint-bearing part of the message.
+
+    That is the reason for the two fields no published fingerprint reads.
+    `session_id_len` is 32 for every client measured so far, because they all
+    run TLS 1.3 in middlebox-compatibility mode - but a client that does not
+    send a legacy session id is a different stack, and ja3, ja4 and peetprint
+    would all call it the same one. `record_version` is 0x0301 throughout for
+    the same kind of reason. Neither has ever differed here; both are compared
+    so that the first client that differs is not silently absorbed.
+
+    `measured_record_version=False` for a capture whose record header mitmproxy
+    synthesised - see `read_mitm_dump`. The field is then None and skipped,
+    rather than reporting the artefact 0x0303 as a property of the client.
     """
     canon, _, problems = canonical_client_hello(raw)
     exts = extension_sequence(canon, raw)
@@ -2503,7 +2709,10 @@ def stack_shape(raw: bytes) -> dict:
                for i in range(0, n, 2)]
     o += 2 + n
     return {
+        "record_version": (f"0x{int.from_bytes(raw[1:3], 'big'):04x}"
+                           if measured_record_version else None),
         "legacy_version": f"0x{int.from_bytes(canon[9:11], 'big'):04x}",
+        "session_id_len": sid,
         "ciphers": ciphers,
         "compression": canon[o:o + 1 + canon[o]].hex(),
         "extension_order": [k for k, _ in exts],
@@ -2520,6 +2729,11 @@ def _dump_record(path: Path) -> dict | None:
     and unlike `read_mitm_dump` it does not insist on a decodable request - a
     connection that only ever produced a ClientHello still says which stack
     made it, which is the whole question here.
+
+    `exact` says whether the five record header bytes are the client's own. A
+    dump the addon could not catch on the wire carries a header mitmproxy
+    synthesised, stamped 0x0303 whatever the client sent, and a profile
+    imported from one records `record_version: null` to remember that.
     """
     data = json.loads(path.read_text())
     if "client" in data and data.get("format") == MITM_FORMAT:
@@ -2527,12 +2741,55 @@ def _dump_record(path: Path) -> dict | None:
         frames = [describe(*f) for f in
                   frames_from_stream(bytes.fromhex(data["client"]))]
         return {"sni": data.get("sni"), "alpn": data.get("alpn"),
-                "raw": raw, "frames": frames}
+                "raw": raw, "frames": frames,
+                "exact": bool(data.get("client_hello_exact"))}
     ch = data.get("client_hello")
     if isinstance(ch, dict) and ch.get("raw"):
         return {"sni": None, "alpn": None, "raw": bytes.fromhex(ch["raw"]),
-                "frames": data.get("frames") or []}
+                "frames": data.get("frames") or [],
+                "exact": ch.get("record_version") is not None}
     return None
+
+
+def _first_request(frames: list[dict]) -> dict[str, str]:
+    """The first request's headers on a connection, or {} if there is none.
+
+    Only the first, and only ever the first: HPACK indexes into a table the
+    earlier blocks built, so a later block cannot be decoded on its own, while
+    this one is guaranteed to decode against an empty table.
+
+    A capture recorded from part-way through a connection decodes to nothing
+    rather than raising - it is a fine capture of a ClientHello and simply has
+    no readable request in it.
+    """
+    frame = next((f for f in frames
+                  if f["type"] == "HEADERS" and f.get("header_block")), None)
+    if frame is None:
+        return {}
+    try:
+        return dict(_decode(bytes.fromhex(frame["header_block"])))
+    except Exception:  # noqa: BLE001 - one unreadable block, not a failed run
+        return {}
+
+
+def _headers_priority(frames: list[dict]) -> tuple | None:
+    """RFC 7540 priority on the first HEADERS frame, or None if it carries none.
+
+    A tuple rather than the dict it comes from, so that it compares by value
+    and `None` stays distinguishable from "priority with everything at zero".
+    """
+    frame = next((f for f in frames if f["type"] == "HEADERS"), None)
+    prio = frame.get("priority") if frame else None
+    return (None if not prio else
+            (prio["exclusive"], prio["depends_on"], prio["weight"]))
+
+
+def _priority_text(prio: tuple | None) -> str:
+    if prio is None:
+        return "none"
+    exclusive, depends_on, weight = prio
+    return (f"{'exclusive ' if exclusive else ''}"
+            f"depends_on={depends_on} weight={weight}")
 
 
 def match(args: argparse.Namespace) -> int:
@@ -2569,9 +2826,11 @@ def match(args: argparse.Namespace) -> int:
             print(f"{brand}: {prof_path} has no ClientHello to match against",
                   file=sys.stderr)
             return 2
-        wanted[brand] = (stack_shape(rec["raw"]),
+        wanted[brand] = (stack_shape(rec["raw"],
+                                     measured_record_version=rec["exact"]),
                          akamai_fingerprint({"frames": rec["frames"]})
-                         if rec["frames"] else None)
+                         if rec["frames"] else None,
+                         _headers_priority(rec["frames"]))
 
     tally: dict[str, int] = {}
     unmatched = 0
@@ -2584,7 +2843,8 @@ def match(args: argparse.Namespace) -> int:
         if rec is None:
             continue
         try:
-            shape = stack_shape(rec["raw"])
+            shape = stack_shape(rec["raw"],
+                                measured_record_version=rec["exact"])
         except Malformed as exc:
             print(f"{path.name}: malformed ClientHello ({exc})")
             unmatched += 1
@@ -2606,14 +2866,52 @@ def match(args: argparse.Namespace) -> int:
         print(f"  {label}  alpn={rec['alpn'] or '?'}")
         print(f"  ja3={f['ja3_hash']}  ja4={f['ja4']}")
         print(f"  akamai={theirs or '(no h2 request in this connection)'}")
+        # Which OS made this connection, when it said so. Only a capture that
+        # got as far as a request can answer that at all - the ClientHello
+        # names no one - so the line is absent rather than empty when there is
+        # no request, where the akamai line above has already said why.
+        request = _first_request(rec["frames"])
+        if request:
+            system = browser_fp.system_of(request)
+            # Falling back to the user-agent rather than printing "unknown":
+            # when the OS cannot be read, what it could not be read from is
+            # the useful thing to see.
+            print(f"  system={system}" if system else
+                  f"  system=?  ua={request.get('user-agent', '(none sent)')[:72]}")
         for text in shape["problems"]:
             print(f"  !! {text}")
+        # Said once about the capture, not once per brand: a ClientHello with
+        # no server_name is a fact about how the recording was made, and it
+        # decides the outcome against every profile that has one. RFC 6066
+        # allows no IP literal there, so a client reaching the server by
+        # address omits the extension entirely rather than filling it in.
+        if "0x0000" not in shape["extension_order"]:
+            print("  !! no SNI in this ClientHello - the client reached the "
+                  "server by IP address.")
+            print("     Against a profile recorded through a hostname this is "
+                  "an extension set that")
+            print("     differs by 0x0000 alone and can never match. Re-record "
+                  "over a hostname")
+            print("     (`serve --host 192-168-1-7.nip.io`) to compare the TLS "
+                  "half at all.")
+
+        their_prio = _headers_priority(rec["frames"])
 
         hit = False
-        for brand, (want_shape, want_akamai) in wanted.items():
+        for brand, (want_shape, want_akamai, want_prio) in wanted.items():
             stack, app = _shape_diff(want_shape, shape)
             if theirs is not None and want_akamai is not None and theirs != want_akamai:
                 stack.append(f"akamai {want_akamai} vs {theirs}")
+            # Reported like the empty session_ticket and for the same measured
+            # reason: on one iOS TLS stack, Safari puts priority on its HEADERS
+            # frame and the CFNetwork apps send none - 72 captures with none and
+            # 2 with it all match `ios16` on every other field. So it says which
+            # client, not which stack, and never turns a match into a miss. The
+            # akamai fingerprint's third field cannot see it: that counts
+            # standalone PRIORITY frames, which none of these clients send.
+            if theirs is not None and their_prio != want_prio:
+                app.append(f"HEADERS priority {_priority_text(want_prio)} "
+                           f"vs {_priority_text(their_prio)}")
             if stack:
                 if args.brand or args.verbose:
                     print(f"  {brand:<16} no - {'; '.join(stack[:4])}"
@@ -2643,6 +2941,16 @@ def _shape_diff(want: dict, got: dict) -> tuple[list[str], list[str]]:
     for key in ("legacy_version", "compression"):
         if want[key] != got[key]:
             stack.append(f"{key} {want[key]} vs {got[key]}")
+    # Only where both sides measured it: a capture imported from a dump the
+    # addon could not catch on the wire has mitmproxy's synthetic 0x0303 here,
+    # and reporting that would be reporting mitmproxy, not the client.
+    if (want["record_version"] and got["record_version"]
+            and want["record_version"] != got["record_version"]):
+        stack.append(f"record_version {want['record_version']} "
+                     f"vs {got['record_version']}")
+    if want["session_id_len"] != got["session_id_len"]:
+        stack.append(f"session_id {want['session_id_len']} bytes "
+                     f"vs {got['session_id_len']}")
     if want["ciphers"] != got["ciphers"]:
         stack.append(f"{len(want['ciphers'])} ciphers vs {len(got['ciphers'])}"
                      if len(want["ciphers"]) != len(got["ciphers"])
@@ -2650,17 +2958,60 @@ def _shape_diff(want: dict, got: dict) -> tuple[list[str], list[str]]:
 
     wo = [e for e in want["extension_order"] if e not in APP_CONTROLLED_EXTS]
     go = [e for e in got["extension_order"] if e not in APP_CONTROLLED_EXTS]
+    #: Extensions the extension-set difference below already named, so that the
+    #: body walk does not say the same thing again in other words.
+    named: set[str] = set()
     if wo != go:
-        stack.append("extension order differs" if sorted(wo) == sorted(go)
-                     else f"extension set differs ({len(wo)} vs {len(go)})")
+        # An SNI-less capture is off by exactly one extension from every
+        # profile taken through a hostname, and "extension set differs (16 vs
+        # 15)" sends the reader counting extension lists to rediscover that.
+        # Named here, and again as a note on the capture itself in `match`.
+        missing = [e for e in dict.fromkeys(wo) if e not in go]
+        extra = [e for e in dict.fromkeys(go) if e not in wo]
+        if sorted(wo) == sorted(go):
+            stack.append("extension order differs")
+        elif missing == ["0x0000"] and not extra:
+            stack.append("no SNI in the capture (0x0000), the profile has one")
+        elif extra == ["0x0000"] and not missing:
+            stack.append("no SNI in the profile (0x0000), the capture has one")
+        elif (missing or extra) and len(missing) + len(extra) <= 4:
+            # Which extension, not how many: a count leaves the reader to align
+            # two lists to find that out, and says nothing at all when one
+            # extension replaced another (the old "16 vs 16"). Capped because
+            # this line is joined with the other differences and truncated.
+            parts = []
+            if missing:
+                parts.append(f"lacks {' '.join(missing)}")
+            if extra:
+                parts.append(f"adds {' '.join(extra)}")
+            stack.append("capture " + " and ".join(parts))
+            named = set(missing) | set(extra)
+        else:
+            # Too many to name, so how many of each - the two totals alone can
+            # be equal while the sets differ, which says nothing at all.
+            #
+            # Both are empty for a difference in nothing but repeats, which in
+            # practice means a different number of GREASE entries: nothing to
+            # name and nothing to count, but the totals do differ there, since
+            # every GREASE is an entry of its own. Two of any other extension
+            # is illegal and `canonical_client_hello` reports it as a problem.
+            detail = ", ".join(p for p in
+                               (f"{len(missing)} gone" if missing else "",
+                                f"{len(extra)} new" if extra else "") if p)
+            stack.append(f"extension set differs ({len(wo)} vs {len(go)}"
+                         + (f": {detail})" if detail else ")"))
     for name in sorted(set(want["bodies"]) | set(got["bodies"])):
         w, g = want["bodies"].get(name), got["bodies"].get(name)
         if w == g:
             continue
-        if w is None:
-            text = f"{name} in the capture, not in the profile"
-        elif g is None:
-            text = f"{name} in the profile, not in the capture"
+        if w is None or g is None:
+            # An extension present on one side only was already named above,
+            # unless there were too many to name. Repeating it in other words
+            # costs a slot on a line that is cut off after four differences.
+            if name in named:
+                continue
+            text = (f"{name} in the capture, not in the profile" if w is None
+                    else f"{name} in the profile, not in the capture")
         else:
             text = f"{name} body differs"
         (app if name in APP_CONTROLLED_EXTS else stack).append(text)
@@ -2770,6 +3121,521 @@ def sniscan(args: argparse.Namespace) -> int:
     return rc
 
 
+# --- the second ClientHello, after a HelloRetryRequest -----------------------
+
+#: SHA-256("HelloRetryRequest"), RFC 8446 section 4.1.3. A ServerHello carrying
+#: this as its random *is* a HelloRetryRequest - there is no separate message
+#: type, which is why one can be assembled by hand as easily as below.
+HRR_RANDOM = bytes.fromhex(
+    "cf21ad74e59a6111be1d8c021e65b891c2a211167abb8c5e079e09e2c8a8339c")
+
+#: Extensions RFC 8446 section 4.1.2 permits the second ClientHello to change,
+#: so a difference in them is not a finding: key_share is replaced with the one
+#: entry the server asked for, padding absorbs that size change, pre_shared_key
+#: is recomputed over the new transcript, cookie is echoed back and early_data
+#: is dropped.
+HRR_MAY_CHANGE = {0x0033, 0x0015, 0x0029, 0x002c, 0x002a}
+
+#: Extensions the second ClientHello may *add*, so their absence from the first
+#: is not a reordering. Only cookie, in practice - the server has to have sent
+#: one for it to be echoed.
+HRR_MAY_APPEAR = {0x002c}
+
+#: Extensions the second ClientHello may *drop*, so their absence is not a
+#: reordering either. early_data because RFC 8446 says a retry ends 0-RTT, and
+#: padding because a real iOS device does - see `_hrr_check`.
+HRR_MAY_VANISH = {0x0015, 0x002a}
+
+
+def _recv_exactly(sock: socket.socket, n: int) -> bytes:
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return buf
+
+
+def _read_record(sock: socket.socket) -> bytes:
+    """One TLS record, header included, or b"" at end of stream."""
+    head = _recv_exactly(sock, 5)
+    if len(head) < 5:
+        return b""
+    return head + _recv_exactly(sock, int.from_bytes(head[3:5], "big"))
+
+
+def _key_share_groups(body: bytes) -> list[int]:
+    """The group of each KeyShareEntry in a client's key_share extension."""
+    out, o = [], 2
+    while o + 4 <= len(body):
+        out.append(int.from_bytes(body[o:o + 2], "big"))
+        o += 4 + int.from_bytes(body[o + 2:o + 4], "big")
+    return out
+
+
+def _hrr_group(ch: bytes) -> int:
+    """A group to demand: offered in supported_groups, not already shared.
+
+    Both halves matter. A group the client never offered makes it abort with
+    illegal_parameter, and one it already sent a share for makes the retry
+    pointless - RFC 8446 forbids the server asking for it.
+    """
+    exts = dict(_walk_extensions(ch))
+    have = set(_key_share_groups(exts.get(0x0033, b"")))
+    groups = exts.get(0x000a, b"")
+    for i in range(2, len(groups) - 1, 2):
+        group = int.from_bytes(groups[i:i + 2], "big")
+        if group not in GREASE and group not in have:
+            return group
+    msg = "the client sent a key_share for every group it offered"
+    raise Malformed(msg)
+
+
+def _hello_retry_request(ch: bytes, group: int) -> bytes:
+    """A HelloRetryRequest demanding `group`, built from the ClientHello.
+
+    Hand-assembled rather than produced by a real server, because a real one
+    would need a certificate, a cipher configuration that happens to leave the
+    right group unshared, and a way to be told to retry at all. What is under
+    test here is the *client*, and everything it checks before accepting an HRR
+    is in these thirty-odd bytes: the version, the echoed session id, a cipher
+    suite it offered, and a group it offered but did not share.
+    """
+    body = ch[9:]                                   # past both headers
+    o = 2 + 32
+    sid = body[o + 1:o + 1 + body[o]]
+    o += 1 + body[o]
+    n = int.from_bytes(body[o:o + 2], "big")
+    offered = [int.from_bytes(body[o + 2 + i:o + 4 + i], "big")
+               for i in range(0, n, 2)]
+    # A HelloRetryRequest only exists in TLS 1.3, so a ClientHello offering no
+    # 1.3 suite cannot be answered with one. That is not a broken client: it is
+    # what an Apple client sends on its *third* attempt after two handshakes
+    # have failed - 157 bytes, legacy_version 0x0301, no key_share, no
+    # supported_versions, TLS_FALLBACK_SCSV on the end. Our probe kills every
+    # handshake by design, so it induces exactly that, and reporting it as
+    # "the client would not retry" sent the reader looking in the wrong place.
+    suite = next((c for c in offered if c in (0x1301, 0x1302, 0x1303)), None)
+    if suite is None:
+        msg = ("this ClientHello offers no TLS 1.3 cipher suite, so no "
+               "HelloRetryRequest applies to it - the client has already "
+               "fallen back")
+        raise Malformed(msg)
+
+    exts = (b"\x00\x2b\x00\x02\x03\x04"             # supported_versions: 1.3
+            + b"\x00\x33\x00\x02" + group.to_bytes(2, "big"))   # key_share
+    hs = (b"\x03\x03" + HRR_RANDOM
+          + bytes([len(sid)]) + sid
+          + suite.to_bytes(2, "big") + b"\x00"
+          + len(exts).to_bytes(2, "big") + exts)
+    hs = b"\x02" + len(hs).to_bytes(3, "big") + hs
+    return b"\x16\x03\x03" + len(hs).to_bytes(2, "big") + hs
+
+
+def hrr_exchange(conn: socket.socket, timeout: float = 15.0
+                 ) -> tuple[bytes, bytes, int, str]:
+    """Answer one connection with a HelloRetryRequest; return both ClientHellos.
+
+    The whole server side of the measurement, and deliberately the *whole* of
+    it: there is no certificate, no key exchange and no ServerHello, because
+    nothing past the second ClientHello is being measured. The peer's handshake
+    then fails, which for a browser means an error page - the price of the
+    only measurement that shows what its second ClientHello looks like.
+
+    Returns (first, second, group, note); `note` is empty unless the second
+    never arrived, in which case it says what came instead.
+    """
+    conn.settimeout(timeout)
+    first = second = b""
+    group = 0
+    try:
+        first = _read_record(conn)
+        if len(first) < 6 or first[0] != 0x16 or first[5] != 0x01:
+            return first, b"", 0, "the first record was not a ClientHello"
+        group = _hrr_group(first)
+        conn.sendall(_hello_retry_request(first, group))
+        # Middlebox compatibility: a real server sends this after an HRR, and a
+        # client that has already sent its own expects to see one.
+        conn.sendall(b"\x14\x03\x03\x00\x01\x01")
+        while True:
+            rec = _read_record(conn)
+            if not rec:
+                return first, b"", group, ("the connection closed without a "
+                                           "second ClientHello")
+            if rec[0] == 0x15:                      # alert
+                why = (f"alert {rec[5]}/{rec[6]}" if len(rec) >= 7
+                       else "a truncated alert")
+                return first, b"", group, f"the client rejected the retry: {why}"
+            if rec[0] == 0x14:                      # its own CCS, expected
+                continue
+            if rec[0] == 0x16 and len(rec) > 5 and rec[5] == 0x01:
+                return first, rec, group, ""
+            return first, b"", group, f"unexpected record type 0x{rec[0]:02x}"
+    except Malformed as exc:
+        return first, b"", group, str(exc)
+    except OSError as exc:
+        return first, second, group, f"{type(exc).__name__}: {exc}"
+    finally:
+        conn.close()
+
+
+def hello_retry_pair(brand: str, sni: str = "example.com",
+                     alpn: typing.Sequence[str] = ("h2", "http/1.1")
+                     ) -> tuple[bytes, bytes, int, str]:
+    """Both ClientHellos of one handshake, and the group the retry demanded.
+
+    Like `one_client_hello`, no certificate and no completed handshake: we
+    answer the first ClientHello with a HelloRetryRequest, read the second, and
+    close. The client then fails, which is the expected outcome.
+
+    Returns (first, second, group, note). `note` is empty unless the second
+    never arrived, in which case it says what came instead.
+    """
+    from . import browser_fp
+
+    got: dict[str, typing.Any] = {"note": ""}
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve_one() -> None:
+        conn, _ = srv.accept()
+        got.update(zip(("first", "second", "group", "note"),
+                       hrr_exchange(conn)))
+
+    thread = threading.Thread(target=serve_one, daemon=True)
+    thread.start()
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    ctx.set_alpn_protocols(list(alpn))
+    browser_fp.tls_profile.set_profile(ctx, browser_fp.profile(brand).tls_profile)
+    sock = socket.create_connection(("127.0.0.1", port), timeout=10)
+    try:
+        ctx.wrap_socket(sock, server_hostname=sni)
+    except OSError:
+        pass                           # we never send a ServerHello; expected
+    finally:
+        sock.close()
+        thread.join(timeout=10)
+        srv.close()
+    return (got.get("first", b""), got.get("second", b""),
+            got.get("group", 0), got["note"])
+
+
+def _grease_positions(ch: bytes) -> dict[str, list[str]]:
+    """Every GREASE codepoint in a ClientHello, by where it sits.
+
+    Keyed by position rather than collected into a set, because the rule being
+    checked is that each *slot* holds the same value in both ClientHellos - and
+    BoringSSL draws them all from one seed, so two slots legitimately hold the
+    same value (supported_groups and key_share always do).
+    """
+    out: dict[str, list[str]] = {}
+
+    def add(where: str, value: int) -> None:
+        out.setdefault(where, []).append(f"0x{value:04x}")
+
+    o = 43
+    o += 1 + ch[o]
+    n = int.from_bytes(ch[o:o + 2], "big")
+    for i in range(o + 2, o + 2 + n, 2):
+        value = int.from_bytes(ch[i:i + 2], "big")
+        if value in GREASE:
+            add("cipher_suites", value)
+
+    for etype, body in _walk_extensions(ch):
+        if etype in GREASE:
+            add("extension id", etype)
+        elif etype == 0x000a:                        # supported_groups
+            for i in range(2, len(body) - 1, 2):
+                value = int.from_bytes(body[i:i + 2], "big")
+                if value in GREASE:
+                    add("supported_groups", value)
+        elif etype == 0x002b:                        # supported_versions
+            for i in range(1, len(body) - 1, 2):
+                value = int.from_bytes(body[i:i + 2], "big")
+                if value in GREASE:
+                    add("supported_versions", value)
+        elif etype == 0x0033:                        # key_share
+            for value in _key_share_groups(body):
+                if value in GREASE:
+                    add("key_share", value)
+    return out
+
+
+def _hrr_check(first: bytes, second: bytes, group: int) -> bool:
+    """Everything the second ClientHello has to keep from the first."""
+    ok = True
+    ga, gb = _grease_positions(first), _grease_positions(second)
+    # key_share's GREASE entry is *meant* to disappear - RFC 8446 requires the
+    # retry to carry exactly one entry - so it is checked below instead.
+    ga.pop("key_share", None)
+    gb.pop("key_share", None)
+    if ga == gb:
+        print("  GREASE values     repeated  " + ", ".join(
+            f"{k} {'/'.join(v)}" for k, v in sorted(ga.items())))
+    else:
+        ok = False
+        print("  GREASE values     REDRAWN - a real BoringSSL client derives "
+              "them from one\n                    per-handshake seed, so both "
+              "ClientHellos carry the same ones")
+        for name, values in (("first ", ga), ("second", gb)):
+            print(f"      {name}: " + ", ".join(
+                f"{k}={'/'.join(v)}" for k, v in sorted(values.items())))
+
+    ea = [t for t, _ in _walk_extensions(first)]
+    eb = [t for t, _ in _walk_extensions(second)]
+    # An extension appearing or disappearing is not a reordering, and reporting
+    # it as one buried the actual finding the first time a real device was
+    # measured: iOS drops padding from the retry, and every one of its sixteen
+    # pairs came out as "extension order DIFFER" with two near-identical lines
+    # underneath that the eye had to diff by hand.
+    added = [t for t in eb if t not in ea and t in HRR_MAY_APPEAR]
+    dropped = [t for t in ea if t not in eb and t in HRR_MAY_VANISH]
+    trimmed = [t for t in eb if t not in added]
+    kept = [t for t in ea if t not in dropped]
+    if trimmed == kept:
+        bits = []
+        if added:
+            bits.append("plus " + ", ".join(f"0x{t:04x}" for t in added))
+        if dropped:
+            bits.append("less " + ", ".join(f"0x{t:04x}" for t in dropped))
+        print(f"  extension order   identical, {len(ea)} extensions"
+              + (f" ({'; '.join(bits)})" if bits else ""))
+    else:
+        ok = False
+        print("  extension order   DIFFER - the permutation is drawn once per "
+              "handshake, so\n                    the retry must reuse it")
+        print(f"      first : {' '.join(f'0x{t:04x}' for t in ea)}")
+        print(f"      second: {' '.join(f'0x{t:04x}' for t in eb)}")
+
+    # Measured on a real iOS 18 device, sixteen retries out of sixteen: the
+    # padding extension is not in the second ClientHello at all - 517 bytes
+    # padded to 512 in the first, 324 unpadded in the second, though 315 bytes
+    # of handshake is well inside the range that otherwise pads. Upstream
+    # OpenSSL pads both, which is what this caught.
+    if 0x0015 in ea:
+        if 0x0015 in eb:
+            ok = False
+            print("  padding           STILL THERE in the retry - a real iOS "
+                  "device drops it\n                    outright, so a padded "
+                  "second ClientHello is 193 bytes and one\n                  "
+                  "  extension away from the client being imitated")
+        else:
+            print("  padding           dropped from the retry, as iOS does")
+
+    ks = dict(_walk_extensions(second)).get(0x0033)
+    if ks is None:
+        ok = False
+        print("  key_share         MISSING from the retry")
+    else:
+        groups = _key_share_groups(ks)
+        if groups == [group]:
+            print(f"  key_share         one entry, 0x{group:04x} as demanded")
+        else:
+            ok = False
+            print(f"  key_share         WRONG - RFC 8446 4.1.2 requires exactly "
+                  f"one entry for\n                    0x{group:04x}, got "
+                  + ", ".join(f"0x{g:04x}" for g in groups))
+
+    # Everything else, body by body. Two dicts and not a zip: the order check
+    # above already reported any reordering, and pairing by id keeps this from
+    # reporting the same thing a second time as a wall of mismatched bodies.
+    ba, bb = dict(_walk_extensions(first)), dict(_walk_extensions(second))
+    moved = sorted(t for t in set(ba) & set(bb)
+                   if t not in HRR_MAY_CHANGE and ba[t] != bb[t])
+    if not moved:
+        print("  extension bodies  identical outside key_share and padding")
+
+    # What the client was *allowed* to change, and did. Not a verdict - it is
+    # the interesting half when the client is somebody else's, because it says
+    # what a real stack actually does with the freedom the RFC gives it.
+    allowed = sorted(t for t in set(ba) & set(bb)
+                     if t in HRR_MAY_CHANGE and ba[t] != bb[t])
+    for etype in allowed:
+        print(f"  0x{etype:04x}            changed, as the RFC permits: "
+              f"{len(ba[etype])}B -> {len(bb[etype])}B")
+    gone = sorted(set(ba) - set(bb) - GREASE - {0x0015})
+    for etype in gone:
+        print(f"  0x{etype:04x}            dropped from the second ClientHello")
+    for etype in moved:
+        ok = False
+        print(f"  0x{etype:04x}            DIFFERS between the two ClientHellos")
+        if etype == 0xfe0d:
+            # Field by field rather than as one blob: the three parts do not
+            # carry the same weight. config_id names the ECHConfig in use, and
+            # a retry does not change which config the client holds, so a real
+            # ECH repeats it - redrawing it is the part that is wrong on its
+            # own terms. What `enc` and `payload` are supposed to do across a
+            # retry is the ECH draft's business and is not asserted here.
+            fa, fb = _ech_fields(ba[etype]), _ech_fields(bb[etype])
+            for name in ("type", "kdf", "aead", "config_id", "enc", "payload"):
+                verdict = "same" if fa[name] == fb[name] else "REDRAWN"
+                print(f"      {name:<10} {verdict:<8} "
+                      f"{_short(fa[name], 32)} -> {_short(fb[name], 32)}")
+            print("      config_id names the ECHConfig, which a retry does not "
+                  "change - a real\n      ECH repeats it, so a GREASE one that "
+                  "does not is distinguishable")
+        else:
+            print(f"      first : {_short(ba[etype].hex())}")
+            print(f"      second: {_short(bb[etype].hex())}")
+    return ok
+
+
+def _ech_fields(body: bytes) -> dict[str, str]:
+    """The outer ECHClientHello, split up: type, suite, config_id, enc, payload."""
+    enc_len = int.from_bytes(body[6:8], "big")
+    enc = body[8:8 + enc_len]
+    rest = body[8 + enc_len:]
+    return {
+        "type": body[0:1].hex(),
+        "kdf": body[1:3].hex(),
+        "aead": body[3:5].hex(),
+        "config_id": body[5:6].hex(),
+        "enc": enc.hex(),
+        "payload": rest[2:].hex(),
+    }
+
+
+def hrr_serve(args: argparse.Namespace) -> int:
+    """Answer whatever connects with a retry, and measure *its* second hello.
+
+    The same measurement as `hrr`, pointed at somebody else's client. What it
+    is for is the half of the question no amount of local testing settles: our
+    profiles say what a real iOS stack sends in a *first* ClientHello, because
+    that was captured - but no capture in this tree contains a second one, so
+    the rules `hrr` checks are read off the RFC and off BoringSSL's source
+    rather than off a measurement. Pointing a real device at this answers it.
+
+    Needs no certificate, which is the one part that is easier than `serve`:
+    the handshake dies before anything is authenticated, so there is nothing
+    for the phone to be asked to trust. The browser shows an error page, and
+    both ClientHellos are already recorded by then.
+    """
+    out = Path(args.out)
+    srv = listen(args.port)
+    host = args.host or local_ipv4() or "localhost"
+    print(f"listening on :{args.port} - point a client at https://{host}:{args.port}/\n"
+          f"every connection is answered with a HelloRetryRequest and both of its\n"
+          f"ClientHellos are written to {out}/. The client will report an error; "
+          f"that is\nexpected and does not affect what was measured. Ctrl-C to stop.\n")
+    seen = 0
+    started = time.monotonic()
+    # Stamped with the run, not just a counter. The counter restarts at 1 in
+    # every process, so a second listener silently overwrote eight pairs from
+    # the first one - and the pairs a phone produces are expensive enough that
+    # losing them to a filename collision is not acceptable.
+    run = datetime.datetime.now().strftime("%m%d-%H%M%S")
+    try:
+        while True:
+            conn, peer = srv.accept()
+            first, second, group, note = hrr_exchange(conn)
+            if not first:
+                print(f"{peer[0]}: nothing usable - {note or 'no ClientHello'}")
+                continue
+            seen += 1
+            sni = sni_of(first) or "(no SNI)"
+            print(f"=== {peer[0]}:{peer[1]} #{seen}: {sni} "
+                  f"(+{time.monotonic() - started:.2f}s) ===")
+            if not second:
+                print(f"  no second ClientHello - {note}")
+                print("  stored anyway: the first one is a measurement too")
+            else:
+                print(f"  retry demanded    0x{group:04x}; {len(first)}B then "
+                      f"{len(second)}B on the wire")
+                _hrr_check(first, second, group)
+            out.mkdir(parents=True, exist_ok=True)
+            path = out / f"hrr-{run}-{_safe(sni)}-{seen:03d}.json"
+            path.write_text(json.dumps({
+                # Timestamped because the first real run could not answer a
+                # plain question about itself: one page load produced nine
+                # connections in three rounds of a fallback ladder, and nothing
+                # stored said whether those were three sockets in parallel or
+                # one retried nine times. This server accepts one at a time, so
+                # the order alone cannot tell them apart.
+                "at": datetime.datetime.now().isoformat(timespec="milliseconds"),
+                "elapsed": round(time.monotonic() - started, 3),
+                "peer": peer[0], "peer_port": peer[1],
+                "sni": sni_of(first), "group": group,
+                "note": note, "first": first.hex(), "second": second.hex(),
+            }, indent=2))
+            print(f"  stored {path}\n")
+    except KeyboardInterrupt:
+        print(f"\nstopped after {seen} connection(s)")
+    finally:
+        srv.close()
+    return 0
+
+
+def hrr_pair(args: argparse.Namespace) -> int:
+    """Re-check a pair stored by `hrr --serve`, without the device."""
+    rec = json.loads(Path(args.pair).read_text())
+    first = bytes.fromhex(rec["first"])
+    second = bytes.fromhex(rec["second"])
+    print(f"=== {args.pair}: {rec.get('sni') or '(no SNI)'} from "
+          f"{rec.get('peer', '?')} ===")
+    if not second:
+        print(f"  no second ClientHello was recorded - {rec.get('note', '')}")
+        return 1
+    print(f"  retry demanded    0x{rec['group']:04x}; {len(first)}B then "
+          f"{len(second)}B on the wire")
+    return 0 if _hrr_check(first, second, rec["group"]) else 1
+
+
+def hrr(args: argparse.Namespace) -> int:
+    """Check the second ClientHello against the first, after a retry.
+
+    The other thing `selftest` cannot see. It drives one fresh handshake
+    against a server that never retries, so every rule about what the *second*
+    ClientHello must keep from the first goes unexercised - and those rules are
+    where a client that is otherwise byte-perfect gives itself away, because
+    they are the ones a fingerprinting server can trigger at will simply by
+    asking for a group the client did not share.
+
+    Needs no network and no certificate: the retry is assembled by hand.
+    """
+    from . import browser_fp
+
+    if args.pair:
+        return hrr_pair(args)
+    if args.serve:
+        return hrr_serve(args)
+
+    brands = [args.brand] if args.brand else list(browser_fp.brands())
+    results: dict[str, int] = {}
+    for i, brand in enumerate(brands):
+        if i:
+            print()
+        print(f"=== {brand} ===")
+        try:
+            first, second, group, note = hello_retry_pair(brand, args.sni)
+        except Exception as exc:                              # noqa: BLE001
+            print(f"  FAILED ({type(exc).__name__}: {exc})")
+            results[brand] = 1
+            continue
+        if not first:
+            print(f"  no ClientHello at all - {note or 'nothing arrived'}")
+            results[brand] = 1
+            continue
+        if not second:
+            print(f"  no second ClientHello - {note}")
+            results[brand] = 1
+            continue
+        print(f"  retry demanded    0x{group:04x}; {len(first)}B then "
+              f"{len(second)}B on the wire")
+        results[brand] = 0 if _hrr_check(first, second, group) else 1
+
+    if len(brands) > 1:
+        print("\n=== summary ===")
+        for brand, rc in results.items():
+            print(f"  {brand:<16} {'PASS' if rc == 0 else 'FAIL'}")
+    return 0 if all(rc == 0 for rc in results.values()) else 1
+
+
 def list_profiles(_args: argparse.Namespace) -> int:
     from . import browser_fp
     print(browser_fp.catalog())
@@ -2784,23 +3650,26 @@ def main() -> int:
         "serve",
         help="run an h2 server and record whatever connects to it",
         description="Stand up an HTTP/2 server over TLS and write down the raw "
-                    "bytes of every connection that reaches it. Without "
-                    "--brand nothing is installed: the dumps go to --captures "
-                    "in mitm_addon.py's layout, for `import-mitm` to turn into "
-                    "a profile afterwards - the same two steps as capture-mitm, "
-                    "against our own server instead of a real site.")
+                    "bytes of every connection that reaches it, until you stop "
+                    "it with Ctrl-C. Nothing is installed: the dumps go to "
+                    "--captures in mitm_addon.py's layout, for `import-mitm` to "
+                    "turn into a profile afterwards - the same two steps as "
+                    "capture-mitm, against our own server instead of a real "
+                    "site. --brand collapses them into one and ends the run as "
+                    "soon as a single profile is complete.")
     s.add_argument("--captures", default="captures", metavar="DIR",
                    help="where the raw dumps go when no --brand is given; "
                         "default: ./captures")
-    s.add_argument("--brand", help="skip the dumps and store the connection "
-                                   "that carried the request as this profile, "
-                                   "in one step (one file per browser, no "
-                                   "version in the name)")
-    s.add_argument("--out", help="store that same single capture at this path, "
-                                 "without registering it as a brand")
+    s.add_argument("--brand", help="capture one profile and stop, storing it "
+                                   "as this brand instead of dumping (one file "
+                                   "per browser, no version in the name)")
+    s.add_argument("--out", help="the same single capture, stored at this path, "
+                                 "without registering it as a brand; with "
+                                 "--brand the file still records that name")
     s.add_argument("--xhr-timeout", type=float, default=25.0,
-                   help="how long to wait for the page's own /xhr-sample after "
-                        "the navigation arrives (default 25s)")
+                   help="with --brand/--out only: how long to wait for the "
+                        "page's own /xhr-sample after the navigation arrives "
+                        "before ending the run (default 25s)")
     s.add_argument("--host", help="address the client will use, comma-separated "
                                   "if several; goes into the certificate's SAN "
                                   "and is printed as the URL to visit. Needed "
@@ -2882,7 +3751,8 @@ def main() -> int:
     m.add_argument("--brand", help="which profile to write; default: read off "
                                    "the captured user-agent")
     m.add_argument("--out", help="write here instead of into the profiles "
-                                 "directory, and skip the reference")
+                                 "directory, and skip the reference; --brand "
+                                 "given as well is recorded in the file")
     m.add_argument("--allow-resumed", action="store_true",
                    help="accept a ClientHello carrying pre_shared_key; it will "
                         "not match our client, which never resumes")
@@ -2919,6 +3789,38 @@ def main() -> int:
     sc.add_argument("--step", type=int, default=7,
                     help="hostname length increment (default 7)")
     sc.set_defaults(func=sniscan)
+
+    hr = sub.add_parser(
+        "hrr",
+        help="answer our own ClientHello with a HelloRetryRequest and check "
+             "what the second one keeps",
+        description="The other thing selftest cannot see. It runs one fresh "
+                    "handshake against a server that never retries, so nothing "
+                    "exercises the rules about what the *second* ClientHello "
+                    "must carry over from the first - the GREASE values, the "
+                    "extension order, the GREASE ECH payload. A fingerprinting "
+                    "server can trigger a retry at will by asking for a group "
+                    "the client did not share. Needs no server, no certificate "
+                    "and no network: the retry is assembled by hand.")
+    hr.add_argument("--brand", help="just one; default: every installed profile")
+    hr.add_argument("--sni", default="example.com",
+                    help="hostname to send (default example.com)")
+    hr.add_argument("--serve", action="store_true",
+                    help="instead of testing ourselves, listen and measure "
+                         "whatever connects - a real phone, whose second "
+                         "ClientHello no capture in this tree contains. Needs "
+                         "no certificate: the handshake dies before anything "
+                         "is authenticated")
+    hr.add_argument("--host", help="with --serve: the address to print in the "
+                                   "URL; default is this machine's LAN address")
+    hr.add_argument("--port", type=int, default=8443,
+                    help="with --serve: what to listen on (default 8443)")
+    hr.add_argument("--out", default="captures/hrr", metavar="DIR",
+                    help="with --serve: where the pairs are written "
+                         "(default ./captures/hrr)")
+    hr.add_argument("--pair", metavar="FILE",
+                    help="re-check a pair stored by --serve, with no device")
+    hr.set_defaults(func=hrr)
 
     ls = sub.add_parser("list", help="what browser_fp currently offers")
     ls.set_defaults(func=list_profiles)

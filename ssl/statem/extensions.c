@@ -920,7 +920,8 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
      * ClientHello we generate ourselves. Every other message keeps the plain
      * table order.
      */
-    grease = (context & SSL_EXT_CLIENT_HELLO) != 0 && !s->server;
+    grease = (context & SSL_EXT_CLIENT_HELLO) != 0 && !s->server
+             && (ossl_ssl_fp(s)->flags & SSL_FP_GREASE) != 0;
 
     if (grease) {
         /* The first GREASE extension is empty and always comes first. */
@@ -1895,7 +1896,8 @@ static EXT_RETURN tls_construct_compress_certificate(SSL_CONNECTION *sc, WPACKET
      * handshake against a server that compresses its certificate chain, so
      * configure with "enable-brotli".
      */
-    if (!sc->server && (context & SSL_EXT_CLIENT_HELLO) != 0) {
+    if (!sc->server && (context & SSL_EXT_CLIENT_HELLO) != 0
+            && ossl_ssl_fp(sc)->cert_comp != NULL) {
         const SSL_FP_PROFILE *fp = ossl_ssl_fp(sc);
 
         if ((sc->options & SSL_OP_NO_RX_CERTIFICATE_COMPRESSION) != 0
