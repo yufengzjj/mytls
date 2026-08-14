@@ -1,0 +1,232 @@
+{
+  "brand": "ios17",
+  "frames": [
+    {
+      "type": "SETTINGS",
+      "flags": 0,
+      "stream": 0,
+      "length": 18,
+      "settings": [
+        {
+          "id": 2,
+          "name": "ENABLE_PUSH",
+          "value": 0
+        },
+        {
+          "id": 4,
+          "name": "INITIAL_WINDOW_SIZE",
+          "value": 2097152
+        },
+        {
+          "id": 3,
+          "name": "MAX_CONCURRENT_STREAMS",
+          "value": 100
+        }
+      ]
+    },
+    {
+      "type": "WINDOW_UPDATE",
+      "flags": 0,
+      "stream": 0,
+      "length": 4,
+      "increment": 10485760
+    },
+    {
+      "type": "HEADERS",
+      "flags": 37,
+      "stream": 1,
+      "length": 280,
+      "priority": {
+        "exclusive": false,
+        "depends_on": 0,
+        "weight": 255
+      },
+      "header_block": "8287048660759981d14741910be2582e3cb056757a8d5ae63dc79a699f53b0497ca589d34d1f43aeba0c41a4c7a98f33a69a3fdf9a68fa1d75d0620d263d4c79a68fbed00177febe58f9fbed00177b408a4148b4a549275906497f872587421641925f408a4148b4a549275a42a13f8690e4b692d49f5190f73ad7b4fd7b9d6c63a91f7da002efff408a4148b4a549275a93c85f86a87dcd30d25f7ae6d07f66a281b0dae053fa36b9cf517ed4bdaf8286d739ea2a9ab728176202941ba954d03229ab729f9fda90d75d05e458f3192c3806d70ae16d4feb363dfa33fd2941ba954c452753ff6a712d8831ea602eae05341e33505602de00b4f29b8728ec330e01a5c3b3508d9bd9abfa5242cb40d25fa523b3"
+    }
+  ],
+  "client_hello": {
+    "record_version": "0x0301",
+    "legacy_version": "0x0303",
+    "session_id_len": 32,
+    "cipher_suites": [
+      "0xdada",
+      "0x1301",
+      "0x1302",
+      "0x1303",
+      "0xc02c",
+      "0xc02b",
+      "0xcca9",
+      "0xc030",
+      "0xc02f",
+      "0xcca8",
+      "0xc00a",
+      "0xc009",
+      "0xc014",
+      "0xc013",
+      "0x009d",
+      "0x009c",
+      "0x0035",
+      "0x002f",
+      "0xc008",
+      "0xc012",
+      "0x000a"
+    ],
+    "extensions": [
+      {
+        "type": 56026,
+        "hex": "0xdada",
+        "length": 0,
+        "grease": true,
+        "body": ""
+      },
+      {
+        "type": 0,
+        "hex": "0x0000",
+        "length": 23,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 23,
+        "hex": "0x0017",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 65281,
+        "hex": "0xff01",
+        "length": 1,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 10,
+        "hex": "0x000a",
+        "length": 12,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 11,
+        "hex": "0x000b",
+        "length": 2,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 16,
+        "hex": "0x0010",
+        "length": 14,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 5,
+        "hex": "0x0005",
+        "length": 5,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 13,
+        "hex": "0x000d",
+        "length": 24,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 18,
+        "hex": "0x0012",
+        "length": 0,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 51,
+        "hex": "0x0033",
+        "length": 43,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 45,
+        "hex": "0x002d",
+        "length": 2,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 43,
+        "hex": "0x002b",
+        "length": 11,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 27,
+        "hex": "0x001b",
+        "length": 3,
+        "grease": false,
+        "body": null
+      },
+      {
+        "type": 51914,
+        "hex": "0xcaca",
+        "length": 1,
+        "grease": true,
+        "body": "00"
+      },
+      {
+        "type": 21,
+        "hex": "0x0015",
+        "length": 188,
+        "grease": false,
+        "body": null
+      }
+    ],
+    "raw": "1603010200010001fc0303f3bf11159a1c3d4a8cb3b898c2137f84c58624685105a2d1113cded974ac489f204e544b7c7246a172ae5587a16acf842812ff5a4d2b33094ed8a4b407dba4099f002adada130113021303c02cc02bcca9c030c02fcca8c00ac009c014c013009d009c0035002fc008c012000a01000189dada00000000001700150000123139322d3136382d312d372e6e69702e696f00170000ff01000100000a000c000a4a4a001d001700180019000b000201000010000e000c02683208687474702f312e31000500050100000000000d0018001604030804040105030203080508050501080606010201001200000033002b00294a4a000100001d002018505dac6a3032bd5751b3d86e9a63d261e6c1a8aa506f6827c25b7cba299e66002d00020101002b000b0a0a0a0304030303020301001b0003020001caca000100001500bc0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "captured_at": "2026-08-12T04:37:21+00:00",
+  "xhr": {
+    "header_block": "8287048863ccf62c81d35d05c553032a2f2a7f058840e92ac7b0d31aaf7f05842d35a7d7c47f048321ec47c3739c9d29ad1718602f8960b8f2c159d5ea356b98f71e69a6581d66607451c3",
+    "priority": null,
+    "headers": [
+      [
+        "accept",
+        "*/*"
+      ],
+      [
+        "sec-fetch-site",
+        "same-origin"
+      ],
+      [
+        "sec-fetch-dest",
+        "empty"
+      ],
+      [
+        "accept-language",
+        "zh-CN,zh-Hans;q=0.9"
+      ],
+      [
+        "sec-fetch-mode",
+        "cors"
+      ],
+      [
+        "user-agent",
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+      ],
+      [
+        "referer",
+        "https://192-168-1-7.nip.io:8443/api/all"
+      ],
+      [
+        "accept-encoding",
+        "gzip, deflate, br"
+      ]
+    ]
+  },
+  "meta": {
+    "tls_profile": "ios16"
+  }
+}
