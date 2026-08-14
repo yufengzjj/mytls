@@ -821,8 +821,22 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
         /*
          * The server told us which group it wants; RFC 8446 section 4.1.2
          * allows exactly that one share in the second ClientHello.
+         *
+         * A group-changing HelloRetryRequest already freed the first
+         * ClientHello's shares in tls_parse_stoc_key_share(), leaving
+         * num_ks_pkey == 0 here. But a cookie-only HelloRetryRequest that keeps
+         * our group carries no key_share extension, so that parser never ran
+         * and those EVP_PKEYs are still live; without freeing them here they
+         * leak, since add_key_share() below overwrites ks_pkey[0] and resets
+         * the count. Freeing an already-empty array is a no-op, so this is safe
+         * on both paths.
          */
+        for (i = 0; i < s->s3.tmp.num_ks_pkey; i++) {
+            EVP_PKEY_free(s->s3.tmp.ks_pkey[i]);
+            s->s3.tmp.ks_pkey[i] = NULL;
+        }
         s->s3.tmp.num_ks_pkey = 0;
+        s->s3.tmp.pkey = NULL;
         if (!add_key_share(s, pkt, s->s3.group_id, 0)) {
             /* SSLfatal() already called */
             return EXT_RETURN_FAIL;
@@ -836,7 +850,9 @@ EXT_RETURN tls_construct_ctos_key_share(SSL_CONNECTION *s, WPACKET *pkt,
          * fingerprint, so we send shares for the first CHROME_KEY_SHARES
          * usable groups rather than just the first one.
          */
-        for (i = 0; i < num_groups && sent < ossl_ssl_fp(s)->key_shares; i++) {
+        for (i = 0; i < num_groups
+                    && sent < ossl_ssl_fp(s)->key_shares
+                    && sent < OPENSSL_CLIENT_MAX_KEY_SHARES; i++) {
             if (!tls_group_allowed(s, pgroups[i], SSL_SECOP_CURVE_SUPPORTED))
                 continue;
 

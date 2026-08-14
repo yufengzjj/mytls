@@ -4242,10 +4242,14 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
     /*
      * The cipher and group lists come from the default fingerprint profile, so
      * that ssl/ssl_fp_profile.c stays the only place any browser's lists are
-     * written down. A failure here leaves the library defaults in place, which
-     * the self-test catches immediately.
+     * written down. A failure here (an allocation failure, or a profile group
+     * the provider cannot supply) would otherwise leave the library defaults in
+     * place and then get them pinned below - a context that looks fine but is
+     * silently mis-fingerprinted - so fail construction instead. Under `stock`
+     * the apply is a no-op and cannot fail.
      */
-    (void)ossl_ssl_fp_apply_ctx(ret, ossl_ssl_fp_default());
+    if (!ossl_ssl_fp_apply_ctx(ret, ossl_ssl_fp_default()))
+        goto err;
     ret->fp_empty_ticket = SSL_FP_TICKET_PROFILE;
     /*
      * From here on the cipher lists are part of the fingerprint and the public

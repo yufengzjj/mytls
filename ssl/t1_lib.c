@@ -2052,8 +2052,23 @@ int tls12_check_peer_sigalg(SSL_CONNECTION *s, uint16_t sig, EVP_PKEY *pkey)
         return 0;
     }
 
-    /* Check signature matches a type we sent */
-    sent_sigslen = tls12_get_psigalgs(s, 1, &sent_sigs);
+    /*
+     * Check the signature matches a type we sent. A client running a
+     * fingerprint profile writes the profile's sigalg list to its ClientHello
+     * verbatim (see tls_construct_ctos_sig_algs), which is not the library's
+     * default list that tls12_get_psigalgs() returns - so verify the server's
+     * choice against what actually went on the wire. Otherwise a server could
+     * sign with an algorithm the default list happens to include but the
+     * profile never advertised (ed25519/ed448 are absent from Chrome's list),
+     * and we would accept it. The server side keeps the default list, which is
+     * what its CertificateRequest advertises.
+     */
+    if (s->server == 0 && ossl_ssl_fp(s)->sigalgs != NULL) {
+        sent_sigs = ossl_ssl_fp(s)->sigalgs;
+        sent_sigslen = ossl_ssl_fp(s)->sigalgs_len;
+    } else {
+        sent_sigslen = tls12_get_psigalgs(s, 1, &sent_sigs);
+    }
     for (i = 0; i < sent_sigslen; i++, sent_sigs++) {
         if (sig == *sent_sigs)
             break;
@@ -2720,15 +2735,6 @@ int tls12_copy_sigalgs(SSL_CONNECTION *s, WPACKET *pkt,
     for (i = 0; i < psiglen; i++, psig++) {
         const SIGALG_LOOKUP *lu = tls1_lookup_sigalg(s, *psig);
 
-        /*
-         * Truncate at ecdsa_secp521r1_sha512, which is where the browser list
-         * this used to produce ended. Nothing reaches the wire through here
-         * any more for a ClientHello - the profile's list is written verbatim -
-         * so this now only shortens a server's CertificateRequest, and under
-         * `stock` it must not happen at all.
-         */
-        if (*psig == 0x0603 && (ossl_ssl_fp(s)->flags & SSL_FP_STOCK) == 0)
-            break;
         if (lu == NULL
                 || !tls12_sigalg_allowed(s, SSL_SECOP_SIGALG_SUPPORTED, lu))
             continue;
