@@ -1409,6 +1409,26 @@ def _decode(block: bytes) -> list[tuple[str, str]]:
     return _decode_with(hpack.Decoder(), block)
 
 
+def _decode_primed(rec: dict, block: bytes) -> list[tuple[str, str]]:
+    """Decode a block that is *not* the first on its connection.
+
+    The xhr HEADERS block indexes into the dynamic table the navigate request
+    already built, so decoding it against a fresh table raises the moment it
+    references an inserted entry (a shared `:authority` or `user-agent` is
+    enough). Feed the record's navigate block through a decoder first to rebuild
+    that table, then decode this block against it - the order the client encoded
+    them in. If the record carries no navigate HEADERS frame the table stays
+    empty, same as `_decode`.
+    """
+    import hpack
+
+    decoder = hpack.Decoder()
+    nav = next((f for f in rec.get("frames", []) if f["type"] == "HEADERS"), None)
+    if nav is not None:
+        _decode_with(decoder, bytes.fromhex(nav["header_block"]))
+    return _decode_with(decoder, block)
+
+
 def akamai_fingerprint(rec: dict) -> str:
     """The akamai HTTP/2 fingerprint of a capture.
 
@@ -1902,8 +1922,16 @@ def diff_xhr(a: dict, b: dict, na: str, nb: str,
         return same
     # The dynamic table carries the first block's `:authority` into this one,
     # so an unreproducible authority moves these bytes too - and does it twice,
-    # once as a table reference and once in whatever it displaced.
-    da, db = _decode(ba), _decode(bb)
+    # once as a table reference and once in whatever it displaced. This block is
+    # the second on the connection, so it has to be decoded against the table
+    # the navigate request built (`_decode_primed`), not a fresh one.
+    try:
+        da, db = _decode_primed(a, ba), _decode_primed(b, bb)
+    except Exception as exc:  # noqa: BLE001 - a block we cannot decode is a finding, not a crash
+        print(f"!! xhr HPACK could not be decoded ({type(exc).__name__}: {exc}) "
+              f"- raw bytes only")
+        print(f"  {na}: {ba.hex()}\n  {nb}: {bb.hex()}")
+        return False
     differing = {k for (k, v), (k2, v2) in zip(da, db) if (k, v) != (k2, v2)}
     if excused and [k for k, _ in da] == [k for k, _ in db] \
             and differing <= set(excused):
@@ -1911,9 +1939,8 @@ def diff_xhr(a: dict, b: dict, na: str, nb: str,
               f"not reproducible here")
         return same
     print("!! xhr HPACK bytes DIFFER")
-    for name, blk in ((na, ba), (nb, bb)):
-        print(f"  {name}: " + " ".join(
-            f"{k}={v}" for k, v in _decode(blk)))
+    for name, blk in ((na, da), (nb, db)):
+        print(f"  {name}: " + " ".join(f"{k}={v}" for k, v in blk))
     return False
 
 
@@ -3367,6 +3394,33 @@ def _grease_positions(ch: bytes) -> dict[str, list[str]]:
     return out
 
 
+def _ch_invariants(ch: bytes) -> dict[str, bytes]:
+    """The ClientHello fields the retry must repeat byte for byte.
+
+    RFC 8446 section 4.1.2 lets the second ClientHello differ from the first
+    only in key_share, pre_shared_key, early_data, cookie and padding - every
+    one an extension. Everything ahead of the extensions is fixed: the
+    legacy_version, the session_id, the cipher_suites list (GREASE entries
+    included, since those are drawn once per connection and so must recur) and
+    the compression methods. `_grease_positions` only checks the GREASE
+    codepoints inside that region, not the region itself, so without this a
+    client that reordered or trimmed its ordinary cipher suites on the retry -
+    a real, fingerprintable divergence - would slip through unnoticed.
+
+    Offsets follow `_walk_extensions`: `ch` carries the 5-byte record header.
+    """
+    version = ch[9:11]
+    o = 43
+    session_id = ch[o:o + 1 + ch[o]]
+    o += 1 + ch[o]
+    cs_len = int.from_bytes(ch[o:o + 2], "big")
+    ciphers = ch[o:o + 2 + cs_len]
+    o += 2 + cs_len
+    compression = ch[o:o + 1 + ch[o]]
+    return {"legacy_version": version, "session_id": session_id,
+            "cipher_suites": ciphers, "compression": compression}
+
+
 def _hrr_check(first: bytes, second: bytes, group: int) -> bool:
     """Everything the second ClientHello has to keep from the first."""
     ok = True
@@ -3386,6 +3440,31 @@ def _hrr_check(first: bytes, second: bytes, group: int) -> bool:
         for name, values in (("first ", ga), ("second", gb)):
             print(f"      {name}: " + ", ".join(
                 f"{k}={'/'.join(v)}" for k, v in sorted(values.items())))
+
+    # The extensions are the only thing RFC 8446 4.1.2 lets the retry change;
+    # the fields ahead of them must return byte for byte. The GREASE scan above
+    # only looked at the GREASE codepoints, not the cipher list or the header
+    # fields around it, so compare those here - a second ClientHello that
+    # reorders or trims its cipher suites, or alters its session_id,
+    # legacy_version or compression, is a divergence that would otherwise read
+    # as "no divergence".
+    ia, ib = _ch_invariants(first), _ch_invariants(second)
+    fixed = (("legacy_version", "legacy_version"),
+             ("session_id", "session_id"),
+             ("cipher_suites", "cipher suites"),
+             ("compression", "compression"))
+    if all(ia[k] == ib[k] for k, _ in fixed):
+        print("  fixed fields      identical: legacy_version, session_id, "
+              "cipher suites, compression")
+    else:
+        for key, human in fixed:
+            if ia[key] != ib[key]:
+                ok = False
+                print(f"  {human:<16} DIFFERS between the two ClientHellos - RFC "
+                      f"8446 4.1.2\n                    requires it unchanged in "
+                      f"the retry")
+                print(f"      first : {_short(ia[key].hex())}")
+                print(f"      second: {_short(ib[key].hex())}")
 
     ea = [t for t, _ in _walk_extensions(first)]
     eb = [t for t, _ in _walk_extensions(second)]

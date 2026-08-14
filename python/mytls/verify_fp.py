@@ -63,6 +63,55 @@ def cmp(name: str, got, want) -> bool:
     return False
 
 
+def cmp_akamai(got: dict, want: str) -> bool:
+    """The akamai comparison, forgiving one bug in how peet prints it.
+
+    peet renders SETTINGS id 8 (ENABLE_CONNECT_PROTOCOL) with an empty id -
+    `2:0;3:100;4:2097152;:1;9:1` where the setting is plainly `8:1`. Its own
+    parse of the frame is right, and says so in words:
+
+        'ENABLE_CONNECT_PROTOCOL = 1'
+
+    so this is a defect in its formatter, not in what we sent. Two profiles -
+    iOS 18.0 and 18.2 - send that setting, and iOS 18.5 stopped, which is why
+    only those two ever showed it.
+
+    Rather than excuse an empty id on sight, the empty slot is filled from
+    peet's own named parse and the result compared as usual. A setting that
+    really was missing, or really had a different value, still fails.
+    """
+    live = got["http2"]["akamai_fingerprint"]
+    if live == want:
+        return cmp("akamai", live, want)
+
+    #: The names peet prints, by the id it should have printed.
+    named = {"HEADER_TABLE_SIZE": 1, "ENABLE_PUSH": 2,
+             "MAX_CONCURRENT_STREAMS": 3, "INITIAL_WINDOW_SIZE": 4,
+             "MAX_FRAME_SIZE": 5, "MAX_HEADER_LIST_SIZE": 6,
+             "ENABLE_CONNECT_PROTOCOL": 8, "NO_RFC7540_PRIORITIES": 9}
+    ids = [named.get(str(s).split("=")[0].strip())
+           for frame in got["http2"].get("sent_frames", [])
+           if frame.get("frame_type") == "SETTINGS"
+           for s in frame.get("settings", [])]
+
+    fields = live.split("|")
+    entries = fields[0].split(";") if fields[0] else []
+    if len(ids) == len(entries) and None not in ids:
+        repaired = ";".join(
+            f"{i}:{e.split(':', 1)[1]}" if e.startswith(":") else e
+            for i, e in zip(ids, entries))
+        fields[0] = repaired
+        if "|".join(fields) == want:
+            print(f"  {'akamai':<26} OK (peet printed "
+                  + ", ".join(f"id {i}" for i, e in zip(ids, entries)
+                              if e.startswith(":"))
+                  + " with an empty id;\n"
+                  + " " * 30 + "its own parse of the frame is right)")
+            return True
+
+    return cmp("akamai", live, want)
+
+
 def captured_fingerprints(brand: str) -> tuple[dict, str]:
     """Every fingerprint of the stored capture, computed here from its bytes.
 
@@ -117,19 +166,37 @@ def outside_view(brand: str, want_tls: dict, want_akamai: str) -> bool:
     try:
         with httpx.Client(transport=fp.Transport(brand), timeout=25) as client:
             got = client.get(PEET_URL).json()
-    except Exception as exc:                           # noqa: BLE001
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        # The remote, not our ClientHello, failed to answer - skip. A client we
+        # broke can surface here too (a torn-down handshake raises ConnectError),
+        # but reachable() drives the same handshake against real hosts and is the
+        # check meant to catch that; skipping here only forgives an unreachable
+        # third party. (--skip-reach removes that net, so a broken TLS half is
+        # then unguarded - run without it to trust a green result.)
         print(f"  (skipped: {type(exc).__name__}: {exc})")
         return True
+    except Exception as exc:                           # noqa: BLE001
+        # A protocol error mid-exchange or a non-JSON body is a real failure of
+        # this check, not a reason to pass it.
+        print(f"  FAILED  {type(exc).__name__}: {str(exc)[:80]}")
+        return False
 
-    ok = cmp("ja4", got["tls"]["ja4"], want_tls["ja4"])
-    for i, part in enumerate(("ciphers", "extensions", "sigalgs"), start=1):
-        ok &= cmp(f"ja4_r {part}",
-                  got["tls"]["ja4_r"].split("_")[i],
-                  want_tls["ja4_r"].split("_")[i])
-    ok &= cmp("peetprint_hash", got["tls"]["peetprint_hash"],
-              want_tls["peetprint_hash"])
-    ok &= cmp("akamai", got["http2"]["akamai_fingerprint"], want_akamai)
-    ok &= _ja3(got["tls"]["ja3"], got["tls"]["ja3_hash"], want_tls, "peet")
+    try:
+        ok = cmp("ja4", got["tls"]["ja4"], want_tls["ja4"])
+        for i, part in enumerate(("ciphers", "extensions", "sigalgs"), start=1):
+            ok &= cmp(f"ja4_r {part}",
+                      got["tls"]["ja4_r"].split("_")[i],
+                      want_tls["ja4_r"].split("_")[i])
+        ok &= cmp("peetprint_hash", got["tls"]["peetprint_hash"],
+                  want_tls["peetprint_hash"])
+        ok &= cmp_akamai(got, want_akamai)
+        ok &= _ja3(got["tls"]["ja3"], got["tls"]["ja3_hash"], want_tls, "peet")
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        # A field peet always returns is missing or malformed - report it rather
+        # than let it abort the whole run partway through.
+        print(f"  FAILED  peet response missing/garbled a field: "
+              f"{type(exc).__name__}: {exc}")
+        return False
     return ok
 
 
@@ -139,10 +206,18 @@ def check_ja3_zone(brand: str, want_tls: dict) -> bool:
     try:
         with httpx.Client(transport=fp.Transport(brand), timeout=25) as client:
             got = client.get(JA3_URL).json()
-    except Exception as exc:                           # noqa: BLE001
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
         print(f"  (skipped: {type(exc).__name__}: {exc})")
         return True
-    return _ja3(got["fingerprint"], got.get("hash"), want_tls, "ja3.zone")
+    except Exception as exc:                           # noqa: BLE001
+        print(f"  FAILED  {type(exc).__name__}: {str(exc)[:80]}")
+        return False
+    try:
+        return _ja3(got["fingerprint"], got.get("hash"), want_tls, "ja3.zone")
+    except (KeyError, IndexError, TypeError, ValueError) as exc:
+        print(f"  FAILED  ja3.zone response missing/garbled a field: "
+              f"{type(exc).__name__}: {exc}")
+        return False
 
 
 def _ja3(fingerprint: str, digest: str | None, want_tls: dict, who: str) -> bool:

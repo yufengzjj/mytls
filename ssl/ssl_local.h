@@ -759,9 +759,10 @@ typedef enum ssl_grease_index_en {
 /*
  * "This profile is upstream OpenSSL, not a browser." Only the `stock` profile
  * sets it, and it exists because a few of this fork's changes are not additions
- * that a flag can switch off but *replacements* of an upstream rule - the
- * ClientHello padding threshold, and not padding the second ClientHello. A
- * profile with no lists of its own needs the rule that was there before.
+ * that a flag can switch off but *replacements* of an upstream rule - not
+ * padding the second ClientHello, truncating a copied sigalg list, letting
+ * every signature algorithm past the security policy. A profile with no lists
+ * of its own needs the rules that were there before.
  *
  * It is what makes `make test` mean something: upstream's own tests assert the
  * exact shape of a ClientHello, which every browser profile here deliberately

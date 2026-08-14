@@ -46,10 +46,23 @@ indir "rehash.$$" => sub {
     prepare();
     chmod 0500, curdir();
   SKIP: {
-      if (open(FOO, ">unwritable.txt")) {
-          close FOO;
-          skip "It's pointless to run the next test as root", 1;
+      #A read-only directory is not something every platform can be asked for.
+      #Running as root makes the mode irrelevant, and a WSL v9fs mount ignores
+      #the change outright - the directory still stats as 0777 afterwards. In
+      #both cases there is nothing here for rehash to fail against, so say why
+      #rather than report a failure that is about the filesystem.
+      my $mode = (stat(curdir()))[2] & 07777;
+      my $writable = ($mode & 0222) != 0;
+      if (!$writable && open(my $probe, ">", "unwritable.txt")) {
+          close $probe;
+          unlink "unwritable.txt";
+          $writable = 1;
       }
+      skip sprintf("no read-only directory to test with - chmod 0500 left it "
+                   ."%04o and writable; running as root, or a filesystem that "
+                   ."ignores the mode", $mode), 1
+          if $writable;
+
       isnt(run(app(["openssl", "rehash", curdir()])), 1,
            'Testing rehash operations on readonly directory');
     }

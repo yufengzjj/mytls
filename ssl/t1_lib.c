@@ -193,8 +193,8 @@ static const struct {
 
 static const unsigned char ecformats_default[] = {
     TLSEXT_ECPOINTFORMAT_uncompressed,
-//    TLSEXT_ECPOINTFORMAT_ansiX962_compressed_prime,
-//    TLSEXT_ECPOINTFORMAT_ansiX962_compressed_char2
+    TLSEXT_ECPOINTFORMAT_ansiX962_compressed_prime,
+    TLSEXT_ECPOINTFORMAT_ansiX962_compressed_char2
 };
 
 /*
@@ -202,12 +202,11 @@ static const unsigned char ecformats_default[] = {
  * supported_groups extension is part of the fingerprint we are matching.
  */
 static const uint16_t supported_groups_default[] = {
-    OSSL_TLS_GROUP_ID_X25519MLKEM768, /* X25519MLKEM768 (0x11ec) */
     OSSL_TLS_GROUP_ID_x25519,        /* X25519 (29) */
     OSSL_TLS_GROUP_ID_secp256r1,     /* secp256r1 (23) */
     OSSL_TLS_GROUP_ID_x448,          /* X448 (30) */
-    OSSL_TLS_GROUP_ID_secp384r1,     /* secp384r1 (24) */
     OSSL_TLS_GROUP_ID_secp521r1,     /* secp521r1 (25) */
+    OSSL_TLS_GROUP_ID_secp384r1,     /* secp384r1 (24) */
     OSSL_TLS_GROUP_ID_gc256A,        /* GC256A (34) */
     OSSL_TLS_GROUP_ID_gc256B,        /* GC256B (35) */
     OSSL_TLS_GROUP_ID_gc256C,        /* GC256C (36) */
@@ -1196,6 +1195,15 @@ void tls1_get_formatlist(SSL_CONNECTION *s, const unsigned char **pformats,
         /* For Suite B we don't support char2 fields */
         if (tls1_suiteb(s))
             *num_formats = sizeof(ecformats_default) - 1;
+        else if ((ossl_ssl_fp(s)->flags & SSL_FP_STOCK) == 0)
+            /*
+             * Every browser here advertises uncompressed and nothing else, so
+             * a profile stops the list at one entry. Truncating the array
+             * itself instead - which is what this used to do - also emptied
+             * the Suite B list, since that one is defined as "all but the last
+             * entry", and left nothing able to read a compressed point.
+             */
+            *num_formats = 1;
         else
             *num_formats = sizeof(ecformats_default);
     }
@@ -1337,32 +1345,34 @@ int tls1_check_ec_tmp_key(SSL_CONNECTION *s, unsigned long cid)
 /* Default sigalg schemes */
 static const uint16_t tls12_sigalgs[] = {
     TLSEXT_SIGALG_ecdsa_secp256r1_sha256,
-    TLSEXT_SIGALG_rsa_pss_rsae_sha256,
-    TLSEXT_SIGALG_rsa_pkcs1_sha256,
-
     TLSEXT_SIGALG_ecdsa_secp384r1_sha384,
-    TLSEXT_SIGALG_ecdsa_sha1,
-    TLSEXT_SIGALG_rsa_pss_rsae_sha384,
-    TLSEXT_SIGALG_rsa_pss_rsae_sha384,
-    TLSEXT_SIGALG_rsa_pkcs1_sha384,
-
-    TLSEXT_SIGALG_rsa_pss_rsae_sha512,
-    TLSEXT_SIGALG_rsa_pkcs1_sha512,
-    TLSEXT_SIGALG_rsa_pkcs1_sha1,
-
     TLSEXT_SIGALG_ecdsa_secp521r1_sha512,
     TLSEXT_SIGALG_ed25519,
     TLSEXT_SIGALG_ed448,
     TLSEXT_SIGALG_ecdsa_brainpoolP256r1_sha256,
     TLSEXT_SIGALG_ecdsa_brainpoolP384r1_sha384,
     TLSEXT_SIGALG_ecdsa_brainpoolP512r1_sha512,
+
     TLSEXT_SIGALG_rsa_pss_pss_sha256,
     TLSEXT_SIGALG_rsa_pss_pss_sha384,
     TLSEXT_SIGALG_rsa_pss_pss_sha512,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha256,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha384,
+    TLSEXT_SIGALG_rsa_pss_rsae_sha512,
+
+    TLSEXT_SIGALG_rsa_pkcs1_sha256,
+    TLSEXT_SIGALG_rsa_pkcs1_sha384,
+    TLSEXT_SIGALG_rsa_pkcs1_sha512,
+
     TLSEXT_SIGALG_ecdsa_sha224,
+    TLSEXT_SIGALG_ecdsa_sha1,
+
     TLSEXT_SIGALG_rsa_pkcs1_sha224,
+    TLSEXT_SIGALG_rsa_pkcs1_sha1,
+
     TLSEXT_SIGALG_dsa_sha224,
     TLSEXT_SIGALG_dsa_sha1,
+
     TLSEXT_SIGALG_dsa_sha256,
     TLSEXT_SIGALG_dsa_sha384,
     TLSEXT_SIGALG_dsa_sha512,
@@ -1386,36 +1396,9 @@ static const SIGALG_LOOKUP sigalg_lookup_tbl[] = {
     {TLSEXT_SIGALG_ecdsa_secp256r1_sha256_name, TLSEXT_SIGALG_ecdsa_secp256r1_sha256,
      NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
      NID_ecdsa_with_SHA256, NID_X9_62_prime256v1, 1},
-    {TLSEXT_SIGALG_rsa_pss_rsae_sha256_name, TLSEXT_SIGALG_rsa_pss_rsae_sha256,
-     NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA,
-     NID_undef, NID_undef, 1},
-    {TLSEXT_SIGALG_rsa_pkcs1_sha256_name, TLSEXT_SIGALG_rsa_pkcs1_sha256,
-     NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
-     NID_sha256WithRSAEncryption, NID_undef, 1},
     {TLSEXT_SIGALG_ecdsa_secp384r1_sha384_name, TLSEXT_SIGALG_ecdsa_secp384r1_sha384,
      NID_sha384, SSL_MD_SHA384_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
      NID_ecdsa_with_SHA384, NID_secp384r1, 1},
-    {TLSEXT_SIGALG_ecdsa_sha1_name, TLSEXT_SIGALG_ecdsa_sha1,
-     NID_sha1, SSL_MD_SHA1_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
-     NID_ecdsa_with_SHA1, NID_undef, 1},
-    {TLSEXT_SIGALG_rsa_pss_rsae_sha384_name, TLSEXT_SIGALG_rsa_pss_rsae_sha384,
-     NID_sha384, SSL_MD_SHA384_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA,
-     NID_undef, NID_undef, 1},
-    {TLSEXT_SIGALG_rsa_pss_rsae_sha384_name, TLSEXT_SIGALG_rsa_pss_rsae_sha384,
-     NID_sha384, SSL_MD_SHA384_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA,
-     NID_undef, NID_undef, 1},
-    {TLSEXT_SIGALG_rsa_pkcs1_sha384_name, TLSEXT_SIGALG_rsa_pkcs1_sha384,
-     NID_sha384, SSL_MD_SHA384_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
-     NID_sha384WithRSAEncryption, NID_undef, 1},
-    {TLSEXT_SIGALG_rsa_pss_rsae_sha512_name, TLSEXT_SIGALG_rsa_pss_rsae_sha512,
-     NID_sha512, SSL_MD_SHA512_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA,
-     NID_undef, NID_undef, 1},
-    {TLSEXT_SIGALG_rsa_pkcs1_sha512_name, TLSEXT_SIGALG_rsa_pkcs1_sha512,
-     NID_sha512, SSL_MD_SHA512_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
-     NID_sha512WithRSAEncryption, NID_undef, 1},
-    {TLSEXT_SIGALG_rsa_pkcs1_sha1_name, TLSEXT_SIGALG_rsa_pkcs1_sha1,
-     NID_sha1, SSL_MD_SHA1_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
-     NID_sha1WithRSAEncryption, NID_undef, 1},
     {TLSEXT_SIGALG_ecdsa_secp521r1_sha512_name, TLSEXT_SIGALG_ecdsa_secp521r1_sha512,
      NID_sha512, SSL_MD_SHA512_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
      NID_ecdsa_with_SHA512, NID_secp521r1, 1},
@@ -1425,6 +1408,12 @@ static const SIGALG_LOOKUP sigalg_lookup_tbl[] = {
     {TLSEXT_SIGALG_ed448_name, TLSEXT_SIGALG_ed448,
      NID_undef, -1, EVP_PKEY_ED448, SSL_PKEY_ED448,
      NID_undef, NID_undef, 1},
+    {TLSEXT_SIGALG_ecdsa_sha224_name, TLSEXT_SIGALG_ecdsa_sha224,
+     NID_sha224, SSL_MD_SHA224_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
+     NID_ecdsa_with_SHA224, NID_undef, 1},
+    {TLSEXT_SIGALG_ecdsa_sha1_name, TLSEXT_SIGALG_ecdsa_sha1,
+     NID_sha1, SSL_MD_SHA1_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
+     NID_ecdsa_with_SHA1, NID_undef, 1},
     {TLSEXT_SIGALG_ecdsa_brainpoolP256r1_sha256_name, TLSEXT_SIGALG_ecdsa_brainpoolP256r1_sha256,
      NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
      NID_ecdsa_with_SHA256, NID_brainpoolP256r1, 1},
@@ -1434,6 +1423,15 @@ static const SIGALG_LOOKUP sigalg_lookup_tbl[] = {
     {TLSEXT_SIGALG_ecdsa_brainpoolP512r1_sha512_name, TLSEXT_SIGALG_ecdsa_brainpoolP512r1_sha512,
      NID_sha512, SSL_MD_SHA512_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
      NID_ecdsa_with_SHA512, NID_brainpoolP512r1, 1},
+    {TLSEXT_SIGALG_rsa_pss_rsae_sha256_name, TLSEXT_SIGALG_rsa_pss_rsae_sha256,
+     NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA,
+     NID_undef, NID_undef, 1},
+    {TLSEXT_SIGALG_rsa_pss_rsae_sha384_name, TLSEXT_SIGALG_rsa_pss_rsae_sha384,
+     NID_sha384, SSL_MD_SHA384_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA,
+     NID_undef, NID_undef, 1},
+    {TLSEXT_SIGALG_rsa_pss_rsae_sha512_name, TLSEXT_SIGALG_rsa_pss_rsae_sha512,
+     NID_sha512, SSL_MD_SHA512_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA,
+     NID_undef, NID_undef, 1},
     {TLSEXT_SIGALG_rsa_pss_pss_sha256_name, TLSEXT_SIGALG_rsa_pss_pss_sha256,
      NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA_PSS_SIGN,
      NID_undef, NID_undef, 1},
@@ -1443,18 +1441,21 @@ static const SIGALG_LOOKUP sigalg_lookup_tbl[] = {
     {TLSEXT_SIGALG_rsa_pss_pss_sha512_name, TLSEXT_SIGALG_rsa_pss_pss_sha512,
      NID_sha512, SSL_MD_SHA512_IDX, EVP_PKEY_RSA_PSS, SSL_PKEY_RSA_PSS_SIGN,
      NID_undef, NID_undef, 1},
-    {TLSEXT_SIGALG_ecdsa_sha224_name, TLSEXT_SIGALG_ecdsa_sha224,
-     NID_sha224, SSL_MD_SHA224_IDX, EVP_PKEY_EC, SSL_PKEY_ECC,
-     NID_ecdsa_with_SHA224, NID_undef, 1},
+    {TLSEXT_SIGALG_rsa_pkcs1_sha256_name, TLSEXT_SIGALG_rsa_pkcs1_sha256,
+     NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
+     NID_sha256WithRSAEncryption, NID_undef, 1},
+    {TLSEXT_SIGALG_rsa_pkcs1_sha384_name, TLSEXT_SIGALG_rsa_pkcs1_sha384,
+     NID_sha384, SSL_MD_SHA384_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
+     NID_sha384WithRSAEncryption, NID_undef, 1},
+    {TLSEXT_SIGALG_rsa_pkcs1_sha512_name, TLSEXT_SIGALG_rsa_pkcs1_sha512,
+     NID_sha512, SSL_MD_SHA512_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
+     NID_sha512WithRSAEncryption, NID_undef, 1},
     {TLSEXT_SIGALG_rsa_pkcs1_sha224_name, TLSEXT_SIGALG_rsa_pkcs1_sha224,
      NID_sha224, SSL_MD_SHA224_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
      NID_sha224WithRSAEncryption, NID_undef, 1},
-    {TLSEXT_SIGALG_dsa_sha224_name, TLSEXT_SIGALG_dsa_sha224,
-     NID_sha224, SSL_MD_SHA224_IDX, EVP_PKEY_DSA, SSL_PKEY_DSA_SIGN,
-     NID_undef, NID_undef, 1},
-    {TLSEXT_SIGALG_dsa_sha1_name, TLSEXT_SIGALG_dsa_sha1,
-     NID_sha1, SSL_MD_SHA1_IDX, EVP_PKEY_DSA, SSL_PKEY_DSA_SIGN,
-     NID_dsaWithSHA1, NID_undef, 1},
+    {TLSEXT_SIGALG_rsa_pkcs1_sha1_name, TLSEXT_SIGALG_rsa_pkcs1_sha1,
+     NID_sha1, SSL_MD_SHA1_IDX, EVP_PKEY_RSA, SSL_PKEY_RSA,
+     NID_sha1WithRSAEncryption, NID_undef, 1},
     {TLSEXT_SIGALG_dsa_sha256_name, TLSEXT_SIGALG_dsa_sha256,
      NID_sha256, SSL_MD_SHA256_IDX, EVP_PKEY_DSA, SSL_PKEY_DSA_SIGN,
      NID_dsa_with_SHA256, NID_undef, 1},
@@ -1464,6 +1465,12 @@ static const SIGALG_LOOKUP sigalg_lookup_tbl[] = {
     {TLSEXT_SIGALG_dsa_sha512_name, TLSEXT_SIGALG_dsa_sha512,
      NID_sha512, SSL_MD_SHA512_IDX, EVP_PKEY_DSA, SSL_PKEY_DSA_SIGN,
      NID_undef, NID_undef, 1},
+    {TLSEXT_SIGALG_dsa_sha224_name, TLSEXT_SIGALG_dsa_sha224,
+     NID_sha224, SSL_MD_SHA224_IDX, EVP_PKEY_DSA, SSL_PKEY_DSA_SIGN,
+     NID_undef, NID_undef, 1},
+    {TLSEXT_SIGALG_dsa_sha1_name, TLSEXT_SIGALG_dsa_sha1,
+     NID_sha1, SSL_MD_SHA1_IDX, EVP_PKEY_DSA, SSL_PKEY_DSA_SIGN,
+     NID_dsaWithSHA1, NID_undef, 1},
 #ifndef OPENSSL_NO_GOST
     {TLSEXT_SIGALG_gostr34102012_256_intrinsic_name, TLSEXT_SIGALG_gostr34102012_256_intrinsic,
      NID_id_GostR3411_2012_256, SSL_MD_GOST12_256_IDX,
@@ -2582,7 +2589,23 @@ SSL_TICKET_STATUS tls_decrypt_ticket(SSL_CONNECTION *s,
 static int tls12_sigalg_allowed(const SSL_CONNECTION *s, int op,
                                 const SIGALG_LOOKUP *lu)
 {
-    return 1;
+    /*
+     * A browser profile advertises what the browser advertises, including
+     * algorithms this build would not choose for itself - iOS lists
+     * rsa_pkcs1_sha1, Chrome lists three ML-DSA codepoints - so the security
+     * policy that would drop them has to stand aside, or the list on the wire
+     * stops being the captured one.
+     *
+     * That is now only true of the *acceptance* side: the ClientHello's list
+     * comes from the profile and is written verbatim without passing through
+     * here at all (tls_construct_ctos_sig_algs()), so what this still governs
+     * is which algorithm we will let a server pick and verify with. Blanket
+     * approval there is wider than the fingerprint needs; narrowing it is a
+     * separate decision from making the tests mean something, which is all
+     * this gate does.
+     */
+    if ((ossl_ssl_fp(s)->flags & SSL_FP_STOCK) == 0)
+        return 1;
     unsigned char sigalgstr[2];
     int secbits;
 
@@ -2696,7 +2719,15 @@ int tls12_copy_sigalgs(SSL_CONNECTION *s, WPACKET *pkt,
 
     for (i = 0; i < psiglen; i++, psig++) {
         const SIGALG_LOOKUP *lu = tls1_lookup_sigalg(s, *psig);
-        if(*psig==0x0603)
+
+        /*
+         * Truncate at ecdsa_secp521r1_sha512, which is where the browser list
+         * this used to produce ended. Nothing reaches the wire through here
+         * any more for a ClientHello - the profile's list is written verbatim -
+         * so this now only shortens a server's CertificateRequest, and under
+         * `stock` it must not happen at all.
+         */
+        if (*psig == 0x0603 && (ossl_ssl_fp(s)->flags & SSL_FP_STOCK) == 0)
             break;
         if (lu == NULL
                 || !tls12_sigalg_allowed(s, SSL_SECOP_SIGALG_SUPPORTED, lu))

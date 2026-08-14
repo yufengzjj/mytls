@@ -468,6 +468,40 @@ unsigned int ossl_get_extension_type(size_t idx)
     return ext_defs[idx].type;
 }
 
+/*
+ * ext_defs in the order upstream declares it, as indices into ours.
+ *
+ * The table above is in the order a browser puts its extensions on the wire,
+ * because for a profile that does not shuffle - every iOS one - that order *is*
+ * the fingerprint. The `stock` profile is not imitating anybody and has to be
+ * upstream, right down to this: its ClientHello's extension order is what
+ * upstream's own tests read back and compare against.
+ *
+ * Kept as a permutation rather than a second table so that there is still only
+ * one place an extension is defined. `application_settings` and
+ * `encrypted_client_hello` do not exist upstream and are never sent under
+ * `stock`; they sit where this fork puts them, just before padding. padding and
+ * psk stay last in both orders, which the construction loop relies on.
+ */
+static const unsigned char stock_ext_order[TLSEXT_IDX_num_builtins] = {
+    TLSEXT_IDX_renegotiate, TLSEXT_IDX_server_name,
+    TLSEXT_IDX_max_fragment_length, TLSEXT_IDX_srp,
+    TLSEXT_IDX_ec_point_formats, TLSEXT_IDX_supported_groups,
+    TLSEXT_IDX_session_ticket, TLSEXT_IDX_status_request,
+    TLSEXT_IDX_next_proto_neg, TLSEXT_IDX_application_layer_protocol_negotiation,
+    TLSEXT_IDX_use_srtp, TLSEXT_IDX_encrypt_then_mac,
+    TLSEXT_IDX_signed_certificate_timestamp, TLSEXT_IDX_extended_master_secret,
+    TLSEXT_IDX_signature_algorithms_cert, TLSEXT_IDX_post_handshake_auth,
+    TLSEXT_IDX_client_cert_type, TLSEXT_IDX_server_cert_type,
+    TLSEXT_IDX_signature_algorithms, TLSEXT_IDX_supported_versions,
+    TLSEXT_IDX_psk_kex_modes, TLSEXT_IDX_key_share,
+    TLSEXT_IDX_cookie, TLSEXT_IDX_cryptopro_bug,
+    TLSEXT_IDX_compress_certificate, TLSEXT_IDX_early_data,
+    TLSEXT_IDX_certificate_authorities, TLSEXT_IDX_application_settings,
+    TLSEXT_IDX_encrypted_client_hello, TLSEXT_IDX_padding,
+    TLSEXT_IDX_psk
+};
+
 /* Check whether an extension's context matches the current context */
 static int validate_context(SSL_CONNECTION *s, unsigned int extctx,
                             unsigned int thisctx)
@@ -880,7 +914,7 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
     int min_version, max_version = 0, reason;
     const EXTENSION_DEFINITION *thisexd;
     int for_comp = (context & SSL_EXT_TLS1_3_CERTIFICATE_COMPRESSION) != 0;
-    int grease = 0, shuffled = 0;
+    int grease = 0, shuffled = 0, stock = 0;
 
     if (!WPACKET_start_sub_packet_u16(pkt)
                /*
@@ -922,6 +956,11 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
      */
     grease = (context & SSL_EXT_CLIENT_HELLO) != 0 && !s->server
              && (ossl_ssl_fp(s)->flags & SSL_FP_GREASE) != 0;
+    /*
+     * Not restricted to a ClientHello: `stock` means upstream, and upstream
+     * writes every message's extensions in that one table order.
+     */
+    stock = (ossl_ssl_fp(s)->flags & SSL_FP_STOCK) != 0;
 
     if (grease) {
         /* The first GREASE extension is empty and always comes first. */
@@ -952,7 +991,9 @@ int tls_construct_extensions(SSL_CONNECTION *s, WPACKET *pkt,
         EXT_RETURN ret;
         size_t idx = i;
 
-        if (shuffled && i < TLSEXT_IDX_padding)
+        if (stock)
+            idx = stock_ext_order[i];
+        else if (shuffled && i < TLSEXT_IDX_padding)
             idx = s->ext_permutation[i];
 
         if (grease && i == TLSEXT_IDX_padding) {

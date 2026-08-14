@@ -1052,8 +1052,6 @@ EXT_RETURN tls_construct_ctos_early_data(SSL_CONNECTION *s, WPACKET *pkt,
 }
 
 #define F5_WORKAROUND_MIN_MSG_LEN   0xff
-/* What upstream uses, kept for the `stock` profile. */
-#define F5_WORKAROUND_UPSTREAM_MIN  0x20
 #define F5_WORKAROUND_MAX_MSG_LEN   0x200
 
 /*
@@ -1129,9 +1127,7 @@ EXT_RETURN tls_construct_ctos_padding(SSL_CONNECTION *s, WPACKET *pkt,
         }
     }
 
-    if (hlen > ((ossl_ssl_fp(s)->flags & SSL_FP_STOCK) != 0
-               ? F5_WORKAROUND_UPSTREAM_MIN : F5_WORKAROUND_MIN_MSG_LEN)
-            && hlen < F5_WORKAROUND_MAX_MSG_LEN) {
+    if (hlen > F5_WORKAROUND_MIN_MSG_LEN && hlen < F5_WORKAROUND_MAX_MSG_LEN) {
         /* Calculate the amount of padding we need to add */
         hlen = F5_WORKAROUND_MAX_MSG_LEN - hlen;
 
@@ -2071,7 +2067,6 @@ int tls_parse_stoc_alpn(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
             break;
         }
     }
-    valid = 1;
     if (!valid) {
         /* The protocol sent from the server does not match one we advertised */
         SSLfatal(s, SSL_AD_DECODE_ERROR, SSL_R_BAD_EXTENSION);
