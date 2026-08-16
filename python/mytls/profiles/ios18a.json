@@ -192,6 +192,7 @@
     ]
   },
   "meta": {
-    "tls_profile": "ios16"
+    "tls_profile": "ios16",
+    "compitable":["18.0","18.1"]
   }
 }

@@ -23,7 +23,6 @@ from __future__ import annotations
 import _ssl
 import ctypes
 import ssl
-import typing
 
 
 class Unavailable(RuntimeError):

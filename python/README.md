@@ -149,6 +149,16 @@ chrome  (Chrome 150 on Windows)
 
 Same from the command line: `mytls-probe list`, `python -m mytls`.
 
+`mytls-probe list` shows the browser profiles installed in `profiles/` — the JSON
+files this Python package derives everything from. `mytls-probe list --tls` instead
+asks the fork's libssl which fingerprint profiles the **TLS C layer** has built in
+(`chrome`, `chrome_android`, `ios18`, `ios16`, `ios26`, `stock`), marking the one a
+fresh context defaults to. The two lists are separate on purpose: a browser profile
+names a TLS profile to drive, but the TLS layer's set is fixed in
+`ssl/ssl_fp_profile.c` and asked of the library itself, so `--tls` is also the quick
+check for whether the running CPython is linked against the fork at all — a stock
+build reports `tls c layer: unavailable`.
+
 The same content is available as a dict in `fp.profile("chrome").meta` (`brand`, `label`,
 `browser`, `version`, `platform`, `user_agent`, `sec_ch_ua`, `hpack`, `tls_profile`,
 `akamai_fingerprint`, `akamai_hash`, `source`, `captured_at`, …).

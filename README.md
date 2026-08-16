@@ -60,7 +60,9 @@ mytls = mytls_sect
 FingerprintProfile = ios18
 ```
 
-An unknown name is an error, not a silent fallback.
+An unknown name is an error, not a silent fallback. To see the built-in list itself —
+the same names `SSL_fp_profile_name()` walks, asked of the library rather than
+hard-coded — run `mytls-probe list --tls`.
 
 ### One switch a profile does not get the last word on
 

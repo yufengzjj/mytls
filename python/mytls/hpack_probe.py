@@ -3715,8 +3715,29 @@ def hrr(args: argparse.Namespace) -> int:
     return 0 if all(rc == 0 for rc in results.values()) else 1
 
 
-def list_profiles(_args: argparse.Namespace) -> int:
+def list_profiles(args: argparse.Namespace) -> int:
     from . import browser_fp
+    if getattr(args, "tls", False):
+        import ssl as _ssl
+
+        from . import tls_profile
+        try:
+            names = tls_profile.available()
+        except tls_profile.Unavailable as exc:
+            print(f"tls c layer: unavailable ({exc})")
+            return 1
+        #: The default is whatever a fresh context reports before we touch it;
+        #: read it back rather than assume, and mark it in the listing.
+        default = None
+        try:
+            default = tls_profile.get_profile(_ssl.SSLContext(_ssl.PROTOCOL_TLS_CLIENT))
+        except tls_profile.Unavailable:
+            pass
+        print(f"{len(names)} profile(s) built into the TLS layer "
+              f"({_ssl.OPENSSL_VERSION}):")
+        for name in names:
+            print(f"  {name}{'  (default)' if name == default else ''}")
+        return 0
     print(browser_fp.catalog())
     return 0
 
@@ -3902,6 +3923,9 @@ def main() -> int:
     hr.set_defaults(func=hrr)
 
     ls = sub.add_parser("list", help="what browser_fp currently offers")
+    ls.add_argument("--tls", action="store_true",
+                    help="instead list the fingerprint profiles built into the "
+                         "TLS C layer, asked of the fork's libssl itself")
     ls.set_defaults(func=list_profiles)
 
     d = sub.add_parser("diff", help="compare two captures byte by byte")

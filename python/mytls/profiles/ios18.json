@@ -234,5 +234,8 @@
         "gzip, deflate, br"
       ]
     ]
+  },
+  "meta": {
+    "compitable":["18.4","18.7"]
   }
 }
