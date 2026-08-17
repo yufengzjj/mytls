@@ -242,6 +242,64 @@ Practical consequence: a stored profile reproduces any app on that OS version on
 supply these two. Getting them is one capture of the app you actually want — see
 [capturing from a real site](#capturing-from-a-real-site-instead-mitmproxy).
 
+#### Reproducing a captured request to the byte: `send_exact` + `raw_headers`
+
+The defaults above make the *fingerprint* (TLS, SETTINGS, pseudo-header order, HPACK rules)
+match — which is all a fingerprinter looks at, and all most callers need. Matching the whole
+HEADERS block of one recorded request byte-for-byte is a stricter bar, and two httpx habits
+get in the way:
+
+* httpx keeps its own client-default headers (`accept`, `accept-encoding`, `connection`,
+  `user-agent`) at the **front**, and appends the auto `content-length` at the **end** — so
+  a plain `client.post(url, headers=[...])` will not emit your list in your order.
+* `_build_headers` drops any request header whose `(name, value)` equals an httpx default,
+  so an explicit `accept: */*` (byte-identical to httpx's) is stripped no matter how you
+  pass it.
+
+Two knobs handle both:
+
+```python
+import mytls
+
+# raw_headers=True: keep every request header verbatim - do NOT drop the ones whose value
+# matches an httpx default. Only safe when you own the whole list (send_exact, below),
+# because otherwise httpx's own `user-agent: python-httpx` would survive too.
+transport = mytls.AsyncTransport("ios16", raw_headers=True)
+
+async with httpx.AsyncClient(transport=transport, timeout=30) as client:
+    # send_exact: build the request, then replace its headers with yours, verbatim and in
+    # order. auth/follow_redirects/stream go to send(); everything else (content/data/json/
+    # params/cookies/timeout/...) to build_request().
+    r = await mytls.send_exact(client, "POST", "https://v.whatsapp.net/v2/exist",
+        headers=[
+            ("accept", "*/*"),                                # kept, thanks to raw_headers
+            ("content-type", "application/x-www-form-urlencoded"),
+            ("content-length", str(len(body))),              # explicit, so it keeps its place
+            ("accept-language", "zh-CN,zh-Hans;q=0.9"),
+            ("user-agent", "WhatsApp/2.26.30.78 iOS/16.7.12 Device/iPhone_8_Plus"),
+            ("authorization", token),
+            ("accept-encoding", "gzip, deflate, br"),
+        ],
+        content=body)                                         # `content=` pins the body bytes
+```
+
+Because the list is taken literally, it is wholly yours: include `content-type` and an
+explicit `content-length` (replacing the headers discards the ones httpx computed from the
+body), and use `content=` rather than `data=`/`json=` so the body bytes — and therefore the
+length — are what you say. `:authority` comes from a `host` header if you give one, otherwise
+from the request URL; pass `host` explicitly only when the connection target and the authority
+differ (dialing an IP or a local test server while presenting a hostname).
+
+`send_exact` is async (it awaits `client.send`) and works through a proxy unchanged — an HTTP
+`CONNECT` or a `socks5://` tunnel carries the TLS and HTTP/2 end to end, so the bytes that
+reach the origin are identical with or without one. Verified against a recorded WhatsApp
+request: the HEADERS frame `send_exact` puts on the wire is byte-for-byte the capture's, over
+a direct connection and through both proxy kinds.
+
+`raw_headers` without `send_exact` is a foot-gun: a plain `client.post()` would then leak
+httpx's `user-agent: python-httpx/...` and `accept: */*`, because nothing strips them any
+more. The two are meant to be used together.
+
 ---
 
 ## Prerequisites
