@@ -54,6 +54,7 @@ from .browser_fp import (
     describe,
     profile,
     reload,
+    send_exact,
     transport,
 )
 
@@ -63,6 +64,7 @@ __all__ = [
     "DEFAULT_BRAND", "PROFILES", "PROFILES_DIR",
     "AsyncTransport", "Profile", "Transport", "async_transport", "brand_for",
     "brands", "catalog", "describe", "profile", "reload", "transport",
+    "send_exact",
     "fingerprints", "tls_profile", "check", "tls_profiles", "addon_path",
     "__version__",
 ]

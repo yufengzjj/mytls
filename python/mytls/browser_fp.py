@@ -108,6 +108,7 @@ from . import tls_profile
 
 __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
            "Transport", "AsyncTransport", "transport", "async_transport",
+           "send_exact",
            "profile", "brands", "brand_for", "system_of", "reload", "describe",
            "catalog", "tls_profile"]
 
@@ -573,6 +574,16 @@ class Profile:
         #: what selftest does and the only way the HPACK bytes can match it.
         self.default_headers: list[tuple[bytes, bytes]] = []
 
+        #: When True, `_build_headers` keeps every request header verbatim
+        #: instead of dropping the ones whose (name, value) equals an httpx
+        #: auto-default. Only safe when the caller has taken full control of the
+        #: header list - e.g. after overwriting `request.headers` - because
+        #: otherwise httpx's own `user-agent: python-httpx` etc. would survive.
+        #: It exists so an explicit `accept: */*` (indistinguishable from
+        #: httpx's default by value) can be sent at the position the caller put
+        #: it, which the value-strip otherwise makes impossible.
+        self.raw_headers: bool = False
+
         #: Whether the ClientHello offers an empty session_ticket extension,
         #: overriding the OpenSSL profile. `FROM_CAPTURE` leaves the profile's
         #: own answer alone; True and False pin it.
@@ -853,12 +864,28 @@ def _build_headers(prof: Profile, request: typing.Any) -> list[tuple[bytes, byte
     httpx layers client-level and request-level headers.  To reproduce the
     captured client exactly, pass `profile.headers`, which is that order.
     """
-    authority = [v for k, v in request.headers if k.lower() == b"host"][0]
+    # :authority comes from the host header when there is one - httpx/httpcore
+    # put it there from the URL. A caller who has replaced the whole header list
+    # (send_exact) may have left it out, so fall back to the request URL; still
+    # pass host explicitly when the connection target and the authority differ
+    # (e.g. dialing an IP but presenting a hostname).
+    host = [v for k, v in request.headers if k.lower() == b"host"]
+    if host:
+        authority = host[0]
+    else:
+        u = request.url
+        default_port = b"443" if u.scheme == b"https" else b"80"
+        port = b"" if u.port is None or str(u.port).encode() == default_port \
+            else b":" + str(u.port).encode()
+        authority = u.host + port
 
-    defaults = _httpx_default_headers()
+    defaults = set() if prof.raw_headers else _httpx_default_headers()
     supplied: list[tuple[bytes, bytes]] = []
     for key, value in request.headers:
         key = key.lower()
+        # `_DROP` stays even in raw mode: host becomes :authority and the rest
+        # are HTTP/1 hop headers that h2 forbids. Only the httpx-default
+        # value-strip is what `raw_headers` turns off.
         if key in _DROP or (key, value) in defaults:
             continue
         supplied.append((key, value))
@@ -1473,6 +1500,7 @@ class Transport(httpx.HTTPTransport):
                  headers: typing.Any = None,
                  priority: typing.Any = FROM_CAPTURE,
                  session_ticket: typing.Any = FROM_CAPTURE,
+                 raw_headers: bool = False,
                  **kwargs: typing.Any) -> None:
         # A copy, not the shared Profile: `headers=`, `priority=`,
         # `session_ticket=` and `header_profile` are per-transport, and
@@ -1484,6 +1512,7 @@ class Transport(httpx.HTTPTransport):
             self.profile.default_headers = _as_header_pairs(headers)
         self.profile.priority_override = _check_priority(priority)
         self.profile.session_ticket_override = _check_session_ticket(session_ticket)
+        self.profile.raw_headers = bool(raw_headers)
         kwargs.setdefault("http2", True)
         super().__init__(**kwargs)
         _retag_pool(self, self.profile, self._ASYNC)
@@ -1505,6 +1534,7 @@ class AsyncTransport(httpx.AsyncHTTPTransport):
                  headers: typing.Any = None,
                  priority: typing.Any = FROM_CAPTURE,
                  session_ticket: typing.Any = FROM_CAPTURE,
+                 raw_headers: bool = False,
                  **kwargs: typing.Any) -> None:
         # A copy, not the shared Profile: `headers=`, `priority=`,
         # `session_ticket=` and `header_profile` are per-transport, and
@@ -1516,6 +1546,7 @@ class AsyncTransport(httpx.AsyncHTTPTransport):
             self.profile.default_headers = _as_header_pairs(headers)
         self.profile.priority_override = _check_priority(priority)
         self.profile.session_ticket_override = _check_session_ticket(session_ticket)
+        self.profile.raw_headers = bool(raw_headers)
         kwargs.setdefault("http2", True)
         super().__init__(**kwargs)
         _retag_pool(self, self.profile, self._ASYNC)
@@ -1535,6 +1566,47 @@ def transport(brand: str | None = None, **kwargs: typing.Any) -> Transport:
 def async_transport(brand: str | None = None, **kwargs: typing.Any) -> AsyncTransport:
     """An async transport for `brand`; same as AsyncTransport(brand, ...)."""
     return AsyncTransport(brand, **kwargs)
+
+
+#: `send()` takes these; `build_request()` takes everything else. Splitting on
+#: this is what lets send_exact forward a single **kwargs to both.
+_SEND_KWARGS = frozenset({"auth", "follow_redirects", "stream"})
+
+
+async def send_exact(client: typing.Any, method: str, url: typing.Any, *,
+                     headers: typing.Any = None,
+                     **kwargs: typing.Any) -> typing.Any:
+    """Send a request whose header list is emitted exactly as given.
+
+    A drop-in for `await client.post(url, ...)` when the on-wire header order
+    has to be yours to the byte: build the request, then replace its headers
+    with `headers` verbatim - so httpx's own client-default headers cannot sit
+    in front of yours, and its auto `content-length` cannot be appended after
+    them.  Everything else (`content`/`data`/`json`/`params`/`cookies`/
+    `timeout`/`auth`/`follow_redirects`/...) is forwarded to httpx unchanged.
+
+        r = await fp.send_exact(client, "POST", url, headers=[...], content=body)
+
+    Because the header list is taken literally, YOU own the whole of it:
+
+    * include `host` (it becomes `:authority`), `content-type` and an explicit
+      `content-length` - overwriting the headers discards the ones httpx built
+      from the body;
+    * to keep a header whose value equals an httpx default - `accept: */*` most
+      often - give the transport `raw_headers=True`, otherwise `_build_headers`
+      still drops it by value even though you set it here;
+    * `content=` is the way to pin the body bytes (and thus content-length),
+      rather than `data=`/`json=` whose encoders would set headers you have
+      just replaced.
+
+    `headers=None` sends whatever httpx built, i.e. it behaves like a plain
+    send.  Intended for `httpx.AsyncClient`; `client.send` is awaited.
+    """
+    send_kwargs = {k: kwargs.pop(k) for k in list(kwargs) if k in _SEND_KWARGS}
+    request = client.build_request(method, url, **kwargs)
+    if headers is not None:
+        request.headers = httpx.Headers(headers)
+    return await client.send(request, **send_kwargs)
 
 
 def __getattr__(name: str) -> typing.Any:
