@@ -55,6 +55,19 @@ JA3_URL = "https://check.ja3.zone/"
 REACH_HOSTS = ("tls.peet.ws", "www.google.com", "www.cloudflare.com")
 
 
+def _transport(brand: str, insecure: bool):
+    """The fingerprint transport, optionally not verifying the peer's cert.
+
+    `verify` is an ordinary httpx knob that flows through to the SSL_CTX; it sets
+    the verify mode, which is a client-side, post-handshake decision and never
+    changes a byte of the ClientHello - so `--insecure` reads a fingerprint back
+    unchanged from a host whose certificate is broken. tls.peet.ws currently
+    serves an expired self-signed default cert, and since it only echoes the
+    ClientHello we just sent, there is nothing secret to protect by verifying it.
+    """
+    return fp.Transport(brand, verify=False) if insecure else fp.Transport(brand)
+
+
 def cmp(name: str, got, want) -> bool:
     if got == want:
         print(f"  {name:<26} OK")
@@ -128,7 +141,7 @@ def captured_fingerprints(brand: str) -> tuple[dict, str]:
     return fingerprints.of_client_hello(raw), prof.akamai_fingerprint
 
 
-def reachable(brand: str, hosts=REACH_HOSTS) -> bool:
+def reachable(brand: str, hosts=REACH_HOSTS, insecure: bool = False) -> bool:
     """Does a real server, rather than our own probe, accept this ClientHello?
 
     The one property with no offline substitute. A profile copies whatever the
@@ -140,7 +153,7 @@ def reachable(brand: str, hosts=REACH_HOSTS) -> bool:
     ok = True
     for host in hosts:
         try:
-            with httpx.Client(transport=fp.Transport(brand), timeout=20) as client:
+            with httpx.Client(transport=_transport(brand, insecure), timeout=20) as client:
                 r = client.get(f"https://{host}/", follow_redirects=False)
         except Exception as exc:                       # noqa: BLE001
             ok = False
@@ -153,7 +166,8 @@ def reachable(brand: str, hosts=REACH_HOSTS) -> bool:
     return ok
 
 
-def outside_view(brand: str, want_tls: dict, want_akamai: str) -> bool:
+def outside_view(brand: str, want_tls: dict, want_akamai: str,
+                 insecure: bool = False) -> bool:
     """What peet made of the bytes we just sent, against the capture's own.
 
     A match means an unrelated implementation, reading our live ClientHello off
@@ -164,7 +178,7 @@ def outside_view(brand: str, want_tls: dict, want_akamai: str) -> bool:
     """
     print("\n=== tls.peet.ws ===")
     try:
-        with httpx.Client(transport=fp.Transport(brand), timeout=25) as client:
+        with httpx.Client(transport=_transport(brand, insecure), timeout=25) as client:
             got = client.get(PEET_URL).json()
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         # The remote, not our ClientHello, failed to answer - skip. A client we
@@ -200,11 +214,11 @@ def outside_view(brand: str, want_tls: dict, want_akamai: str) -> bool:
     return ok
 
 
-def check_ja3_zone(brand: str, want_tls: dict) -> bool:
+def check_ja3_zone(brand: str, want_tls: dict, insecure: bool = False) -> bool:
     """A second, unrelated implementation of JA3 on its own live connection."""
     print("\n=== check.ja3.zone (independent of peet) ===")
     try:
-        with httpx.Client(transport=fp.Transport(brand), timeout=25) as client:
+        with httpx.Client(transport=_transport(brand, insecure), timeout=25) as client:
             got = client.get(JA3_URL).json()
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         print(f"  (skipped: {type(exc).__name__}: {exc})")
@@ -258,12 +272,23 @@ def main() -> int:
                    help="override the acceptance hosts (repeatable)")
     p.add_argument("--skip-reach", action="store_true",
                    help="skip the acceptance check and only ask the services")
+    p.add_argument("--insecure", action="store_true",
+                   help="do not verify the peer's TLS certificate on the live "
+                        "connections. For reference/echo hosts whose cert is "
+                        "broken - tls.peet.ws currently serves an expired "
+                        "self-signed cert - so its ClientHello echo can still be "
+                        "read. Does not change the fingerprint (verify mode is a "
+                        "post-handshake, client-side decision).")
     args = p.parse_args()
 
     brands = [args.brand] if args.brand else list(fp.brands())
     if not brands:
         print(f"no profiles in {fp.PROFILES_DIR}", file=sys.stderr)
         return 2
+
+    if args.insecure:
+        print("!! --insecure: peer certificates are NOT verified on the live "
+              "connections (the ClientHello sent is unchanged).")
 
     results: dict[str, bool] = {}
     for brand in brands:
@@ -272,9 +297,10 @@ def main() -> int:
         print(f"\n######## {brand} ({prof.label}) ########\n")
         ok = True
         if not args.skip_reach:
-            ok &= reachable(brand, tuple(args.host) if args.host else REACH_HOSTS)
-        ok &= outside_view(brand, want_tls, want_akamai)
-        ok &= check_ja3_zone(brand, want_tls)
+            ok &= reachable(brand, tuple(args.host) if args.host else REACH_HOSTS,
+                            args.insecure)
+        ok &= outside_view(brand, want_tls, want_akamai, args.insecure)
+        ok &= check_ja3_zone(brand, want_tls, args.insecure)
         results[brand] = ok
 
     print("\n=== summary ===")
