@@ -59,6 +59,10 @@ def library() -> ctypes.CDLL:
         lib.SSL_CTX_set_fp_empty_ticket.restype = ctypes.c_int
         lib.SSL_CTX_get_fp_empty_ticket.argtypes = [ctypes.c_void_p]
         lib.SSL_CTX_get_fp_empty_ticket.restype = ctypes.c_int
+        # For scrubbing OpenSSL's thread-local error queue after a profile is
+        # applied; see set_profile for why that is necessary.
+        lib.ERR_clear_error.argtypes = []
+        lib.ERR_clear_error.restype = None
     except AttributeError as exc:
         msg = (f"{ssl.OPENSSL_VERSION} has no fingerprint profiles ({exc}). "
                f"This needs the OpenSSL fork in this repository; a stock build "
@@ -108,7 +112,21 @@ def set_profile(context: ssl.SSLContext, name: str) -> None:
     """
     lib = library()
     ptr = _ssl_ctx(context)
-    if lib.SSL_CTX_set_fp_profile(ptr, name.encode()) != 1:
+    ok = lib.SSL_CTX_set_fp_profile(ptr, name.encode())
+    # Applying a profile runs SSL_CTX_set_cipher_list under the hood. On some
+    # builds - notably a system openssl.cnf that pins @SECLEVEL=2, as Debian
+    # ships - resolving the cipher string drops suites the level forbids and
+    # leaves a stray SSL_R_NO_CIPHER_MATCH on OpenSSL's error queue *even though
+    # the call succeeds*. That queue is thread-local, so in an asyncio program
+    # every coroutine on the loop thread shares it; CPython does not clear it
+    # before an SSL_read, so the next connection that simply closes (a plain
+    # EOF, retval 0 in _ssl.c's read) reports that stale entry as its reason -
+    # "[SSL: NO_CIPHER_MATCH] no cipher match" for a socket that only hung up.
+    # Scrub the queue here so a benign residue cannot masquerade as a later
+    # failure. Done before the check so a genuine failure does not leave one
+    # behind either.
+    lib.ERR_clear_error()
+    if ok != 1:
         msg = (f"OpenSSL has no fingerprint profile {name!r}; it knows "
                f"{', '.join(available())}. The TLS layer would still be "
                f"emitting the default, so this is an error rather than a "

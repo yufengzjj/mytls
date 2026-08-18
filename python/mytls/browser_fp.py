@@ -133,12 +133,14 @@ __all__ = ["Profile", "PROFILES", "PROFILES_DIR", "DEFAULT_BRAND",
 #: `hpack.hpack.INDEX_NEVER`, all private. A change there does not raise: it
 #: silently encodes different bytes, which is the one failure this package
 #: exists to prevent. 4.1.0 is what every listed h2 resolves to, and all four
-#: profiles re-encode byte-identically on it.
+#: profiles re-encode byte-identically on it. 4.2.0 verified the same way
+#: (`mytls-probe selftest`: every profile re-encodes byte-identical), so it is
+#: listed too rather than warned about.
 _EXPECTED = {
     "httpx": ("0.27.2",),
     "httpcore": ("1.0.9",),
     "h2": ("4.4.1", "4.4.0", "4.3.0"),
-    "hpack": ("4.1.0",),
+    "hpack": ("4.2.0", "4.1.0"),
 }
 
 #: Default for `priority_override` / `Transport(priority=...)`: whatever the
