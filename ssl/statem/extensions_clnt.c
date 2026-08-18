@@ -2075,10 +2075,28 @@ int tls_parse_stoc_alpn(SSL_CONNECTION *s, PACKET *pkt, unsigned int context,
         return 0;
     }
     while (PACKET_get_length_prefixed_1(&confpkt, &protpkt)) {
-        if (PACKET_remaining(&protpkt) != len)
-            continue;
-        if (memcmp(PACKET_data(pkt), PACKET_data(&protpkt), len) == 0) {
+        size_t plen = PACKET_remaining(&protpkt);
+
+        /* Exact match, as RFC 7301 requires. */
+        if (plen == len
+            && memcmp(PACKET_data(pkt), PACKET_data(&protpkt), len) == 0) {
             /* Valid protocol found */
+            valid = 1;
+            break;
+        }
+        /*-
+         * APNs quirk: the device-facing courier answers an offered protocol
+         * such as "apns-pack-v1" with "apns-pack-v1:<win>:<win>", carrying its
+         * flow-control window inside the ALPN string. That is not the
+         * byte-for-byte echo RFC 7301 mandates, so stock OpenSSL rejects it
+         * with SSL_R_BAD_EXTENSION - but a real device accepts it and reads the
+         * window from there. Accept a server protocol that is one we offered
+         * followed by ':'; the whole string (suffix included) is stored below,
+         * so SSL_get0_alpn_selected() hands the parameters back to the caller.
+         */
+        if (len > plen + 1
+            && memcmp(PACKET_data(pkt), PACKET_data(&protpkt), plen) == 0
+            && PACKET_data(pkt)[plen] == ':') {
             valid = 1;
             break;
         }
