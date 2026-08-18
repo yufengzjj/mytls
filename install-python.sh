@@ -183,15 +183,23 @@ build_openssl() {
     # them can offer them - the chrome profile does not - but a server could
     # then negotiate 3DES on an ios18 connection, exactly as it could with
     # the real client.
+    # enable-zlib is not optional here: the ios profiles advertise zlib
+    # certificate compression (RFC 8879), so the server compresses its chain
+    # with zlib and this library has to be able to decompress it - without
+    # zlib the handshake dies with SSL_R_BAD_COMPRESSION_ALGORITHM. brotli is
+    # the same story for the chrome profiles.
     # shellcheck disable=SC2086 - OPENSSL_TARGET is intentionally word-split
-    ./Configure $OPENSSL_TARGET shared enable-brotli enable-weak-ssl-ciphers \
+    ./Configure $OPENSSL_TARGET shared enable-brotli enable-zlib \
+        enable-weak-ssl-ciphers \
         --prefix="$PREFIX" --libdir=lib --openssldir="$ssldir" \
         '-Wl,-rpath,$(LIBRPATH)'
 
-    grep -q "OPENSSL_NO_BROTLI" include/openssl/configuration.h 2>/dev/null \
-        && warn "brotli support did NOT get enabled - a server that compresses
-         its certificate chain will fail the handshake. Install the brotli
-         development package and re-run."
+    for feat in BROTLI ZLIB; do
+        grep -q "OPENSSL_NO_$feat\b" include/openssl/configuration.h 2>/dev/null \
+            && warn "$feat certificate compression did NOT get enabled - a
+             server that compresses its certificate chain with it will fail the
+             handshake. Install the $feat development package and re-run."
+    done
 
     # build_generated first: with -j the generated headers can otherwise lose a
     # race against the compiles that include them.
