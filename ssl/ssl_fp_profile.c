@@ -598,13 +598,33 @@ int ossl_ssl_fp_apply_ctx(SSL_CTX *ctx, const SSL_FP_PROFILE *prof)
     if (prof->ciphers == NULL)
         return 1;
 
+    /*
+     * SSL_CTX_set_cipher_list leaves a stray SSL_R_NO_CIPHER_MATCH on the
+     * thread-local error queue whenever @SECLEVEL drops one of the profile's
+     * suites - a system openssl.cnf pinning SECLEVEL 2 (Debian's default) is
+     * enough - *even though the call succeeds*. The queue is shared by every
+     * coroutine on a loop thread, and CPython does not clear it before an
+     * SSL_read, so a later benign EOF gets misreported as "no cipher match".
+     * Mark the queue and pop back to it on success so a benign residue cannot
+     * masquerade as a real failure; on failure leave the errors in place, since
+     * that is exactly when the reason matters. This is the source of the
+     * residue for every SSL_CTX - SSL_CTX_new applies the default profile
+     * through here - so scrubbing it at the source covers callers that never
+     * touch the SSL_CTX_set_fp_profile() path.
+     */
+    ERR_set_mark();
     pinned = ctx->ciphers_pinned;
     ctx->ciphers_pinned = 0;
     ok = SSL_CTX_set_ciphersuites(ctx, prof->tls13_ciphers)
-         && SSL_CTX_set_cipher_list(ctx, prof->ciphers);
+         && SSL_CTX_set_cipher_list(ctx, prof->ciphers)
+         && SSL_CTX_set1_groups_list(ctx, prof->groups) > 0;
     ctx->ciphers_pinned = pinned;
 
-    return ok && SSL_CTX_set1_groups_list(ctx, prof->groups) > 0;
+    if (ok)
+        ERR_pop_to_mark();
+    else
+        ERR_clear_last_mark();
+    return ok;
 }
 
 static int fp_apply_ssl(SSL *s, const SSL_FP_PROFILE *prof)
@@ -616,13 +636,20 @@ static int fp_apply_ssl(SSL *s, const SSL_FP_PROFILE *prof)
     if (prof->ciphers == NULL)
         return 1;
 
+    /* Same benign-residue scrub as ossl_ssl_fp_apply_ctx, per connection. */
+    ERR_set_mark();
     pinned = s->ctx->ciphers_pinned;
     s->ctx->ciphers_pinned = 0;
     ok = SSL_set_ciphersuites(s, prof->tls13_ciphers)
-         && SSL_set_cipher_list(s, prof->ciphers);
+         && SSL_set_cipher_list(s, prof->ciphers)
+         && SSL_set1_groups_list(s, prof->groups) > 0;
     s->ctx->ciphers_pinned = pinned;
 
-    return ok && SSL_set1_groups_list(s, prof->groups) > 0;
+    if (ok)
+        ERR_pop_to_mark();
+    else
+        ERR_clear_last_mark();
+    return ok;
 }
 
 const char *SSL_fp_profile_name(size_t idx)
