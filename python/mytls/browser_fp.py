@@ -1470,11 +1470,21 @@ def _apply_tls_profile(transport: typing.Any, prof: Profile) -> str | None:
         if prof.session_ticket_override is not FROM_CAPTURE:
             tls_profile.set_empty_ticket(context, prof.session_ticket_override)
     except tls_profile.Unavailable as exc:
+        # httpx has already built the SSLContext by now, so its NO_CIPHER_MATCH
+        # residue is on the queue even when our own profile step fails; scrub
+        # before returning so it cannot be misreported on a later read.
+        tls_profile.clear_error_queue()
         warnings.warn(
             f"browser_fp: the TLS layer is NOT {prof.brand}'s - {exc} The "
             f"HTTP/2 layer still is, so the two halves disagree.",
             RuntimeWarning, stacklevel=3)
         return None
+    # Construction is complete and synchronous: scrub the benign residue httpx's
+    # SSL setup leaves under @SECLEVEL=2 (a NO_CIPHER_MATCH the fp profile's own
+    # C-side mark/pop cannot reach, because httpx runs before set_profile) so it
+    # cannot masquerade as a later connection's read failure. See
+    # tls_profile.clear_error_queue.
+    tls_profile.clear_error_queue()
     return prof.tls_profile
 
 
