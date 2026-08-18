@@ -194,11 +194,19 @@ build_openssl() {
         --prefix="$PREFIX" --libdir=lib --openssldir="$ssldir" \
         '-Wl,-rpath,$(LIBRPATH)'
 
-    for feat in BROTLI ZLIB; do
-        grep -q "OPENSSL_NO_$feat\b" include/openssl/configuration.h 2>/dev/null \
-            && warn "$feat certificate compression did NOT get enabled - a
+    # Confirm the certificate-compression algorithms actually made it in.
+    # configdata.pm's feature dump is authoritative; configuration.h is not -
+    # it names OPENSSL_NO_BROTLI/ZLIB inside compile-time guards even when the
+    # algorithm is enabled, so grepping it reports a false "disabled".
+    enabled_feats=$(perl configdata.pm --dump 2>/dev/null \
+        | sed -n '/^Enabled features:/,/^Disabled features:/p')
+    for feat in brotli zlib; do
+        printf '%s\n' "$enabled_feats" | grep -qw "$feat" \
+            || warn "$feat certificate compression did NOT get enabled - a
              server that compresses its certificate chain with it will fail the
-             handshake. Install the $feat development package and re-run."
+             handshake with SSL_R_BAD_COMPRESSION_ALGORITHM (the profiles that
+             advertise $feat depend on it). Install the $feat development
+             package and re-run."
     done
 
     # build_generated first: with -j the generated headers can otherwise lose a
