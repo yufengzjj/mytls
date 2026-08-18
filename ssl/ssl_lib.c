@@ -4263,6 +4263,21 @@ SSL_CTX *SSL_CTX_new_ex(OSSL_LIB_CTX *libctx, const char *propq,
     ret->ciphers_pinned = (ossl_ssl_fp_default()->flags & SSL_FP_STOCK) == 0;
     if (getenv("SSLKEYLOGFILE") != NULL)
         SSL_CTX_set_keylog_callback(ret, keylog_callback);
+    /*
+     * Building the cipher lists under a @SECLEVEL=2 openssl.cnf (Debian's
+     * default) drops the suites the level forbids and leaves a stray
+     * SSL_R_NO_CIPHER_MATCH on the thread-local error queue *even though the
+     * lists are non-empty and construction succeeded*. Every SSL_CTX_new runs
+     * this - a plain ssl.SSLContext() and httpx included, not just the
+     * fingerprint path - so the residue would sit on a queue shared by every
+     * coroutine on an asyncio loop thread, and CPython does not clear it before
+     * an SSL_read: a later benign EOF then gets misreported as "no cipher
+     * match". Scoped mark/pop around the individual cipher calls proved too
+     * fragile (inner code re-marks the queue), so scrub unconditionally here:
+     * reaching this point means construction succeeded, and a context that was
+     * built cleanly must not leave an error behind to be blamed on a later read.
+     */
+    ERR_clear_error();
     return ret;
  err:
     SSL_CTX_free(ret);

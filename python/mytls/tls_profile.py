@@ -59,10 +59,6 @@ def library() -> ctypes.CDLL:
         lib.SSL_CTX_set_fp_empty_ticket.restype = ctypes.c_int
         lib.SSL_CTX_get_fp_empty_ticket.argtypes = [ctypes.c_void_p]
         lib.SSL_CTX_get_fp_empty_ticket.restype = ctypes.c_int
-        # For scrubbing the thread-local error queue once a transport is fully
-        # built; see clear_error_queue for why that is necessary.
-        lib.ERR_clear_error.argtypes = []
-        lib.ERR_clear_error.restype = None
     except AttributeError as exc:
         msg = (f"{ssl.OPENSSL_VERSION} has no fingerprint profiles ({exc}). "
                f"This needs the OpenSSL fork in this repository; a stock build "
@@ -113,39 +109,19 @@ def set_profile(context: ssl.SSLContext, name: str) -> None:
     lib = library()
     ptr = _ssl_ctx(context)
     ok = lib.SSL_CTX_set_fp_profile(ptr, name.encode())
-    # The profile's own cipher calls scrub their residue at the C source
-    # (ossl_ssl_fp_apply_ctx / fp_apply_ssl in ssl/ssl_fp_profile.c, wrapped in
-    # ERR_set_mark/ERR_pop_to_mark), so nothing is cleared here. That is NOT the
-    # whole story for a transport though: httpx's own SSL setup leaves a
-    # NO_CIPHER_MATCH on the queue *before* this runs - see clear_error_queue,
-    # which browser_fp calls once the transport is built.
+    # Applying a profile runs SSL_CTX_set_cipher_list, which under a @SECLEVEL=2
+    # openssl.cnf leaves a benign SSL_R_NO_CIPHER_MATCH on the thread-local error
+    # queue even on success; that is scrubbed at the C source
+    # (ossl_ssl_fp_apply_ctx in ssl/ssl_fp_profile.c wraps the cipher calls in
+    # ERR_set_mark/ERR_pop_to_mark), so nothing is cleared here. The same residue
+    # from plain SSL_CTX_new is scrubbed at its own success return in
+    # ssl/ssl_lib.c, which is what covers non-mytls SSL clients in the process.
     if ok != 1:
         msg = (f"OpenSSL has no fingerprint profile {name!r}; it knows "
                f"{', '.join(available())}. The TLS layer would still be "
                f"emitting the default, so this is an error rather than a "
                f"warning.")
         raise Unavailable(msg)
-
-
-def clear_error_queue() -> None:
-    """Drop everything on OpenSSL's thread-local error queue.
-
-    Building an httpx transport under a `@SECLEVEL=2` openssl.cnf (Debian's
-    default) leaves a stray `SSL_R_NO_CIPHER_MATCH` here even on success - and
-    not from the fingerprint profile: it is httpx's own SSL context setup, which
-    runs its cipher calls *before* set_profile does, so the C-side mark/pop in
-    ssl_fp_profile.c cannot reach it (those marks are set after httpx is done).
-    The queue is thread-local, so on a shared asyncio loop thread every coroutine
-    sees it, and CPython does not clear it before an SSL_read - so the next
-    connection that merely closes reports the stale entry as
-    "[SSL: NO_CIPHER_MATCH] no cipher match".
-
-    Call this once a transport is fully constructed (browser_fp does, at the end
-    of _apply_tls_profile): construction is synchronous and the last thing that
-    touches ciphers, so a full clear there scrubs the httpx residue and the
-    profile residue together without racing another coroutine's real error.
-    """
-    library().ERR_clear_error()
 
 
 def get_profile(context: ssl.SSLContext) -> str:
