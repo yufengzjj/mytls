@@ -734,22 +734,25 @@ connections agree, both `amp-api` connections agree.
 profiles are both in the *without* group, matching what Safari and WhatsApp were measured
 doing. See [Tunables](#tunables).
 
-**Only ever compare JA4 against JA4 from the same tool.** `tls.peet.ws` leaves the padding
-extension out of the `ja4_r` extension list while still counting it in the `14` prefix;
-Wireshark includes it in both. That alone changes the third field, independently of
-anything the client did, and by more than a version bump does:
+**Only ever compare JA4 against JA4 from the same tool, and the same year of it.** The
+spec and Wireshark put the padding extension (`0015`) in the `ja4_r` extension list as well
+as the `14` prefix. `tls.peet.ws` used to leave it out of the list while still counting it.
+By 2026-09 it includes `0015` like Wireshark does. That alone changes the third field,
+independently of anything the client did, and by more than a version bump does:
 
 | third field | `ios16` (11 sigalgs) | `ios18` (10 sigalgs) |
 |---|---|---|
-| `tls.peet.ws` (no `0015`) | `874d27d7ca63` | **`7f0f34a4126d`** |
-| Wireshark (`0015` included) | `14788d8d241b` | `e42f34c56612` |
+| Wireshark, `tls.peet.ws` now (`0015` included) | `14788d8d241b` | **`e42f34c56612`** |
+| older `tls.peet.ws` (no `0015`) | `874d27d7ca63` | `7f0f34a4126d` |
+
+iOS 26 sends no padding extension, so both rows give the same answer for it.
 
 The 11-sigalg column was first derived by hand from an iOS 18.1.1 capture and has since
 been confirmed off the wire: the iOS 16.7.12 captures reproduce `874d27d7ca63` exactly, and
 so does the `ios16` profile emitting its own ClientHello.
 
 The bold value is what `fingerprints.of_client_hello()` reports as `ja4`; the cell below it
-is its `ja4_padding_counted`, so whichever tool a capture came from, its answer is
+is its `ja4_padding_skipped`, so whichever tool a capture came from, its answer is
 available. All four were reproduced from `sha256(sorted_extensions + "_" + sigalgs)[:12]` — the
 top row by hand, both 18.5 cells by `fingerprints.py` running on our own client's bytes — so
 a mismatch is worth resolving to one of these cells before concluding the profile is wrong.

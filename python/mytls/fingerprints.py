@@ -179,22 +179,24 @@ def _ja4_lists(ch: dict, *, count_padding: bool) -> tuple[str, str]:
     return ",".join(ciphers), ",".join(exts) + "_" + ",".join(sigalgs)
 
 
-def ja4(ch: dict, *, count_padding: bool = False) -> str:
+def ja4(ch: dict, *, count_padding: bool = True) -> str:
     """ja4, in the flavour `tls.peet.ws` computes by default.
 
     `count_padding` is the one place implementations disagree, and it matters
     only for clients that send a padding extension - which among the profiles
-    here means Safari and not Chrome. peet leaves 0x0015 out of the sorted
-    extension list while still counting it in the two-digit total; Wireshark
-    includes it in both, which is what the specification says. Same bytes,
-    different answer, so a ja4 is only ever comparable to one from the same
-    tool. The default is peet's because that is what `references/` holds.
+    here means Safari and not Chrome. The specification and Wireshark put
+    0x0015 in the sorted extension list as well as the two-digit total. peet
+    used to leave it out of the list (while still counting it), but by
+    2026-09 it includes it like everyone else, so that is the default. Pass
+    False for the old peet answer when comparing against a value it recorded
+    before then. Same bytes, different answer, so a ja4 is only ever
+    comparable to one from the same tool.
     """
     ciphers, tail = _ja4_lists(ch, count_padding=count_padding)
     return f"{_ja4_prefix(ch)}_{_sha12(ciphers)}_{_sha12(tail)}"
 
 
-def ja4_r(ch: dict, *, count_padding: bool = False) -> str:
+def ja4_r(ch: dict, *, count_padding: bool = True) -> str:
     """ja4 with the lists spelled out instead of hashed - what to read on a mismatch."""
     ciphers, tail = _ja4_lists(ch, count_padding=count_padding)
     return f"{_ja4_prefix(ch)}_{ciphers}_{tail}"
@@ -248,8 +250,8 @@ def of_client_hello(raw: str | bytes) -> dict:
         "ja3_hash": j3["hash"],
         "ja4": ja4(ch),
         "ja4_r": ja4_r(ch),
-        "ja4_padding_counted": ja4(ch, count_padding=True),
-        "ja4_r_padding_counted": ja4_r(ch, count_padding=True),
+        "ja4_padding_skipped": ja4(ch, count_padding=False),
+        "ja4_r_padding_skipped": ja4_r(ch, count_padding=False),
         "peetprint": pp["fingerprint"],
         "peetprint_hash": pp["hash"],
     }
