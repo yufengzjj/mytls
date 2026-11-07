@@ -7,6 +7,8 @@ and its output kept for when something goes wrong. That is this module.
 
 mitmproxy runs out of process, as `capture-mitm` already does, so this file
 imports nothing from it: the mitmdump under test may be another interpreter.
+mitmweb works the same way (pass its path where a mitmdump is expected): it is
+the same proxy with a web UI on top, which gets a free port of its own here.
 """
 
 from __future__ import annotations
@@ -75,6 +77,7 @@ class Mitmdump:
         self.extra = extra
         self.startup_timeout = startup_timeout
         self.port = 0
+        self.web_port = 0
         self.proc: subprocess.Popen | None = None
         self._dir = Path(tempfile.mkdtemp(prefix="mytls-mitm-"))
         self.log_path = self._dir / "mitmdump.log"
@@ -100,10 +103,23 @@ class Mitmdump:
             argv += ["--set", f"fp_connect_to={self.connect_to}"]
         if self.insecure:
             argv += ["--set", "ssl_insecure=true"]
+        if self.is_mitmweb:
+            # The web UI has a fixed default port of its own, which an earlier
+            # mitmweb or something on the Windows side of WSL may hold - and
+            # then mitmweb never starts, which reads like a fingerprint failure.
+            # Nobody looks at the UI during a test, so no browser either.
+            argv += ["--set", f"web_port={self.web_port}",
+                     "--set", "web_open_browser=false"]
         return argv + list(self.extra)
+
+    @property
+    def is_mitmweb(self) -> bool:
+        return Path(self.mitmdump).name.startswith("mitmweb")
 
     def __enter__(self) -> Mitmdump:
         self.port = free_port()
+        if self.is_mitmweb:
+            self.web_port = free_port()
         env = dict(os.environ, PYTHONUNBUFFERED="1")
         # mitmproxy ignores these itself, but the addon or a script might not.
         for name in ("http_proxy", "https_proxy", "all_proxy",

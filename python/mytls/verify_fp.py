@@ -379,8 +379,9 @@ def main() -> int:
                    help="ask the same questions of mitmproxy's upstream "
                         "connection: a mitmdump per brand with the packaged "
                         "TLS addon and http2_fingerprint, our client behind it")
-    p.add_argument("--mitmdump", help="with --via-mitm: the mitmdump under test; "
-                                      "default: beside this interpreter, else PATH")
+    p.add_argument("--mitmdump", help="with --via-mitm: the mitmdump under test, "
+                                      "or a mitmweb; default: the mitmdump beside "
+                                      "this interpreter, else PATH")
     p.add_argument("--tls-script", metavar="PATH",
                    help="with --via-mitm: a TLS addon of your own taking the "
                         "fp_profile option, instead of mitm_upstream.py")
@@ -405,7 +406,7 @@ def main() -> int:
                   "on PATH; point at the one under test with --mitmdump.",
                   file=sys.stderr)
             return 2
-        print(f"mitmdump under test: {mitmdump}")
+        print(f"under test: {mitmdump}")
 
     results: dict[str, bool] = {}
     hosts = tuple(args.host) if args.host else REACH_HOSTS

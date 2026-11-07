@@ -2741,7 +2741,7 @@ def mitm_selftest(args: argparse.Namespace) -> int:
     if not targets:
         print(f"no profiles in {PROFILES_DIR}", file=sys.stderr)
         return 1
-    print(f"mitmdump under test: {mitmdump}\n")
+    print(f"under test: {mitmdump}\n")
 
     results = {}
     for i, brand in enumerate(targets):
@@ -3930,8 +3930,9 @@ def main() -> int:
                     "excused. No network.")
     ms.add_argument("--brand", help="default: every installed brand")
     ms.add_argument("--openssl", default=str(Path.home() / "openssl/bin/openssl"))
-    ms.add_argument("--mitmdump", help="the mitmdump under test; default: the "
-                                       "one beside this interpreter, else PATH")
+    ms.add_argument("--mitmdump", help="the mitmdump under test, or a mitmweb; "
+                                       "default: the mitmdump beside this "
+                                       "interpreter, else PATH")
     ms.add_argument("--tls-script", metavar="PATH",
                     help="a TLS addon of your own taking the fp_profile "
                          "option, instead of the packaged mitm_upstream.py")

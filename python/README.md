@@ -164,6 +164,8 @@ priority — against the capture, since through a proxy neither is ours.
 
 `--tls-script PATH` runs either against a TLS addon of your own instead of
 `mitm_upstream.py`, as long as it takes the same `fp_profile` option.
+`--mitmdump` also takes a mitmweb — the same proxy with a web UI — which then
+gets a free port for the UI and does not open a browser.
 
 Measured (2026-11-07, mitmproxy `http2-fingerprint` branch, cryptography 50.0.2 built
 against this library): `mitm-selftest` PASS for all 8 captures, HPACK identical for both
