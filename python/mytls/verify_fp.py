@@ -30,6 +30,16 @@ Those brands are now checkable like any other.
 
     mytls-verify                     # every installed profile
     mytls-verify --brand ios18       # just one
+    mytls-verify --via-mitm          # the same, through mitmproxy
+
+`--via-mitm` asks the same questions of mitmproxy's upstream connection
+instead of ours. Our client goes through a mitmdump started for each brand -
+the packaged `mitm_upstream.py` choosing the ClientHello, mitmproxy's own
+`http2_fingerprint` option the HTTP/2 layer - and the services judge what
+mitmproxy sent. The client sends the capture's headers and HEADERS priority,
+as the browser behind the proxy would, so peet's view of the HEADERS frame -
+field order, priority - is checked against the capture too. Acceptance is
+judged on what mitmproxy negotiated upstream, which the client cannot see.
 """
 
 from __future__ import annotations
@@ -54,8 +64,14 @@ JA3_URL = "https://check.ja3.zone/"
 #: is printed but not judged, since none of them owe us a 200.
 REACH_HOSTS = ("tls.peet.ws", "www.google.com", "www.cloudflare.com")
 
+#: Left out when a capture's headers are replayed on these body-less GETs. A
+#: capture can be a POST - ios16 is WhatsApp posting 814 bytes - and a GET that
+#: declares a body it never sends is a malformed request: Google resets the
+#: stream with PROTOCOL_ERROR, where peet lets it pass.
+BODY_HEADERS = frozenset({"content-length"})
 
-def _transport(brand: str, insecure: bool):
+
+def _transport(brand: str, insecure: bool, proxy: str | None = None):
     """The fingerprint transport, optionally not verifying the peer's cert.
 
     `verify` is an ordinary httpx knob that flows through to the SSL_CTX; it sets
@@ -65,6 +81,16 @@ def _transport(brand: str, insecure: bool):
     serves an expired self-signed default cert, and since it only echoes the
     ClientHello we just sent, there is nothing secret to protect by verifying it.
     """
+    if proxy is not None:
+        # Through mitmproxy, the certificate this client sees is mitmproxy's
+        # own; whether the real server's is verified is mitmproxy's decision
+        # (ssl_insecure, set from --insecure). What goes upstream is whatever a
+        # browser behind the proxy sends, so send the capture's own request.
+        prof = fp.profile(brand)
+        return fp.Transport(brand, verify=False, proxy=proxy,
+                            headers=[(k, v) for k, v in prof.headers
+                                     if k.lower() not in BODY_HEADERS],
+                            priority=prof.captured_priority("navigate") or None)
     return fp.Transport(brand, verify=False) if insecure else fp.Transport(brand)
 
 
@@ -141,33 +167,63 @@ def captured_fingerprints(brand: str) -> tuple[dict, str]:
     return fingerprints.of_client_hello(raw), prof.akamai_fingerprint
 
 
-def reachable(brand: str, hosts=REACH_HOSTS, insecure: bool = False) -> bool:
+def reachable(brand: str, hosts=REACH_HOSTS, insecure: bool = False,
+              mitm=None) -> bool:
     """Does a real server, rather than our own probe, accept this ClientHello?
 
     The one property with no offline substitute. A profile copies whatever the
     browser sent, including things a strict server might refuse - iOS lists
     `rsa_pss_rsae_sha384` twice and offers three 3DES suites - and loopback
     against our own OpenSSL will never object to any of it.
+
+    Through mitmproxy (`mitm`), what is judged is mitmproxy's upstream
+    connection, read from the report the test hooks write: the client's own
+    connection ends at mitmproxy and says nothing about the server's.
     """
-    print("=== acceptance (real servers, real network) ===")
+    print("=== acceptance (real servers, real network"
+          + (", mitmproxy's upstream" if mitm else "") + ") ===")
     ok = True
+    proxy = mitm.proxy_url if mitm else None
     for host in hosts:
+        seen = len(mitm.report()) if mitm else 0
         try:
-            with httpx.Client(transport=_transport(brand, insecure), timeout=20) as client:
+            with httpx.Client(transport=_transport(brand, insecure, proxy),
+                              timeout=20) as client:
                 r = client.get(f"https://{host}/", follow_redirects=False)
         except Exception as exc:                       # noqa: BLE001
             ok = False
             print(f"  {host:<22} FAILED  {type(exc).__name__}: {str(exc)[:70]}")
             continue
-        good = r.http_version == "HTTP/2"
+        if mitm is None:
+            good = r.http_version == "HTTP/2"
+            ok &= good
+            print(f"  {host:<22} {'OK   ' if good else 'NO H2'}  "
+                  f"{r.http_version}, status {r.status_code}")
+            continue
+        upstream = _upstream_record(mitm, seen, host)
+        if upstream is None:
+            ok = False
+            print(f"  {host:<22} FAILED  mitmproxy reported no upstream "
+                  f"response (status {r.status_code} came from mitmproxy)")
+            continue
+        good = upstream["upstream_http_version"] == "HTTP/2.0"
         ok &= good
-        print(f"  {host:<22} {'OK   ' if good else 'NO H2'}  "
-              f"{r.http_version}, status {r.status_code}")
+        print(f"  {host:<22} {'OK   ' if good else 'NO H2'}  upstream "
+              f"{upstream['upstream_http_version']} {upstream['upstream_tls_version']} "
+              f"{upstream['upstream_cipher']}, status {upstream['status']}")
     return ok
 
 
+def _upstream_record(mitm, seen: int, host: str) -> dict | None:
+    """The first report line written for `host` after the first `seen`."""
+    for record in mitm.report()[seen:]:
+        if httpx.URL(record["url"]).host == host:
+            return record
+    return None
+
+
 def outside_view(brand: str, want_tls: dict, want_akamai: str,
-                 insecure: bool = False) -> bool:
+                 insecure: bool = False, proxy: str | None = None) -> bool:
     """What peet made of the bytes we just sent, against the capture's own.
 
     A match means an unrelated implementation, reading our live ClientHello off
@@ -176,9 +232,10 @@ def outside_view(brand: str, want_tls: dict, want_akamai: str,
     that, offline and byte for byte - but it is the one check that would notice
     a difference which only appears off the loopback.
     """
-    print("\n=== tls.peet.ws ===")
+    print("\n=== tls.peet.ws" + (" (through mitmproxy)" if proxy else "") + " ===")
     try:
-        with httpx.Client(transport=_transport(brand, insecure), timeout=25) as client:
+        with httpx.Client(transport=_transport(brand, insecure, proxy),
+                          timeout=25) as client:
             got = client.get(PEET_URL).json()
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         # The remote, not our ClientHello, failed to answer - skip. A client we
@@ -205,6 +262,8 @@ def outside_view(brand: str, want_tls: dict, want_akamai: str,
                   want_tls["peetprint_hash"])
         ok &= cmp_akamai(got, want_akamai)
         ok &= _ja3(got["tls"]["ja3"], got["tls"]["ja3_hash"], want_tls, "peet")
+        if proxy is not None:
+            ok &= _headers_frame(brand, got)
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         # A field peet always returns is missing or malformed - report it rather
         # than let it abort the whole run partway through.
@@ -214,11 +273,14 @@ def outside_view(brand: str, want_tls: dict, want_akamai: str,
     return ok
 
 
-def check_ja3_zone(brand: str, want_tls: dict, insecure: bool = False) -> bool:
+def check_ja3_zone(brand: str, want_tls: dict, insecure: bool = False,
+                   proxy: str | None = None) -> bool:
     """A second, unrelated implementation of JA3 on its own live connection."""
-    print("\n=== check.ja3.zone (independent of peet) ===")
+    print("\n=== check.ja3.zone (independent of peet"
+          + (", through mitmproxy" if proxy else "") + ") ===")
     try:
-        with httpx.Client(transport=_transport(brand, insecure), timeout=25) as client:
+        with httpx.Client(transport=_transport(brand, insecure, proxy),
+                          timeout=25) as client:
             got = client.get(JA3_URL).json()
     except (httpx.ConnectError, httpx.TimeoutException) as exc:
         print(f"  (skipped: {type(exc).__name__}: {exc})")
@@ -232,6 +294,39 @@ def check_ja3_zone(brand: str, want_tls: dict, insecure: bool = False) -> bool:
         print(f"  FAILED  ja3.zone response missing/garbled a field: "
               f"{type(exc).__name__}: {exc}")
         return False
+
+
+def _headers_frame(brand: str, got: dict) -> bool:
+    """peet's view of the first HEADERS frame against the capture's.
+
+    Only through mitmproxy, where neither the field order nor the priority is
+    ours: mitmproxy re-encodes the request it received, and has to keep the
+    browser's field order after its pseudo-header order and pass the
+    browser's priority on. Names only - the values name this request, not the
+    captured one - and peet is the one place the field order can be seen off
+    the machine. The byte-level version of this is `mitm-selftest`.
+    """
+    import hpack
+
+    from . import hpack_probe
+
+    ref, _ = hpack_probe._load(brand)
+    frame = next(f for f in ref["frames"] if f["type"] == "HEADERS")
+    want_names = [k for k, _ in hpack_probe._decode_with(
+        hpack.Decoder(), bytes.fromhex(frame["header_block"]))
+        if k not in BODY_HEADERS]
+    live = next(f for f in got["http2"]["sent_frames"]
+                if f.get("frame_type") == "HEADERS")
+    # ":method: GET" -> ":method"; "accept: */*" -> "accept".
+    live_names = [h[:h.index(":", 1)] for h in live.get("headers", [])]
+    ok = cmp("headers order", live_names, want_names)
+
+    want = fp.profile(brand).captured_priority("navigate")
+    prio = live.get("priority")
+    live_prio = (None if not prio else
+                 {"exclusive": bool(prio.get("exclusive")),
+                  "depends_on": prio.get("depends_on"), "weight": prio.get("weight")})
+    return ok & cmp("headers priority", live_prio, want)
 
 
 def _ja3(fingerprint: str, digest: str | None, want_tls: dict, who: str) -> bool:
@@ -278,7 +373,17 @@ def main() -> int:
                         "broken - tls.peet.ws currently serves an expired "
                         "self-signed cert - so its ClientHello echo can still be "
                         "read. Does not change the fingerprint (verify mode is a "
-                        "post-handshake, client-side decision).")
+                        "post-handshake, client-side decision). With "
+                        "--via-mitm it sets mitmproxy's ssl_insecure instead.")
+    p.add_argument("--via-mitm", action="store_true",
+                   help="ask the same questions of mitmproxy's upstream "
+                        "connection: a mitmdump per brand with the packaged "
+                        "TLS addon and http2_fingerprint, our client behind it")
+    p.add_argument("--mitmdump", help="with --via-mitm: the mitmdump under test; "
+                                      "default: beside this interpreter, else PATH")
+    p.add_argument("--tls-script", metavar="PATH",
+                   help="with --via-mitm: a TLS addon of your own taking the "
+                        "fp_profile option, instead of mitm_upstream.py")
     args = p.parse_args()
 
     brands = [args.brand] if args.brand else list(fp.brands())
@@ -290,15 +395,33 @@ def main() -> int:
         print("!! --insecure: peer certificates are NOT verified on the live "
               "connections (the ClientHello sent is unchanged).")
 
+    mitmdump = None
+    if args.via_mitm:
+        from .mitm_harness import find_mitmdump
+
+        mitmdump = find_mitmdump(args.mitmdump)
+        if not mitmdump:
+            print("--via-mitm: mitmdump was not found beside this interpreter or "
+                  "on PATH; point at the one under test with --mitmdump.",
+                  file=sys.stderr)
+            return 2
+        print(f"mitmdump under test: {mitmdump}")
+
     results: dict[str, bool] = {}
+    hosts = tuple(args.host) if args.host else REACH_HOSTS
     for brand in brands:
         prof = fp.profile(brand)
         want_tls, want_akamai = captured_fingerprints(brand)
-        print(f"\n######## {brand} ({prof.label}) ########\n")
+        print(f"\n######## {brand} ({prof.label})"
+              + (f" through mitmproxy, fp_profile={prof.tls_profile}" if mitmdump else "")
+              + " ########\n")
+        if mitmdump:
+            results[brand] = _via_mitm(brand, mitmdump, args, hosts,
+                                       want_tls, want_akamai)
+            continue
         ok = True
         if not args.skip_reach:
-            ok &= reachable(brand, tuple(args.host) if args.host else REACH_HOSTS,
-                            args.insecure)
+            ok &= reachable(brand, hosts, args.insecure)
         ok &= outside_view(brand, want_tls, want_akamai, args.insecure)
         ok &= check_ja3_zone(brand, want_tls, args.insecure)
         results[brand] = ok
@@ -307,6 +430,33 @@ def main() -> int:
     for brand, ok in results.items():
         print(f"  {brand:<16} {'PASS' if ok else 'FAIL'}")
     return 0 if all(results.values()) else 1
+
+
+def _via_mitm(brand: str, mitmdump: str, args: argparse.Namespace,
+              hosts: tuple[str, ...], want_tls: dict, want_akamai: str) -> bool:
+    """Every check for one brand, through a mitmdump started for it."""
+    from .mitm_harness import Mitmdump, MitmdumpError
+
+    mitm = Mitmdump(mitmdump, tls_profile=fp.profile(brand).tls_profile,
+                    h2_profile=brand, tls_script=args.tls_script,
+                    insecure=args.insecure)
+    try:
+        with mitm:
+            ok = True
+            if not args.skip_reach:
+                ok &= reachable(brand, hosts, args.insecure, mitm=mitm)
+            ok &= outside_view(brand, want_tls, want_akamai, args.insecure,
+                               proxy=mitm.proxy_url)
+            ok &= check_ja3_zone(brand, want_tls, args.insecure,
+                                 proxy=mitm.proxy_url)
+        if not ok:
+            print(f"\n  mitmdump said:\n{mitm.log(tail=15)}")
+        return ok
+    except MitmdumpError as exc:
+        print(f"  FAILED  mitmproxy did not start:\n{exc}")
+        return False
+    finally:
+        mitm.cleanup()
 
 
 if __name__ == "__main__":

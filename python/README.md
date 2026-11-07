@@ -41,6 +41,8 @@ The captures ship inside it, so a project that depends on it does not need this 
 | `mytls/hpack_probe.py` | Runs an h2 server that records the **raw ClientHello + h2 frames + HPACK bytes**; `serve` dumps every connection a visiting browser makes (`import-mitm` turns those into a profile), `selftest` captures ourselves and diffs byte for byte. Installed as `mytls-probe` |
 | `mytls/verify_fp.py` | The live check: real servers accept our handshake, and tls.peet.ws / check.ja3.zone are asked about us and compared against fingerprints computed on the spot from the profile's bytes. Nothing stored. Installed as `mytls-verify` |
 | `mytls/mitm_addon.py` | A mitmproxy 12 addon that records the same raw bytes off a **real site** rather than off our own server. Runs under mitmproxy's interpreter, imports nothing from here; `mytls-probe import-mitm` turns its dumps into a profile |
+| `mytls/mitm_upstream.py` | The other direction: a mitmproxy addon that gives mitmproxy's **upstream** connection a browser's ClientHello (`--set fp_profile=<tls profile>`). Imports nothing from here; see [mitmproxy as the client](#mitmproxy-as-the-client) |
+| `mytls/mitm_testhooks.py`, `mytls/mitm_harness.py` | What `mitm-selftest` and `verify --via-mitm` use to run mitmdump: a hook that redirects upstream TCP connections and reports what they negotiated, and the process wrapper |
 | `mytls/tls_profile.py` | Selects the TLS-layer profile from Python (ctypes into libssl) |
 | `mytls/fingerprints.py` | ja3 / ja4 / ja4_r / peetprint computed from a ClientHello's bytes — no service involved |
 | `mytls/profiles/<brand>.json` | **One file per browser**; everything in `browser_fp` is derived from it |
@@ -112,6 +114,62 @@ the Client — once httpx is given a transport it ignores its own:
 fp.ChromeTransport(verify=ctx, proxy=P)          # right
 httpx.Client(transport=..., verify=ctx, proxy=P) # silently ignored
 ```
+
+### mitmproxy as the client
+
+The same two layers can be put on mitmproxy's connection to the server, so that whatever
+sits behind the proxy is seen upstream as a browser. That needs two things on the
+mitmproxy side:
+
+* **TLS** — mitmproxy's TLS is pyOpenSSL → cryptography → libssl, and the official
+  cryptography wheel links its own OpenSSL statically. Build cryptography from source
+  against this repository's library instead (`OPENSSL_DIR=$HOME/openssl`,
+  `RUSTFLAGS="-C link-arg=-Wl,-rpath,$HOME/openssl/lib"`, plus
+  `-C target-feature=-crt-static` on musl, and no binary wheel for cryptography), then load
+  `mitm_upstream.py`, which calls `SSL_set_fp_profile()` on every upstream connection.
+* **HTTP/2** — a mitmproxy with the `http2_fingerprint` option (the `http2-fingerprint`
+  branch of mitmproxy). It reads SETTINGS, WINDOW_UPDATE, pseudo-header order and the HPACK
+  encoder from the brand here, and passes on the HEADERS priority the client sent.
+
+```sh
+mitmdump -s "$(python -c 'import mytls; print(mytls.upstream_addon_path())')" \
+    --set fp_profile=ios18 --set http2_fingerprint=ios18 --set http3=false
+```
+
+`fp_profile` takes a **TLS** profile name and `http2_fingerprint` a brand; for most brands
+they are the same word, but not for all — `profile(brand).tls_profile` says which
+(`ios17` → `ios16`, `ios18b` → `ios18`). `http3=false` because upstream QUIC is aioquic's
+own TLS, which the library cannot reach. Header *values* and their order are whatever the
+client behind the proxy sent; only the network stack's half comes from the profile.
+
+Both checks have a through-mitmproxy twin, run with the venv's own mitmdump (found beside
+the interpreter, or `--mitmdump`):
+
+```sh
+mytls-probe mitm-selftest        # offline, byte for byte, every capture
+mytls-verify --via-mitm          # live: real servers, peet, ja3.zone
+```
+
+`mitm-selftest` drives our client through mitmdump as an explicit proxy at the probe and
+diffs what **mitmproxy** sent against the capture: ClientHello, frame layer, HPACK for the
+navigation and the xhr on the same connection. It is stricter than `selftest`: the client
+asks for the capture's own `:authority` (`192-168-1-7.nip.io:8443`, `v.whatsapp.net`) and
+mitmproxy keeps it, in the HPACK block and the SNI, while `fp_connect_to` sends the TCP
+connection to the probe on loopback — so nothing is excused, for any capture.
+
+`verify --via-mitm` asks peet and ja3.zone about mitmproxy's upstream connection, judges
+acceptance on what mitmproxy negotiated upstream (the client's own connection ends at the
+proxy), and additionally checks peet's view of the HEADERS frame — field order and
+priority — against the capture, since through a proxy neither is ours.
+
+`--tls-script PATH` runs either against a TLS addon of your own instead of
+`mitm_upstream.py`, as long as it takes the same `fp_profile` option.
+
+Measured (2026-11-07, mitmproxy `http2-fingerprint` branch, cryptography 50.0.2 built
+against this library): `mitm-selftest` PASS for all 8 captures, HPACK identical for both
+requests; `verify --via-mitm` PASS for all 8. Both fail where they should: a TLS script
+that ignores `fp_profile` turns ja4, peetprint and the ClientHello bytes to DIFFER, and a
+mitmproxy that drops the client's HEADERS priority fails the 6 captures that carry one.
 
 ### Seeing what is being imitated
 

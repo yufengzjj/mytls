@@ -1273,7 +1273,8 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
                like: dict[str, str] | None = None,
                xhr: dict | None = None,
                method: str = "GET", path: str = "/api/all",
-               xhr_method: str = "GET", xhr_path: str = "/xhr-sample") -> None:
+               xhr_method: str = "GET", xhr_path: str = "/xhr-sample",
+               proxy: str | None = None) -> None:
     """Send one request through the brand's transport at our own server.
 
     `authority` and not a port: it goes into the HPACK block verbatim and
@@ -1294,6 +1295,9 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
     about the encoder. A body is synthesised when the captured headers declare
     a `content-length`, because a POST whose length header disagrees with what
     follows it is not a request either end would accept.
+
+    `proxy` sends it through an HTTP proxy - mitmproxy, for `mitm-selftest` -
+    by CONNECT to `authority`. The proxy's certificate is not verified either.
     """
     import httpx
 
@@ -1319,7 +1323,7 @@ def run_client(authority: str, brand: str | None, *, quiet: bool = False,
     # verify goes on the transport: httpx ignores its own when given one.
     transport = browser_fp.Transport(
         brand, verify=ctx, headers=defaults,
-        priority=captured.captured_priority("navigate") or None)
+        priority=captured.captured_priority("navigate") or None, proxy=proxy)
     # The transport holds its own copy, so this is the one to adjust - the
     # shared Profile that profile() hands out no longer reaches it.
     prof = transport.profile
@@ -2634,6 +2638,125 @@ def selftest(args: argparse.Namespace) -> int:
     return 0 if all(rc in (0, SKIPPED) for rc in results.values()) else 1
 
 
+# --- the self-test, with mitmproxy in the middle ----------------------------
+
+def mitm_selftest_one(brand: str, openssl: str, mitmdump: str, *,
+                      tls_script: str | None = None) -> int:
+    """`selftest_one`, except that what reaches the probe is mitmproxy's.
+
+    Our client impersonating `brand` goes through mitmproxy as an explicit
+    proxy, the way a browser would be pointed at it, and mitmproxy's own
+    upstream connection - its ClientHello from the TLS addon, its frames and
+    HPACK from `http2_fingerprint` - is what the probe records and what gets
+    diffed against the capture.
+
+    Stricter than the direct self-test in one respect. The client asks for the
+    capture's own `:authority`, a LAN name like `192-168-1-7.nip.io:8443` or a
+    real site, and mitmproxy keeps it - in the HPACK block and in the SNI - but
+    the `fp_connect_to` hook opens the TCP connection to the probe on loopback
+    instead. So nothing is excused: every capture is compared byte for byte,
+    including the ones `selftest` can only replay at localhost.
+
+    What this proves beyond `selftest` is mitmproxy's half: that the request
+    it re-encodes from the browser's - pseudo-header order, field order,
+    priority, the dynamic table across two requests - comes out as the browser
+    sent it, and that the profile reached the SSL object mitmproxy built.
+    """
+    from . import browser_fp
+    from .mitm_harness import Mitmdump, MitmdumpError
+
+    ref, source = _load(brand)
+    authority = authority_of(ref)
+    prof = browser_fp.profile(brand)
+
+    ctx = tls_context(openssl)
+    srv = listen(0)
+    probe_port = srv.getsockname()[1]
+
+    got: list[dict] = []
+    want_xhr = ref.get("xhr") is not None
+    thread = threading.Thread(
+        target=lambda: got.extend(filter(None, [
+            capture(srv, ctx, quiet=True, want_xhr=want_xhr, timeout=10.0)])),
+        daemon=True)
+    import hpack
+
+    decoder = hpack.Decoder()
+    frame = next(f for f in ref["frames"] if f["type"] == "HEADERS")
+    pseudo = dict(_decode_with(decoder, bytes.fromhex(frame["header_block"])))
+    xhr_pseudo = dict(
+        _decode_with(decoder, bytes.fromhex(ref["xhr"]["header_block"]))
+        if ref.get("xhr") else [])
+
+    proxy = Mitmdump(mitmdump, tls_profile=prof.tls_profile, h2_profile=brand,
+                     tls_script=tls_script,
+                     connect_to=f"127.0.0.1:{probe_port}",
+                     # The probe's certificate is self-signed; verification is
+                     # a post-handshake decision and changes no ClientHello byte.
+                     insecure=True)
+    thread.start()
+    try:
+        with proxy:
+            run_client(authority, brand, quiet=True, like=pseudo,
+                       xhr=ref.get("xhr"),
+                       method=pseudo.get(":method", "GET"),
+                       path=pseudo.get(":path", "/api/all"),
+                       xhr_method=xhr_pseudo.get(":method", "GET"),
+                       xhr_path=xhr_pseudo.get(":path", "/xhr-sample"),
+                       proxy=proxy.proxy_url)
+            thread.join(timeout=20)
+    except MitmdumpError as exc:
+        print(f"=== {brand}: mitmproxy did not start ===\n{exc}", file=sys.stderr)
+        return 1
+    finally:
+        srv.close()
+        thread.join(timeout=5)
+
+    try:
+        print(f"=== {brand}: mitmproxy's upstream bytes vs {source} ===")
+        print(f"  mitmproxy: fp_profile={prof.tls_profile} "
+              f"({Path(tls_script).name if tls_script else 'mitm_upstream.py'}), "
+              f"http2_fingerprint={brand}; client asked for {authority}\n")
+        if not got:
+            print(f"the probe captured nothing for {brand}. mitmdump said:\n"
+                  f"{proxy.log()}", file=sys.stderr)
+            return 1
+        return diff_records(ref, got[0], brand, "via mitmproxy")
+    finally:
+        proxy.cleanup()
+
+
+def mitm_selftest(args: argparse.Namespace) -> int:
+    from .mitm_harness import find_mitmdump
+
+    mitmdump = find_mitmdump(args.mitmdump)
+    if not mitmdump:
+        print("mitmdump was not found beside this interpreter or on PATH; point "
+              "at the one under test with --mitmdump. It has to be a mitmproxy "
+              "with the http2_fingerprint option, and its cryptography linked "
+              "against this repository's OpenSSL.", file=sys.stderr)
+        return 2
+    targets = ([args.brand] if args.brand
+               else sorted(p.stem for p in PROFILES_DIR.glob("*.json")))
+    if not targets:
+        print(f"no profiles in {PROFILES_DIR}", file=sys.stderr)
+        return 1
+    print(f"mitmdump under test: {mitmdump}\n")
+
+    results = {}
+    for i, brand in enumerate(targets):
+        if i:
+            print()
+        results[brand] = mitm_selftest_one(brand, args.openssl, mitmdump,
+                                           tls_script=args.tls_script)
+
+    if len(targets) > 1:
+        print("\n=== summary (through mitmproxy) ===")
+        for brand, rc in results.items():
+            print(f"  {brand:<16} {'PASS' if rc == 0 else 'FAIL'}")
+    return 0 if all(rc == 0 for rc in results.values()) else 1
+
+
 def one_client_hello(brand: str, sni: str, alpn: typing.Sequence[str] = ("h2", "http/1.1")
                      ) -> bytes:
     """The ClientHello this brand emits for `sni`, caught off a local socket.
@@ -3793,6 +3916,26 @@ def main() -> int:
     t.add_argument("--port", type=int, help="override the reference's port")
     t.add_argument("--openssl", default=str(Path.home() / "openssl/bin/openssl"))
     t.set_defaults(func=selftest)
+    ms = sub.add_parser(
+        "mitm-selftest",
+        help="selftest with mitmproxy in the middle: its upstream bytes vs "
+             "every capture, offline",
+        description="The same byte-for-byte comparison as selftest, except "
+                    "that our client goes through mitmdump as an explicit "
+                    "proxy and what the probe records is mitmproxy's own "
+                    "upstream connection: the ClientHello from the TLS addon, "
+                    "the frames and HPACK from its http2_fingerprint option. "
+                    "The capture's :authority and SNI are kept and the TCP "
+                    "connection is redirected to the probe, so nothing is "
+                    "excused. No network.")
+    ms.add_argument("--brand", help="default: every installed brand")
+    ms.add_argument("--openssl", default=str(Path.home() / "openssl/bin/openssl"))
+    ms.add_argument("--mitmdump", help="the mitmdump under test; default: the "
+                                       "one beside this interpreter, else PATH")
+    ms.add_argument("--tls-script", metavar="PATH",
+                    help="a TLS addon of your own taking the fp_profile "
+                         "option, instead of the packaged mitm_upstream.py")
+    ms.set_defaults(func=mitm_selftest)
 
     cm = sub.add_parser(
         "capture-mitm",

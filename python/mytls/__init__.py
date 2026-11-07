@@ -66,6 +66,7 @@ __all__ = [
     "brands", "catalog", "describe", "profile", "reload", "transport",
     "send_exact",
     "fingerprints", "tls_profile", "check", "tls_profiles", "addon_path",
+    "upstream_addon_path",
     "__version__",
 ]
 
@@ -100,6 +101,17 @@ def addon_path() -> str:
     from pathlib import Path
 
     return str(Path(__file__).resolve().parent / "mitm_addon.py")
+
+
+def upstream_addon_path() -> str:
+    """Where the addon that fingerprints mitmproxy's *upstream* TLS lives.
+
+    `addon_path()` records the browser -> mitmproxy side; this one makes the
+    mitmproxy -> server side look like a browser. A path for the same reason.
+    """
+    from pathlib import Path
+
+    return str(Path(__file__).resolve().parent / "mitm_upstream.py")
 
 
 def tls_profiles() -> tuple[str, ...]:
